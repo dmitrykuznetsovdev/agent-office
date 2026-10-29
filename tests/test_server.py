@@ -104,6 +104,27 @@ class TailTest(unittest.TestCase):
         self.assertAlmostEqual(server.today_cost(t), one)
         self.assertAlmostEqual(t.cost, 2 * one)
 
+    def test_model_and_tool_kind_follow_the_last_reply(self):
+        self.write(assistant('m1', [('Edit', {'file_path': '/a/cuts.json'})]))
+        t = server.Tail(self.path).feed()
+        self.assertEqual(t.model, 'claude-sonnet-5-5')
+        self.assertEqual(t.tool, 'edit')
+        self.assertEqual(t.activity, 'правит cuts.json')
+        self.write(line(type='assistant', timestamp='2026-01-01T10:01:00Z', message={
+            'id': 'm2', 'model': 'claude-haiku-5-5', 'stop_reason': 'tool_use',
+            'content': [{'type': 'tool_use', 'name': 'Bash', 'input': {'command': 'npm test'}}],
+            'usage': {'input_tokens': 1, 'output_tokens': 1}}), mode='a')
+        t.feed()
+        self.assertEqual(t.model, 'claude-haiku-5-5')
+        self.assertEqual(t.tool, 'bash')
+
+    def test_tool_kinds(self):
+        kinds = {name: server.tool_kind(name) for name in
+                 ['Read', 'Write', 'Edit', 'MultiEdit', 'Grep', 'Glob', 'Bash', 'WebFetch', 'Agent', 'Task', 'Skill', 'mcp__x__y']}
+        self.assertEqual(kinds, {'Read': 'read', 'Write': 'write', 'Edit': 'edit', 'MultiEdit': 'edit', 'Grep': 'grep',
+                                 'Glob': 'grep', 'Bash': 'bash', 'WebFetch': 'web', 'Agent': 'agent', 'Task': 'agent',
+                                 'Skill': 'skill', 'mcp__x__y': 'other'})
+
     def test_removed_agents_leave_the_roster(self):
         self.write(line(type='attachment', attachment={'type': 'agent_listing_delta', 'addedTypes': ['a', 'b']})
                    + line(type='attachment', attachment={'type': 'agent_listing_delta', 'removedTypes': ['a']}))
@@ -137,6 +158,26 @@ class SessionsTest(unittest.TestCase):
         self.assertEqual(s['id'], 'sid1')
         self.assertAlmostEqual(s['today'], round(2 * one, 2))
         self.assertAlmostEqual(s['cost'], round(4 * one, 2))
+
+
+    def test_agents_and_producer_carry_model_tool_and_finish(self):
+        pdir = os.path.join(self.dir.name, '-work-app')
+        sub = os.path.join(pdir, 'sid1', 'subagents')
+        os.makedirs(sub)
+        with open(os.path.join(pdir, 'sid1.jsonl'), 'w') as f:
+            f.write(assistant('m1', [('Agent', {'subagent_type': 'Explore'})]))
+        with open(os.path.join(sub, 'agent-a1.jsonl'), 'w') as f:
+            f.write(line(type='assistant', timestamp='2026-01-01T10:00:05Z', message={
+                'id': 'a1', 'model': 'claude-haiku-5-5', 'stop_reason': 'tool_use',
+                'content': [{'type': 'tool_use', 'name': 'Grep', 'input': {'pattern': 'TODO'}}],
+                'usage': {'input_tokens': 1, 'output_tokens': 1}}))
+        with open(os.path.join(sub, 'agent-a1.meta.json'), 'w') as f:
+            json.dump({'agentType': 'Explore', 'description': 'ищет', 'finished': True}, f)
+        st = server.state('sid1')
+        [a] = st['agents']
+        self.assertEqual((a['model'], a['tool'], a['finished']), ('claude-haiku-5-5', 'grep', True))
+        self.assertEqual(a['at'], server.ms('2026-01-01T10:00:05Z'))
+        self.assertEqual((st['producer']['model'], st['producer']['tool']), ('claude-sonnet-5-5', 'agent'))
 
 
 class LedgerTest(unittest.TestCase):
