@@ -26,8 +26,14 @@
   .banner.quiet span { flex: 0 1 auto; }
   .banner.quiet button { padding: 3px 9px; font-size: 12px; }
   button:disabled { opacity: .55; cursor: default; }
-  #office { flex: 1; display: flex; align-items: center; justify-content: center; padding: 12px; min-height: 0; min-width: 0; }
-  #office svg { width: 100%; height: 100%; max-height: calc(100vh - 70px); image-rendering: pixelated; }
+  .tools { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; margin: 10px 12px 0; color: var(--muted); font-size: 12px; }
+  .tools label { display: flex; align-items: center; gap: 6px; }
+  .tools select { background: #23253a; color: var(--text); border: 1px solid #44486a; border-radius: 6px; padding: 3px 6px; font: inherit; }
+  #office { flex: 1; overflow: auto; padding: 12px; min-height: 0; min-width: 0; }
+  .stage { position: relative; max-width: 1000px; margin: 0 auto; }
+  .stage canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; }
+  .stage canvas.labels { position: absolute; inset: 0; height: 100%; pointer-events: none; image-rendering: auto; }
+  .err { margin: 8px 12px 0; padding: 8px 12px; border: 1px solid var(--off); border-radius: 8px; color: #ffb0b0; font: 12px Menlo, monospace; white-space: pre-wrap; }
   aside { border-left: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; min-height: 0; }
   aside section { padding: 12px 14px; overflow: auto; }
   aside section.sessions { max-height: 45%; border-bottom: 1px solid var(--line); flex: none; }
@@ -67,7 +73,15 @@
     <span id="bannerText"></span>
     <button id="gen">Сгенерировать офис</button>
   </div>
-  <div id="office"></div>
+  <div class="tools">
+    <label>Офис <select id="officeStyle"></select></label>
+    <label>Время <select id="timeOfDay"></select></label>
+  </div>
+  <div class="err" id="err" hidden></div>
+  <div id="office"><div class="stage">
+    <canvas id="scene" width="320" height="240" aria-label="Офис агентов по этажам"></canvas>
+    <canvas id="labels" class="labels" aria-hidden="true"></canvas>
+  </div></div>
 </main>
 <aside>
   <section class="sessions">
@@ -81,10 +95,11 @@
 </aside>
 <script type="module">
 // метка в адресе: после правок office.js браузер не держит старый модуль
-const { render, roleName, money } = await import('./office.js?' + Date.now())
+const { roleName, money } = await import('./office.js?' + Date.now())
+const { mountFloors, OFFICES, TIME_OPTIONS } = await import('./floors.js?' + Date.now())
 
 const $ = id => document.getElementById(id)
-const office = $('office'), logBox = $('log'), dot = $('dot'), status = $('status')
+const logBox = $('log'), dot = $('dot'), status = $('status')
 const titleEl = $('title'), list = $('sessions'), follow = $('follow'), total = $('total')
 
 let sessions = []
@@ -107,9 +122,29 @@ function ago(at) {
   return Math.floor(m / 60) + ' ч назад'
 }
 
+// этажи рисуются сами каждый кадр; сюда приходят только свежие данные
+const errBox = $('err')
+const floors = mountFloors($('scene'), $('labels'), e => {
+  const msg = 'Офис не нарисовался: ' + (e?.stack || e)
+  if (errBox.textContent !== msg) { errBox.textContent = msg; errBox.hidden = false }
+})
+const styleSel = $('officeStyle'), timeSel = $('timeOfDay')
+for (const [k, o] of Object.entries(OFFICES)) styleSel.add(new Option(o.name, k))
+for (const [k, name] of Object.entries(TIME_OPTIONS)) timeSel.add(new Option(name, k))
+try { styleSel.value = localStorage.getItem('office.style') || 'cozy'; timeSel.value = localStorage.getItem('office.time') || 'clock' } catch {}
+if (!styleSel.value) styleSel.value = 'cozy'
+if (!timeSel.value) timeSel.value = 'clock'
+function restyle() {
+  save('office.style', styleSel.value); save('office.time', timeSel.value)
+  styleSel.title = OFFICES[styleSel.value].ref
+  floors.setStyle(styleSel.value, timeSel.value)
+}
+styleSel.addEventListener('change', restyle)
+timeSel.addEventListener('change', restyle)
+restyle()
+
 function draw(st) {
-  // свежий <svg> — свои часы анимаций; отрицательный begin делает остальное
-  office.innerHTML = render(st, Date.now(), st.office)
+  floors.update(st)
   drawBanner(st.office)
   lastDraw = Date.now()
   const lines = st.log.slice(-80).reverse()
@@ -239,7 +274,7 @@ async function pollState() {
 }
 
 function empty() {
-  return { agents: [], producer: { isBusy: false, activity: '', at: 0, calls: 0, cost: 0 }, cost: 0, log: [], since: Date.now(),
+  return { agents: [], producer: { isBusy: false, activity: '', at: 0, calls: 0, cost: 0, model: '', tool: '' }, cost: 0, log: [], since: Date.now(),
     office: { folder: '', title: 'AGENT OFFICE', zones: [], guests: {}, saved: true } }
 }
 

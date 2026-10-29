@@ -53,6 +53,16 @@ def ms(ts):
         return 0
 
 
+TOOL_KINDS = {'Read': 'read', 'Write': 'write', 'Edit': 'edit', 'MultiEdit': 'edit', 'NotebookEdit': 'edit',
+              'Grep': 'grep', 'Glob': 'grep', 'Bash': 'bash', 'WebSearch': 'web', 'WebFetch': 'web',
+              'Agent': 'agent', 'Task': 'agent', 'Skill': 'skill'}
+
+
+def tool_kind(tool):
+    """Вид инструмента для значка в офисе: читает, правит, ищет, терминал…"""
+    return TOOL_KINDS.get(tool, 'other')
+
+
 def base(path):
     return os.path.basename(str(path or ''))
 
@@ -151,6 +161,8 @@ class Tail:
         self.last = 0          # время последней записи
         self.activity = ''
         self.activity_at = 0
+        self.tool = ''         # вид последнего инструмента, см. tool_kind
+        self.model = ''        # модель последнего ответа
         self.busy = False      # последний ход не закончен
         self.title = ''
         self.prompt = ''
@@ -225,6 +237,7 @@ class Tail:
                 self.activity, self.activity_at = 'думает', at
             return
         mid = msg.get('id')
+        self.model = msg.get('model') or self.model
         if msg.get('usage') and mid not in self.paid:
             self.paid.add(mid)
             self.cost += message_cost(msg.get('model'), msg['usage'])
@@ -233,6 +246,7 @@ class Tail:
             self.calls += 1
             what = describe(b.get('name', ''), b.get('input'))
             self.activity, self.activity_at = what, at
+            self.tool = tool_kind(b.get('name', ''))
             self.events.append((at, what))
         if len(self.events) > LOG_MAX:
             self.events = self.events[-LOG_MAX:]
@@ -467,6 +481,10 @@ def agents_of(pdir, sid, now_ms):
             'endedAt': 0 if working else t.last,
             'calls': t.calls,
             'cost': round(t.cost, 4),
+            'model': t.model,
+            'tool': t.tool,
+            'at': t.activity_at or t.last,
+            'finished': bool(meta.get('finished')),
             'events': t.events,
         })
     agents.sort(key=lambda a: a['startedAt'])
@@ -530,7 +548,7 @@ def state(sid):
             del a['events']
         return {
             'agents': agents,
-            'producer': {'isBusy': busy, 'activity': t.activity if busy else '', 'at': t.activity_at, 'calls': t.calls, 'cost': round(t.cost, 4)},
+            'producer': {'isBusy': busy, 'activity': t.activity if busy else '', 'at': t.activity_at, 'calls': t.calls, 'cost': round(t.cost, 4), 'model': t.model, 'tool': t.tool},
             'cost': round(t.cost + sum(a['cost'] for a in agents), 4),
             'office': office_for(t),
             'log': [{'at': at, 'who': who, 'text': clip(text)} for at, who, text in log[-LOG_MAX:]],
