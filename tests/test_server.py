@@ -139,6 +139,97 @@ class SessionsTest(unittest.TestCase):
         self.assertAlmostEqual(s['cost'], round(4 * one, 2))
 
 
+class LedgerTest(unittest.TestCase):
+    one = {'input_tokens': 1000, 'output_tokens': 100}
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.pdir = os.path.join(self.dir.name, '-work-app')
+        os.makedirs(os.path.join(self.pdir, 'sid1', 'subagents'))
+        self.main = os.path.join(self.pdir, 'sid1.jsonl')
+        self.agent = os.path.join(self.pdir, 'sid1', 'subagents', 'agent-a1.jsonl')
+        self.cache = os.path.join(self.dir.name, 'stats.json')
+        self.usd = server.message_cost('claude-sonnet-5-5', self.one)
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def write(self, path, text, mode='w'):
+        with open(path, mode) as f:
+            f.write(text)
+
+    def day(self, offset):
+        return server.day_of(local_day(offset) * 1000)
+
+    def test_parts_add_up_to_message_cost(self):
+        usage = {'input_tokens': 10, 'output_tokens': 20, 'cache_read_input_tokens': 30,
+                 'cache_creation': {'ephemeral_5m_input_tokens': 40, 'ephemeral_1h_input_tokens': 50}, 'speed': 'fast'}
+        self.assertAlmostEqual(sum(server.cost_parts('claude-opus-5-5', usage)), server.message_cost('claude-opus-5-5', usage))
+
+    def test_days_split_by_model_project_and_session(self):
+        self.write(self.main, assistant('m1', ts=iso(local_day(-1) + 3600)) + assistant('m1', ts=iso(local_day(-1) + 3600))
+                   + assistant('m2', ts=iso(local_day(0) + 3600)))
+        self.write(self.agent, assistant('a1', ts=iso(local_day(0) + 7200)))
+        ledger = server.Ledger(self.cache)
+        ledger.scan(self.dir.name)
+        days = {d['day']: d for d in ledger.report()['days']}
+        self.assertAlmostEqual(days[self.day(-1)]['usd'], self.usd)  # m1 logged twice, paid once
+        today = days[self.day(0)]
+        self.assertAlmostEqual(today['usd'], 2 * self.usd)
+        self.assertAlmostEqual(today['models']['claude-sonnet-5-5'], 2 * self.usd)
+        self.assertAlmostEqual(today['projects']['app'], 2 * self.usd)
+        self.assertEqual(today['sessions'], 1)  # subagent is not a session of its own
+        self.assertEqual((days[self.day(-1)]['started'], today['started']), (1, 0))  # started yesterday
+        self.assertEqual(today['tokens'], 2200)
+
+    def test_report_fills_quiet_days_and_rolls_24h(self):
+        self.write(self.main, assistant('m1', ts=iso(local_day(-3) + 3600)) + assistant('m2', ts=iso(time.time() - 600)))
+        ledger = server.Ledger(self.cache)
+        ledger.scan(self.dir.name)
+        report = ledger.report()
+        self.assertEqual(report['since'], self.day(-3))
+        self.assertEqual([d['day'] for d in report['days']], [self.day(i) for i in (-3, -2, -1, 0)])
+        self.assertEqual(report['days'][1]['usd'], 0)
+        self.assertAlmostEqual(report['last24'], self.usd)
+
+    def test_reads_only_appended_lines(self):
+        self.write(self.main, assistant('m1', ts=iso(local_day(0) + 3600)))
+        ledger = server.Ledger(self.cache)
+        ledger.scan(self.dir.name)
+        self.write(self.main, assistant('m2', ts=iso(local_day(0) + 3600)), mode='a')
+        ledger.scan(self.dir.name)
+        ledger.scan(self.dir.name)
+        self.assertAlmostEqual(ledger.report()['days'][-1]['usd'], 2 * self.usd)
+
+    def test_history_outlives_deleted_journals(self):
+        self.write(self.main, assistant('m1', ts=iso(local_day(-1) + 3600)))
+        ledger = server.Ledger(self.cache)
+        ledger.scan(self.dir.name)
+        ledger.save()
+        os.remove(self.main)
+        again = server.Ledger(self.cache)
+        again.scan(self.dir.name)
+        self.assertAlmostEqual(again.report()['days'][0]['usd'], self.usd)
+
+    def test_reloaded_cache_does_not_count_twice(self):
+        self.write(self.main, assistant('m1', ts=iso(local_day(0) + 3600)))
+        ledger = server.Ledger(self.cache)
+        ledger.scan(self.dir.name)
+        ledger.save()
+        again = server.Ledger(self.cache)
+        again.scan(self.dir.name)
+        self.assertAlmostEqual(again.report()['days'][-1]['usd'], self.usd)
+
+    def test_hours_for_heatmap(self):
+        at = local_day(0) + 14 * 3600 + 60
+        self.write(self.main, assistant('m1', ts=iso(at)))
+        ledger = server.Ledger(self.cache)
+        ledger.scan(self.dir.name)
+        [[day, hour, usd]] = ledger.report()['hours']
+        self.assertEqual((day, hour), (self.day(0), 14))
+        self.assertAlmostEqual(usd, self.usd)
+
+
 class WatchParentTest(unittest.TestCase):
     def test_parent_alive_false_when_ppid_differs(self):
         self.assertTrue(server.parent_alive(os.getppid()))

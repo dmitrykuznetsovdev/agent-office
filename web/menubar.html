@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Office</title>
+<style>
+  /* те же имена, что у офиса (index.html): поменялась палитра там — меняйте здесь */
+  :root {
+    --bg: #14151f; --panel: #1c1d2b; --line: #2a2c40; --text: #e8e6f0; --muted: #8a8fb0; --gold: #f0c040; --ok: #4ade80; --off: #e05a5a;
+    --floor: #2e3150; --wall: #191a29; --plate: #f4f1e8; --ink: #1d1f2e;
+    --m-fable: #b8801c; --m-opus: #d0566e; --m-sonnet: #3a95cf; --m-haiku: #4a9e5c; --m-other: #8c6fd0;
+    --px: 2px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.35 -apple-system, Helvetica, sans-serif; -webkit-user-select: none; user-select: none; cursor: default; }
+  body { width: 380px; }
+  .mono, .usd { font-family: Menlo, ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+
+  /* пиксельная рамка: ступенчатые углы тенями */
+  .pix { box-shadow: 0 calc(-1 * var(--px)) 0 0 var(--c, var(--line)), 0 var(--px) 0 0 var(--c, var(--line)), calc(-1 * var(--px)) 0 0 0 var(--c, var(--line)), var(--px) 0 0 0 var(--c, var(--line)); }
+
+  header { display: flex; align-items: center; gap: 10px; padding: 10px 14px 0; background: var(--wall); }
+  header svg.logo { width: 28px; height: 28px; image-rendering: pixelated; flex: none; }
+  header .sign { font-weight: 700; letter-spacing: .12em; color: var(--gold); font-size: 12px; }
+  header .state { margin-left: auto; color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+
+  nav { display: flex; gap: 6px; padding: 10px 14px 0; background: var(--wall); border-bottom: var(--px) solid var(--line); }
+  nav button { flex: 1; background: var(--panel); color: var(--muted); border: 0; padding: 7px 0 6px; font: 600 12px -apple-system, Helvetica, sans-serif; letter-spacing: .06em; cursor: pointer; }
+  nav button.on { background: var(--floor); color: var(--gold); box-shadow: inset 0 var(--px) 0 var(--gold); }
+  nav button:hover:not(.on) { color: var(--text); }
+
+  main { padding: 12px 14px 4px; }
+  section { margin-bottom: 14px; }
+  h3 { margin: 0 0 7px; font-size: 11px; letter-spacing: .1em; color: var(--muted); font-weight: 600; display: flex; justify-content: space-between; align-items: baseline; }
+  h3 .hint { letter-spacing: 0; font-weight: 400; }
+
+  .tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 14px; }
+  .tiles.four { grid-template-columns: repeat(4, 1fr); }
+  .tile { background: var(--panel); padding: 8px 9px 7px; --c: var(--line); }
+  .tile .k { font-size: 11px; color: var(--muted); }
+  .tile .v { font: 700 20px/1.2 Menlo, ui-monospace, monospace; font-variant-numeric: tabular-nums; display: flex; align-items: center; gap: 7px; margin: 2px 0 1px; }
+  .tiles.four .tile .v { font-size: 16px; }
+  .tile .s { font-size: 10.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  /* зелёная лампочка «в работе»: мигает ступенькой, как пиксель */
+  .lamp { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); flex: none; box-shadow: 0 0 6px var(--ok); animation: blink 1.2s steps(2, jump-none) infinite; }
+  .lamp.big { width: 10px; height: 10px; }
+  .lamp.idle { background: transparent; box-shadow: inset 0 0 0 var(--px) #4a4e70; animation: none; }
+  @keyframes blink { 0% { opacity: 1; } 100% { opacity: .25; box-shadow: none; } }
+  @media (prefers-reduced-motion: reduce) { .lamp { animation: none; } }
+
+  .row { display: flex; align-items: center; gap: 9px; width: 100%; text-align: left; padding: 7px 9px; margin-bottom: 4px; background: var(--panel); border: 0; color: var(--text); font: inherit; cursor: pointer; }
+  .row:hover { background: var(--floor); }
+  .row .body { flex: 1; min-width: 0; }
+  .row .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row .p { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row .money { text-align: right; flex: none; }
+  .row .money .a { font: 600 13px Menlo, ui-monospace, monospace; }
+  .row .money .b { font-size: 10.5px; color: var(--muted); }
+  details summary { list-style: none; cursor: pointer; }
+  details summary::-webkit-details-marker { display: none; }
+  details summary h3 > span:first-child::before { content: '▸ '; }
+  details[open] summary h3 > span:first-child::before { content: '▾ '; }
+  .empty { color: var(--muted); padding: 8px 2px; }
+  .note { font-size: 11px; color: var(--muted); margin: -4px 0 12px; }
+  .note b { color: var(--text); font-weight: 600; }
+
+  .seg { display: flex; gap: 4px; margin-bottom: 12px; }
+  .seg button { background: var(--panel); color: var(--muted); border: 0; padding: 4px 10px; font: 12px -apple-system, Helvetica, sans-serif; cursor: pointer; }
+  .seg button.on { background: var(--plate); color: var(--ink); font-weight: 600; }
+  .seg .since { margin-left: auto; align-self: center; font-size: 11px; color: var(--muted); }
+
+  .chart { background: var(--panel); padding: 8px 8px 4px; }
+  .chart svg { display: block; width: 100%; height: auto; shape-rendering: crispEdges; }
+  .chart svg text { font: 9px Menlo, ui-monospace, monospace; fill: var(--muted); shape-rendering: auto; }
+  .chart .hit { fill: transparent; }
+  .chart .hit:hover { fill: #ffffff10; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 12px; padding: 6px 2px 2px; font-size: 11px; color: var(--muted); }
+  .legend i { display: inline-block; width: 8px; height: 8px; margin-right: 5px; vertical-align: 0; }
+
+  .bars .line { display: grid; grid-template-columns: 104px 1fr 84px; align-items: center; gap: 8px; margin-bottom: 5px; font-size: 12px; }
+  .bars .name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: flex; align-items: center; gap: 6px; }
+  .bars .name i { width: 8px; height: 8px; flex: none; }
+  .bars .track { height: 10px; background: var(--line); }
+  .bars .fill { height: 100%; }
+  .bars .val { text-align: right; white-space: nowrap; font: 12px Menlo, ui-monospace, monospace; }
+  .bars .val small { color: var(--muted); font-size: 10px; }
+  .stack { display: flex; height: 14px; gap: 1px; background: var(--panel); margin-bottom: 8px; }
+
+  #tip { position: fixed; pointer-events: none; z-index: 9; background: var(--plate); color: var(--ink); padding: 5px 8px; font: 11px/1.4 Menlo, ui-monospace, monospace; display: none; max-width: 230px; --c: var(--ink); }
+  #tip b { font-family: -apple-system, Helvetica, sans-serif; }
+
+  footer { display: flex; gap: 4px; padding: 8px 14px 10px; border-top: var(--px) solid var(--line); background: var(--wall); flex-wrap: wrap; }
+  footer button { background: var(--panel); color: var(--text); border: 0; padding: 5px 9px; font: 12px -apple-system, Helvetica, sans-serif; cursor: pointer; }
+  footer button:hover { background: var(--floor); }
+  footer button.main { background: var(--gold); color: var(--ink); font-weight: 600; }
+  footer button.check::before { content: '☐ '; }
+  footer button.check.on::before { content: '☑ '; }
+  footer .gap { flex: 1; }
+  body:not(.app) .app-only { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <svg class="logo" id="logo" viewBox="0 0 16 16"></svg>
+  <span class="sign">AGENT OFFICE</span>
+  <span class="state" id="state">…</span>
+</header>
+<nav>
+  <button data-tab="sessions" class="on">СЕССИИ</button>
+  <button data-tab="stats">СТАТИСТИКА</button>
+</nav>
+<main id="main"></main>
+<footer>
+  <button class="main" id="office">Открыть офис</button>
+  <span class="gap"></span>
+  <button class="app-only check" id="autostart" title="Запускать при входе в систему">Автозапуск</button>
+  <button class="app-only" id="restart" title="Перезапустить сервер">⟳</button>
+  <button class="app-only" id="log" title="Лог сервера">Лог</button>
+  <button class="app-only" id="quit">Выход</button>
+</footer>
+<div id="tip" class="pix"></div>
+<script type="module" src="menubar.js"></script>
+</body>
+</html>

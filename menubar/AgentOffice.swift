@@ -1,6 +1,8 @@
 // Agent Office в статусной панели macOS: траты за сегодня, сессии, запуск сервера.
 // Собирается scripts/build-menubar.sh в build/AgentOffice.app; без зависимостей.
+// Окошко по клику — страница сервера web/menubar.html: её вид правится без пересборки.
 import Cocoa
+import WebKit
 
 // ── Настройки: из Info.plist собранного приложения, иначе — по умолчанию ─────
 struct Config {
@@ -35,10 +37,125 @@ struct Session: Decodable {
     let today: Double?
 }
 
-func money(_ usd: Double) -> String { String(format: "$%.2f", usd) }
+/// Целые доллары, центы — только до доллара: в строке меню место дорого.
+func money(_ usd: Double) -> String {
+    if usd > 0 && usd < 1 { return String(format: "$%.2f", usd) }
+    return "$" + String(Int(usd.rounded(.toNearestOrAwayFromZero)))
+}
 
-func clip(_ s: String, _ n: Int = 50) -> String {
-    s.count <= n ? s : String(s.prefix(n - 1)) + "…"
+// ── Пиксельный офис: значок в строке меню и иконка приложения из одной картинки ──
+enum Pixel {
+    static let office = [
+        "................",
+        ".....GGGGGG.....",
+        ".....GGGGGG.....",
+        "..RRRRRRRRRRRR..",
+        "..BBBBBBBBBBBB..",
+        "..BBCCBCCBYYBB..",
+        "..BBCCBCCBYYBB..",
+        "..BBBBBBBBBBBB..",
+        "..BBDDBCCBCCBB..",
+        "..BBDDBCCBCCBB..",
+        "..BBBBBBBBBBBB..",
+        "..BBCCBOOBCCBB..",
+        "..BBCCBOOBCCBB..",
+        "..BBBBBOOBBBBB..",
+        "LLLLLLLLLLLLLLLL",
+        "................",
+    ]
+    static let colors: [Character: UInt32] = [
+        "G": 0xf0c040, "R": 0x8a4a5a, "B": 0x4b5a8a, "C": 0x6ee7ff, "Y": 0xf0c040, "D": 0x1b1e2b, "O": 0xa0673d, "L": 0x3a3e63,
+    ]
+
+    static func color(_ hex: UInt32, _ alpha: CGFloat = 1) -> NSColor {
+        NSColor(srgbRed: CGFloat(hex >> 16 & 0xff) / 255, green: CGFloat(hex >> 8 & 0xff) / 255, blue: CGFloat(hex & 0xff) / 255, alpha: alpha)
+    }
+
+    /// Клетки картинки в прямоугольнике; y сверху вниз, как в строках.
+    static func draw(in rect: NSRect, fill: (Character) -> NSColor?) {
+        let n = CGFloat(office.count)
+        let px = min(rect.width, rect.height) / n
+        for (y, row) in office.enumerated() {
+            for (x, ch) in row.enumerated() {
+                guard let c = fill(ch) else { continue }
+                c.setFill()
+                NSRect(x: rect.minX + CGFloat(x) * px, y: rect.maxY - CGFloat(y + 1) * px, width: px, height: px).fill()
+            }
+        }
+    }
+
+    /// Значок строки меню: силуэт офиса, окна и дверь — прорези. Шаблон: цвет подставит система.
+    static func menuIcon() -> NSImage {
+        let img = NSImage(size: NSSize(width: 16, height: 16), flipped: false) { r in
+            draw(in: r) { "GRBL".contains($0) ? .black : nil }
+            return true
+        }
+        img.isTemplate = true
+        img.accessibilityDescription = "Agent Office"
+        return img
+    }
+
+    /// Иконка приложения: офис ночью на тёмной плашке, светятся окна и вывеска.
+    static func appIcon(_ side: Int) -> NSBitmapImageRep {
+        let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: side, pixelsHigh: side, bitsPerSample: 8, samplesPerPixel: 4,
+                                   hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        NSGraphicsContext.current?.imageInterpolation = .none
+        let s = CGFloat(side)
+        // плашка по сетке Big Sur: 824 из 1024, скругление ~185
+        let plate = NSRect(x: s * 100 / 1024, y: s * 100 / 1024, width: s * 824 / 1024, height: s * 824 / 1024)
+        let shape = NSBezierPath(roundedRect: plate, xRadius: s * 185 / 1024, yRadius: s * 185 / 1024)
+        NSGradient(starting: color(0x2e3150), ending: color(0x14151f))!.draw(in: shape, angle: -90)
+        NSGraphicsContext.current?.saveGraphicsState()
+        shape.addClip()
+        // звёзды и пол
+        for (x, y) in [(0.22, 0.80), (0.78, 0.84), (0.70, 0.70), (0.30, 0.66), (0.86, 0.60)] {
+            color(0xf4f1e8, 0.7).setFill()
+            NSRect(x: plate.minX + plate.width * x, y: plate.minY + plate.height * y, width: s / 64, height: s / 64).fill()
+        }
+        // целые пиксели картинки, иначе между клетками видны швы
+        let cell = (plate.width * 0.76 / CGFloat(office.count)).rounded(.down)
+        let side = cell * CGFloat(office.count)
+        let art = NSRect(x: (s - side) / 2, y: (s - side) / 2, width: side, height: side).integral
+        // свет окон — мягкое пятно под зданием
+        NSGradient(starting: color(0x6ee7ff, 0.22), ending: color(0x6ee7ff, 0))!.draw(in: NSBezierPath(ovalIn: art.insetBy(dx: -art.width * 0.1, dy: -art.height * 0.05)), relativeCenterPosition: .zero)
+        NSGraphicsContext.current?.shouldAntialias = false
+        draw(in: art) { ch in colors[ch].map { color($0) } }
+        NSGraphicsContext.current?.shouldAntialias = true
+        NSGraphicsContext.current?.restoreGraphicsState()
+        color(0xf0c040, 0.55).setStroke()
+        shape.lineWidth = max(1, s / 128)
+        shape.stroke()
+        NSGraphicsContext.restoreGraphicsState()
+        return rep
+    }
+
+    /// scripts/build-menubar.sh: AgentOffice --render-icon <dir.iconset>
+    static func renderIconset(_ dir: String) throws {
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        for base in [16, 32, 128, 256, 512] {
+            for scale in [1, 2] {
+                let name = "icon_\(base)x\(base)" + (scale == 2 ? "@2x" : "") + ".png"
+                let png = appIcon(base * scale).representation(using: .png, properties: [:])!
+                try png.write(to: URL(fileURLWithPath: dir).appendingPathComponent(name))
+            }
+        }
+    }
+
+    /// Лампочка «в работе» для строки меню.
+    static func lamp(_ on: Bool, font: NSFont) -> NSAttributedString {
+        let d: CGFloat = 7
+        let img = NSImage(size: NSSize(width: d, height: d), flipped: false) { r in
+            color(0x4ade80, on ? 1 : 0.3).setFill()
+            NSBezierPath(ovalIn: r).fill()
+            return true
+        }
+        let a = NSTextAttachment()
+        a.image = img
+        a.bounds = NSRect(x: 0, y: (font.capHeight - d) / 2, width: d, height: d)
+        return NSAttributedString(attachment: a)
+    }
 }
 
 // ── Сервер: свой дочерний процесс или чужой, уже слушающий порт ──────────────
@@ -210,14 +327,19 @@ enum Autostart {
 }
 
 // ── Приложение ──────────────────────────────────────────────────────────────
-final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopoverDelegate, WKScriptMessageHandler, WKNavigationDelegate {
     let cfg = Config.load()
     lazy var server = Server(cfg)
     var item: NSStatusItem!
-    let menu = NSMenu()
+    let menu = NSMenu()          // правый клик: служебное
+    let popover = NSPopover()    // левый клик: сессии и статистика
+    var web: WKWebView!
+    var pageAt = Date.distantPast  // когда страница грузилась: старую перечитываем, чтобы подхватить новый вид
+    var offlinePage = false
     var sessions: [Session] = []
     var online = false
     var misses = 0              // опросов подряд без ответа
+    var blink = true
 
     func applicationDidFinishLaunching(_ note: Notification) {
         // второй инстанс не нужен; но предыдущий может как раз уступать нам место (передача в launchd) — ждём до 3 с
@@ -234,13 +356,16 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let b = item.button {
-            b.image = NSImage(systemSymbolName: "building.2", accessibilityDescription: "Agent Office")
+            b.image = Pixel.menuIcon()
             b.imagePosition = .imageLeading
-            b.title = " $—"
+            b.target = self
+            b.action = #selector(clicked(_:))
+            b.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
         menu.delegate = self
-        item.menu = menu
+        setupPopover()
         server.onChange = { [weak self] in self?.refreshTitle() }
+        refreshTitle()
 
         probe { [weak self] ok in
             guard let self = self else { return }
@@ -248,6 +373,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let t = Timer(timeInterval: 5, repeats: true) { [weak self] _ in self?.poll() }
         RunLoop.main.add(t, forMode: .common)
+        let b = Timer(timeInterval: 0.6, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(b, forMode: .common)
         poll()
     }
 
@@ -275,6 +402,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.sessions = list
                 self.online = true
                 self.misses = 0
+                if self.offlinePage && self.popover.isShown { self.loadPage() }
             } else {
                 self.online = false
                 self.misses += 1
@@ -286,44 +414,130 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     var today: Double { sessions.reduce(0) { $0 + ($1.today ?? 0) } }
-    var total: Double { sessions.reduce(0) { $0 + $1.cost } }
-    var working: Int { sessions.reduce(0) { $0 + $1.working } }
+    /// Сессии, где сейчас кто-то работает: руководитель или агенты.
+    var busy: Int { sessions.filter { $0.working > 0 }.count }
+
+    func tick() {
+        guard online && busy > 0 else { return }
+        blink.toggle()
+        refreshTitle()
+    }
 
     func refreshTitle() {
         guard let b = item?.button else { return }
-        if !online { b.title = " $—"; return }
-        b.title = " " + money(today) + (working > 0 ? " ·\(working)" : "")
+        let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        let title = NSMutableAttributedString(string: " " + (online ? money(today) : "$—"), attributes: [.font: font])
+        if online && busy > 0 {
+            title.append(NSAttributedString(string: "  ", attributes: [.font: font]))
+            title.append(Pixel.lamp(blink, font: font))
+            title.append(NSAttributedString(string: " \(busy)", attributes: [.font: font]))
+        }
+        b.attributedTitle = title
+        b.toolTip = online ? "Сегодня \(money(today)) · сессий в работе: \(busy)" : "Сервер не отвечает"
     }
 
-    // ── Меню строится при открытии из последних данных ──
+    // ── Клик: левый — окошко, правый — меню ──
+    @objc func clicked(_ sender: NSStatusBarButton) {
+        let right = NSApp.currentEvent?.type == .rightMouseUp || NSApp.currentEvent?.modifierFlags.contains(.control) == true
+        if right {
+            popover.performClose(nil)
+            item.menu = menu
+            sender.performClick(nil)
+            item.menu = nil
+            return
+        }
+        if popover.isShown {
+            popover.performClose(nil)
+            return
+        }
+        if Date().timeIntervalSince(pageAt) > 30 || offlinePage { loadPage() } else { show() }
+        popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func setupPopover() {
+        let conf = WKWebViewConfiguration()
+        conf.userContentController.add(self, name: "ao")
+        web = WKWebView(frame: NSRect(x: 0, y: 0, width: 380, height: 520), configuration: conf)
+        web.navigationDelegate = self
+        web.setValue(false, forKey: "drawsBackground")
+        let vc = NSViewController()
+        vc.view = web
+        popover.contentViewController = vc
+        popover.contentSize = NSSize(width: 380, height: 520)
+        popover.behavior = .transient
+        popover.animates = false
+        popover.appearance = NSAppearance(named: .darkAqua)
+        popover.delegate = self
+        loadPage()
+    }
+
+    func loadPage() {
+        offlinePage = false
+        pageAt = Date()
+        web.load(URLRequest(url: URL(string: cfg.base + "/menubar.html")!, cachePolicy: .reloadIgnoringLocalCacheData))
+    }
+
+    /// Сервер не ответил — своя страничка с теми же кнопками.
+    func loadOffline() {
+        offlinePage = true
+        let why = server.gaveUp ? "Сервер не запускается — загляните в лог." : "Сервер не отвечает, поднимаю…"
+        web.loadHTMLString("""
+        <body style="margin:0;background:#14151f;color:#e8e6f0;font:13px -apple-system;padding:18px 16px">
+        <div style="color:#f0c040;font-weight:700;letter-spacing:.12em;font-size:12px">AGENT OFFICE</div>
+        <p>\(why)</p>
+        <p>\(["restart:Перезапустить сервер", "log:Лог", "quit:Выход"].map { p -> String in
+            let kv = p.split(separator: ":")
+            return "<button onclick=\"webkit.messageHandlers.ao.postMessage({cmd:'\(kv[0])'})\" style=\"background:#1c1d2b;color:#e8e6f0;border:0;padding:6px 10px;margin-right:4px\">\(kv[1])</button>"
+        }.joined())</p></body>
+        """, baseURL: nil)
+        popover.contentSize = NSSize(width: 380, height: 150)
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { loadOffline() }
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { loadOffline() }
+
+    /// Страница ожила или окошко открылось: свежие данные и состояние автозапуска.
+    func show() {
+        web.evaluateJavaScript("window.aoShow && aoShow({autostart: \(Autostart.enabled)})")
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        web.evaluateJavaScript("window.aoHide && aoHide()")
+    }
+
+    func userContentController(_ uc: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard let body = message.body as? [String: Any], let cmd = body["cmd"] as? String else { return }
+        switch cmd {
+        case "ready": show()
+        case "size":
+            let h = (body["arg"] as? NSNumber)?.doubleValue ?? 520
+            let screen = NSScreen.main?.visibleFrame.height ?? 800
+            popover.contentSize = NSSize(width: 380, height: min(max(h, 200), min(680, screen - 60)))
+        case "open":
+            popover.performClose(nil)
+            open(body["arg"] as? String ?? "/")
+        case "restart": restartServer()
+        case "log": showLog()
+        case "autostart":
+            toggleAutostart()
+            show()
+        case "quit": quit()
+        default: break
+        }
+    }
+
+    // ── Меню по правому клику: служебное ──
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         if online {
-            menu.addItem(label("Сегодня: \(money(today)) · за сутки: \(money(total))"))
+            menu.addItem(label("Сегодня \(money(today)) · в работе: \(busy)"))
         } else if server.gaveUp {
             menu.addItem(label("Сервер не запускается, см. лог"))
         } else {
             menu.addItem(label("Сервер не отвечает"))
         }
         menu.addItem(.separator())
-
-        let live = sessions.filter { $0.isLive }
-        let rest = sessions.filter { !$0.isLive }
-        if live.isEmpty {
-            menu.addItem(label(online ? "Открытых сессий нет" : "—"))
-        } else {
-            menu.addItem(label("Открытые"))
-            for s in live { menu.addItem(sessionItem(s, dot: true)) }
-        }
-        if !rest.isEmpty {
-            let sub = NSMenu()
-            for s in rest { sub.addItem(sessionItem(s, dot: false)) }
-            let holder = NSMenuItem(title: "Остальные за сутки (\(rest.count))", action: nil, keyEquivalent: "")
-            holder.submenu = sub
-            menu.addItem(holder)
-        }
-        menu.addItem(.separator())
-
         menu.addItem(action("Открыть офис", #selector(openOffice), key: "o"))
         menu.addItem(action("Перезапустить сервер", #selector(restartServer), key: "r"))
         menu.addItem(action("Показать лог", #selector(showLog), key: "l"))
@@ -346,27 +560,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return i
     }
 
-    private func sessionItem(_ s: Session, dot: Bool) -> NSMenuItem {
-        let mark = dot ? (s.working > 0 ? "● " : "○ ") : ""
-        let title = "\(mark)\(clip(s.title)) — \(s.project) · \(money(s.cost))"
-        let i = NSMenuItem(title: title, action: #selector(openSession(_:)), keyEquivalent: "")
-        i.target = self
-        i.representedObject = s.id
-        i.toolTip = s.working > 0 ? "в работе: \(s.working)" : "затихла"
-        return i
-    }
-
     // ── Действия ──
     private func open(_ path: String) {
         if let u = URL(string: "http://localhost:\(cfg.port)" + path) { NSWorkspace.shared.open(u) }
     }
 
     @objc func openOffice() { open("/") }
-
-    @objc func openSession(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String else { return }
-        open("/#" + id)
-    }
 
     @objc func restartServer() {
         server.restart()
@@ -399,6 +598,16 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             a.informativeText = error.localizedDescription
             a.runModal()
         }
+    }
+}
+
+if let i = CommandLine.arguments.firstIndex(of: "--render-icon"), i + 1 < CommandLine.arguments.count {
+    do {
+        try Pixel.renderIconset(CommandLine.arguments[i + 1])
+        exit(0)
+    } catch {
+        FileHandle.standardError.write("render-icon: \(error)\n".data(using: .utf8)!)
+        exit(1)
     }
 }
 

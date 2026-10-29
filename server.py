@@ -8,6 +8,7 @@
 
   /                         страница офиса
   /api/sessions             сессии за последние сутки; today — потрачено сегодня
+  /api/stats                траты по дням, моделям и папкам за всё время, почасово — за 5 недель
   /api/state?s=<id>         офис одной сессии (руководитель, агенты, журнал)
   POST /api/office?s=<id>   сгенерировать офис для папки сессии
 """
@@ -114,17 +115,33 @@ def describe(tool, inp):
     return tool
 
 
+def cache_writes(usage):
+    """Записи в кэш: (на 5 минут, на час)."""
+    cc = usage.get('cache_creation') or {}
+    if not cc:
+        return usage.get('cache_creation_input_tokens', 0), 0
+    return cc.get('ephemeral_5m_input_tokens', 0), cc.get('ephemeral_1h_input_tokens', 0)
+
+
+def cost_parts(model, usage):
+    """Стоимость ответа по статьям: вход, выход, чтение кэша, запись в кэш."""
+    if model not in PRICES:
+        return [0.0, 0.0, 0.0, 0.0]
+    p_in, p_out, p_read = PRICES[model]
+    w5m, w1h = cache_writes(usage)
+    k = (2 if usage.get('speed') == 'fast' else 1) / 1e6
+    return [usage.get('input_tokens', 0) * p_in * k, usage.get('output_tokens', 0) * p_out * k,
+            usage.get('cache_read_input_tokens', 0) * p_read * k, (w5m * 1.25 + w1h * 2) * p_in * k]
+
+
 def message_cost(model, usage):
     """Стоимость одного ответа модели, формула reel.py cost."""
-    if model not in PRICES:
-        return 0.0
-    p_in, p_out, p_read = PRICES[model]
-    cc = usage.get('cache_creation') or {}
-    w1h = cc.get('ephemeral_1h_input_tokens', 0)
-    w5m = cc.get('ephemeral_5m_input_tokens', 0) if cc else usage.get('cache_creation_input_tokens', 0)
-    usd = (usage.get('input_tokens', 0) * p_in + usage.get('output_tokens', 0) * p_out
-           + usage.get('cache_read_input_tokens', 0) * p_read + w5m * p_in * 1.25 + w1h * p_in * 2) / 1e6
-    return usd * (2 if usage.get('speed') == 'fast' else 1)
+    return sum(cost_parts(model, usage))
+
+
+def tokens_of(usage):
+    return (usage.get('input_tokens', 0) + usage.get('output_tokens', 0)
+            + usage.get('cache_read_input_tokens', 0) + sum(cache_writes(usage)))
 
 
 def day_of(at_ms):
@@ -420,6 +437,166 @@ def tidy(folder, roster, raw):
             'zones': zones, 'guests': guests, 'generated': 'claude'}
 
 
+# ── Статистика: траты по часам из всех журналов ─────────────────────────────
+HEAT_DAYS = 35  # сколько дней отдавать почасово, для карты «когда тратим»
+
+
+def blank_day(day):
+    return {'day': day, 'usd': 0.0, 'models': {}, 'projects': {}, 'parts': [0.0, 0.0, 0.0, 0.0], 'tokens': 0,
+            'sessions': 0, 'started': 0}
+
+
+class Ledger:
+    """Сводка трат по часам, моделям и папкам. Лежит на диске: Claude Code
+    чистит журналы через месяц, а история трат остаётся."""
+    IDS = 64  # ответ модели пишется кусками подряд — помним последние id файла
+
+    def __init__(self, path):
+        self.path = path
+        self.files = {}  # журнал → {offset, ids, days, main}
+        self.hours = {}  # 'ГГГГ-ММ-ДДTЧЧ' → {папка: {модель: [вход, выход, чтение кэша, запись в кэш, токены]}}
+        self.dirty = False
+        self.saved_at = 0
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            self.files, self.hours = data['files'], data['hours']
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+
+    def scan(self, root=None):
+        root = root or PROJECTS
+        for proj in os.listdir(root):
+            pdir = os.path.join(root, proj)
+            if not os.path.isdir(pdir):
+                continue
+            for name in os.listdir(pdir):
+                if name.endswith('.jsonl'):
+                    self.feed(os.path.join(pdir, name), True)
+                    continue
+                sub = os.path.join(pdir, name, 'subagents')
+                if os.path.isdir(sub):
+                    for agent in os.listdir(sub):
+                        if agent.endswith('.jsonl'):
+                            self.feed(os.path.join(sub, agent), False)
+        return self
+
+    def feed(self, path, main):
+        rec = self.files.setdefault(path, {'offset': 0, 'ids': [], 'days': [], 'main': main})
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return
+        if size < rec['offset']:
+            rec['offset'] = 0  # журнал переписан заново
+        if size == rec['offset']:
+            return
+        with open(path, 'rb') as f:
+            f.seek(rec['offset'])
+            data = f.read(size - rec['offset'])
+        cut = data.rfind(b'\n')
+        if cut < 0:
+            return  # строка ещё дописывается
+        rec['offset'] += cut + 1
+        for raw in data[:cut].split(b'\n'):
+            if b'"usage"' in raw:  # дешёвый отсев: json разбираем только у ответов модели
+                self.take(rec, raw)
+        self.dirty = True
+
+    def take(self, rec, raw):
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            return
+        msg = d.get('message') if d.get('type') == 'assistant' else None
+        usage = msg.get('usage') if isinstance(msg, dict) else None
+        at = ms(d.get('timestamp'))
+        if not usage or not at:
+            return
+        mid = msg.get('id')
+        if mid:
+            if mid in rec['ids']:
+                return
+            rec['ids'].append(mid)
+            del rec['ids'][:-self.IDS]
+        model = msg.get('model') or '?'
+        parts, tokens = cost_parts(model, usage), tokens_of(usage)
+        if not tokens:
+            return
+        hour = time.strftime('%Y-%m-%dT%H', time.localtime(at / 1000))
+        project = os.path.basename(home_of(d.get('cwd'))) or '?'
+        cell = self.hours.setdefault(hour, {}).setdefault(project, {}).setdefault(model, [0.0, 0.0, 0.0, 0.0, 0])
+        for i, usd in enumerate(parts):
+            cell[i] += usd
+        cell[4] += tokens
+        if rec['main'] and hour[:10] not in rec['days']:
+            rec['days'].append(hour[:10])
+
+    def save(self, every=0):
+        if not self.dirty or time.time() - self.saved_at < every:
+            return
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        tmp = self.path + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump({'files': self.files, 'hours': self.hours}, f, separators=(',', ':'))
+        os.replace(tmp, self.path)
+        self.dirty, self.saved_at = False, time.time()
+
+    def report(self, now=None):
+        """Дни подряд от первой записи до сегодня; почасово — последние HEAT_DAYS дней."""
+        from datetime import date, timedelta
+        now = now or time.time()
+        since_24 = time.strftime('%Y-%m-%dT%H', time.localtime(now - 23 * 3600))
+        heat_from = day_of((now - HEAT_DAYS * 86400) * 1000)
+        days, hours, last24 = {}, [], 0.0
+        for hour, projects in sorted(self.hours.items()):
+            row = days.setdefault(hour[:10], blank_day(hour[:10]))
+            spent = 0.0
+            for project, models in projects.items():
+                for model, cell in models.items():
+                    usd = sum(cell[:4])
+                    spent += usd
+                    row['models'][model] = row['models'].get(model, 0.0) + usd
+                    row['projects'][project] = row['projects'].get(project, 0.0) + usd
+                    row['parts'] = [a + b for a, b in zip(row['parts'], cell[:4])]
+                    row['tokens'] += cell[4]
+            row['usd'] += spent
+            if hour >= since_24:
+                last24 += spent
+            if hour[:10] >= heat_from and spent:
+                hours.append([hour[:10], int(hour[11:]), round(spent, 4)])
+        for rec in self.files.values():
+            for day in rec['days'] if rec['main'] else []:
+                days.setdefault(day, blank_day(day))['sessions'] += 1
+            if rec['main'] and rec['days']:
+                days[min(rec['days'])]['started'] += 1
+        out = []
+        if days:
+            d, end = date.fromisoformat(min(days)), date.fromisoformat(day_of(now * 1000))
+            while d <= end:
+                out.append(days.get(d.isoformat()) or blank_day(d.isoformat()))
+                d += timedelta(days=1)
+        for row in out:
+            row['usd'] = round(row['usd'], 4)
+            row['parts'] = [round(x, 4) for x in row['parts']]
+            for k in ('models', 'projects'):
+                row[k] = {name: round(usd, 4) for name, usd in row[k].items()}
+        return {'since': out[0]['day'] if out else '', 'last24': round(last24, 4), 'days': out, 'hours': hours}
+
+
+LEDGER = None
+STATS_LOCK = threading.Lock()  # статистика копится отдельно от офиса: первый проход долгий
+
+
+def stats():
+    global LEDGER
+    with STATS_LOCK:
+        if LEDGER is None:
+            LEDGER = Ledger(os.path.join(DATA, 'stats.json'))
+        LEDGER.scan()
+        LEDGER.save(every=60)
+        return LEDGER.report()
+
 
 TAILS = {}
 
@@ -610,6 +787,8 @@ class Handler(SimpleHTTPRequestHandler):
                 with LOCK:
                     body = sessions()
                 return self.send_json(body)
+            if url.path == '/api/stats':
+                return self.send_json(stats())
             if url.path == '/api/state':
                 with LOCK:
                     st = state(parse_qs(url.query).get('s', [''])[0])
@@ -637,6 +816,7 @@ def main():
                 time.sleep(2)
             os._exit(0)
         threading.Thread(target=watch, daemon=True).start()
+    threading.Thread(target=stats, daemon=True).start()  # первый проход по журналам — заранее
     print('Agent Office: http://%s:%d' % (args.host, args.port), flush=True)
     ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
 

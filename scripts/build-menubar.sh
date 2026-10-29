@@ -12,7 +12,14 @@ BIN="$APP/Contents/MacOS/AgentOffice"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
-swiftc -O -framework Cocoa "$ROOT/menubar/AgentOffice.swift" -o "$BIN"
+swiftc -O -framework Cocoa -framework WebKit "$ROOT/menubar/AgentOffice.swift" -o "$BIN"
+
+# app icon: the binary draws its own pixel office
+ICONSET="$ROOT/build/AppIcon.iconset"
+rm -rf "$ICONSET"
+mkdir -p "$APP/Contents/Resources"
+"$BIN" --render-icon "$ICONSET"
+iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -22,6 +29,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleIdentifier</key><string>local.agent-office</string>
   <key>CFBundleName</key><string>Agent Office</string>
   <key>CFBundleExecutable</key><string>AgentOffice</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>CFBundleVersion</key><string>1</string>
