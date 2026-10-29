@@ -24,6 +24,11 @@
   header svg.logo { width: 28px; height: 28px; image-rendering: pixelated; flex: none; }
   header .sign { font-weight: 700; letter-spacing: .12em; color: var(--gold); font-size: 12px; }
   header .state { margin-left: auto; color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+  /* выход — значок выключения в углу: приглушённый, светлеет под курсором */
+  header .quit { display: flex; align-items: center; gap: 5px; margin-left: 6px; background: transparent; color: var(--muted); border: 0; padding: 4px 6px; font: 11px -apple-system, Helvetica, sans-serif; cursor: pointer; }
+  header .quit svg { width: 13px; height: 13px; shape-rendering: crispEdges; }
+  header .quit:hover { color: var(--text); background: var(--panel); }
+  .tiles.two { grid-template-columns: repeat(2, 1fr); }
 
   nav { display: flex; gap: 6px; padding: 10px 14px 0; background: var(--wall); border-bottom: var(--px) solid var(--line); }
   nav button { flex: 1; background: var(--panel); color: var(--muted); border: 0; padding: 7px 0 6px; font: 600 12px -apple-system, Helvetica, sans-serif; letter-spacing: .06em; cursor: pointer; }
@@ -106,6 +111,17 @@
   <svg class="logo" id="logo" viewBox="0 0 16 16"></svg>
   <span class="sign">AGENT OFFICE</span>
   <span class="state" id="state">…</span>
+  <button class="app-only quit" id="quit" title="Выйти из Agent Office" aria-label="Выйти из Agent Office">
+    <svg viewBox="0 0 9 9" fill="currentColor" aria-hidden="true">
+      <rect x="4" y="0" width="1" height="4"/>
+      <rect x="2" y="1" width="1" height="1"/><rect x="6" y="1" width="1" height="1"/>
+      <rect x="1" y="2" width="1" height="1"/><rect x="7" y="2" width="1" height="1"/>
+      <rect x="0" y="3" width="1" height="3"/><rect x="8" y="3" width="1" height="3"/>
+      <rect x="1" y="6" width="1" height="1"/><rect x="7" y="6" width="1" height="1"/>
+      <rect x="2" y="7" width="1" height="1"/><rect x="6" y="7" width="1" height="1"/>
+      <rect x="3" y="8" width="3" height="1"/>
+    </svg>выйти
+  </button>
 </header>
 <nav>
   <button data-tab="sessions" class="on">СЕССИИ</button>
@@ -118,7 +134,6 @@
   <button class="app-only check" id="autostart" title="Запускать при входе в систему">Автозапуск</button>
   <button class="app-only" id="restart" title="Перезапустить сервер">⟳</button>
   <button class="app-only" id="log" title="Лог сервера">Лог</button>
-  <button class="app-only" id="quit">Выход</button>
 </footer>
 <div id="tip" class="pix"></div>
 <script type="module" src="menubar.js"></script>

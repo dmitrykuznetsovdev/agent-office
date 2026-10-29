@@ -164,24 +164,19 @@ function renderSessions() {
     const today = sessions.reduce((a, s) => a + (s.today ?? 0), 0);
     const busy = sessions.filter(s => s.working > 0);
     const hands = busy.reduce((a, s) => a + s.working, 0);
-    const last24 = stats?.last24 ?? sessions.reduce((a, s) => a + s.cost, 0);
-    const from = new Date(Date.now() - 23 * 3600e3);
-    from.setMinutes(0, 0, 0);
-    let html = `<div class="tiles">
+    // сутки календарные: с 00:00 до 00:00, вчерашний вечер сюда не входит
+    const midnight = new Date().setHours(0, 0, 0, 0);
+    let html = `<div class="tiles two">
     <div class="tile pix"><div class="k">Сегодня</div><div class="v">${money(today)}</div><div class="s">с 00:00</div></div>
-    <div class="tile pix"><div class="k">За 24 часа</div><div class="v">${money(last24)}</div><div class="s">с ${clock(from.getTime())} вчера</div></div>
     <div class="tile pix"><div class="k">В работе</div><div class="v">${busy.length ? '<span class="lamp big"></span>' : ''}${busy.length}</div><div class="s">${busy.length ? `исполнителей: ${hands}` : 'сессий'}</div></div>
   </div>`;
-    if (last24 - today >= 1) {
-        html += `<p class="note"><b>Сегодня</b> — с полуночи. <b>24 часа</b> — скользящие сутки: туда входит и вчерашний вечер (${money(last24 - today)}).</p>`;
-    }
     const live = sessions.filter(s => s.isLive).sort((a, b) => b.working - a.working || b.at - a.at);
-    const rest = sessions.filter(s => !s.isLive);
+    const rest = sessions.filter(s => !s.isLive && ((s.today ?? 0) > 0 || s.at >= midnight));
     html += `<section><h3>ОТКРЫТЫЕ <span class="hint">${live.length || ''}</span></h3>`;
     html += live.length ? live.map(s => sessionRow(s, true)).join('') : `<div class="empty">${online ? 'Открытых сессий нет' : 'Сервер не отвечает'}</div>`;
     html += '</section>';
     if (rest.length) {
-        html += `<details${load('rest', '') ? ' open' : ''} id="rest"><summary><h3><span>ЗАТИХШИЕ ЗА СУТКИ</span> <span class="hint">${rest.length} · ${money(rest.reduce((a, s) => a + s.cost, 0))}</span></h3></summary>`;
+        html += `<details${load('rest', '') ? ' open' : ''} id="rest"><summary><h3><span>ЗАТИХШИЕ СЕГОДНЯ</span> <span class="hint">${rest.length} · ${money(rest.reduce((a, s) => a + (s.today ?? 0), 0))}</span></h3></summary>`;
         html += rest.map(s => sessionRow(s, false)).join('') + '</details>';
     }
     return html;
@@ -190,6 +185,14 @@ function renderSessions() {
 const W = 348;
 function rangeDays(all) {
     return range === 'all' ? all : all.slice(-Number(range));
+}
+// Ranges worth a button: «30 дней» says nothing new while the whole history is shorter.
+function ranges(all) {
+    const out = [['7', '7 дней']];
+    if (all.length > 30)
+        out.push(['30', '30 дней']);
+    out.push(['all', 'Всё время']);
+    return out;
 }
 function weeks(days) {
     const out = [];
@@ -298,12 +301,14 @@ function renderStats() {
     const all = stats.days;
     if (!all.length)
         return '<div class="empty">Журналов с тратами пока нет</div>';
+    if (!ranges(all).some(([k]) => k === range))
+        range = 'all';
     const days = rangeDays(all);
     const total = days.reduce((a, d) => a + d.usd, 0);
     const started = days.reduce((a, d) => a + d.started, 0);
     const active = days.filter(d => d.usd > 0).length;
     const tokensSum = days.reduce((a, d) => a + d.tokens, 0);
-    let html = `<div class="seg">${[['7', '7 дней'], ['30', '30 дней'], ['all', 'Всё время']]
+    let html = `<div class="seg">${ranges(all)
         .map(([k, t]) => `<button data-range="${k}" class="${range === k ? 'on' : ''}">${t}</button>`).join('')}
     <span class="since">${short(days[0].day)} — ${short(days[days.length - 1].day)}</span></div>`;
     html += `<div class="tiles four">
