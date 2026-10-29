@@ -1,7 +1,9 @@
+import datetime
 import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -10,6 +12,16 @@ import server  # noqa: E402
 
 def line(**entry):
     return json.dumps(entry, ensure_ascii=False) + '\n'
+
+
+def local_day(offset):
+    """Локальная полночь дня offset (0 — сегодня, -1 — вчера), секунды."""
+    d = datetime.date.today() + datetime.timedelta(days=offset)
+    return time.mktime(d.timetuple())
+
+
+def iso(seconds):
+    return datetime.datetime.utcfromtimestamp(seconds).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
 def assistant(mid, tools=(), stop='tool_use', usage=None, ts='2026-01-01T10:00:00Z'):
@@ -84,10 +96,53 @@ class TailTest(unittest.TestCase):
         self.assertEqual(t.calls, 1)
         self.assertFalse(t.busy)
 
+    def test_cost_is_split_by_local_day(self):
+        self.write(assistant('m1', ts=iso(local_day(-1) + 3600)) + assistant('m2', ts=iso(local_day(0) + 3600)))
+        t = server.Tail(self.path).feed()
+        one = server.message_cost('claude-sonnet-5-5', {'input_tokens': 1000, 'output_tokens': 100})
+        self.assertAlmostEqual(t.daily[server.day_of(local_day(0) * 1000)], one)
+        self.assertAlmostEqual(server.today_cost(t), one)
+        self.assertAlmostEqual(t.cost, 2 * one)
+
     def test_removed_agents_leave_the_roster(self):
         self.write(line(type='attachment', attachment={'type': 'agent_listing_delta', 'addedTypes': ['a', 'b']})
                    + line(type='attachment', attachment={'type': 'agent_listing_delta', 'removedTypes': ['a']}))
         self.assertEqual(list(server.Tail(self.path).feed().roster), ['b'])
+
+
+class SessionsTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.projects, server.PROJECTS = server.PROJECTS, self.dir.name
+        server.TAILS.clear()
+
+    def tearDown(self):
+        server.PROJECTS = self.projects
+        server.TAILS.clear()
+        self.dir.cleanup()
+
+    def test_sessions_report_today(self):
+        pdir = os.path.join(self.dir.name, '-work-app')
+        sub = os.path.join(pdir, 'sid1', 'subagents')
+        os.makedirs(sub)
+        yesterday, today = iso(local_day(-1) + 3600), iso(local_day(0) + 3600)
+        with open(os.path.join(pdir, 'sid1.jsonl'), 'w') as f:
+            f.write(assistant('m1', ts=yesterday) + assistant('m2', ts=today))
+        with open(os.path.join(sub, 'agent-a1.jsonl'), 'w') as f:
+            f.write(assistant('a1', ts=yesterday) + assistant('a2', ts=today))
+        with open(os.path.join(sub, 'agent-a1.meta.json'), 'w') as f:
+            json.dump({'agentType': 'Explore', 'description': 'ищет', 'finished': True}, f)
+        one = server.message_cost('claude-sonnet-5-5', {'input_tokens': 1000, 'output_tokens': 100})
+        [s] = server.sessions()
+        self.assertEqual(s['id'], 'sid1')
+        self.assertAlmostEqual(s['today'], round(2 * one, 2))
+        self.assertAlmostEqual(s['cost'], round(4 * one, 2))
+
+
+class WatchParentTest(unittest.TestCase):
+    def test_parent_alive_false_when_ppid_differs(self):
+        self.assertTrue(server.parent_alive(os.getppid()))
+        self.assertFalse(server.parent_alive(os.getppid() + 12345))
 
 
 class OfficeTest(unittest.TestCase):

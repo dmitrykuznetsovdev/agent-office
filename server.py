@@ -4,10 +4,10 @@
 Читает журналы всех сессий (~/.claude/projects) и отдаёт состояние офиса
 выбранной сессии. В журналы ничего не пишет, хуки не нужны.
 
-  python3 server.py [--port 8767] [--data ~/.claude/agent-office]
+  python3 server.py [--port 8767] [--data ~/.claude/agent-office] [--watch-parent]
 
   /                         страница офиса
-  /api/sessions             сессии за последние сутки
+  /api/sessions             сессии за последние сутки; today — потрачено сегодня
   /api/state?s=<id>         офис одной сессии (руководитель, агенты, журнал)
   POST /api/office?s=<id>   сгенерировать офис для папки сессии
 """
@@ -127,6 +127,19 @@ def message_cost(model, usage):
     return usd * (2 if usage.get('speed') == 'fast' else 1)
 
 
+def day_of(at_ms):
+    """Локальная календарная дата записи журнала."""
+    return time.strftime('%Y-%m-%d', time.localtime(at_ms / 1000))
+
+
+def today_cost(t):
+    return t.daily.get(day_of(time.time() * 1000), 0.0)
+
+
+def parent_alive(ppid):
+    return os.getppid() == ppid
+
+
 def clip(text, n=60):
     text = ' '.join(str(text).split())
     return text if len(text) <= n else text[:n - 1] + '…'
@@ -159,6 +172,7 @@ class Tail:
         self.roster = {}       # агенты, доступные сессии: тип → описание
         self.events = []       # [(at, text)]
         self.cost = 0.0
+        self.daily = {}        # локальная дата → $, последние два дня
         self.paid = set()      # ответ модели пишется в журнал кусками — платим за id один раз
 
     def feed(self):
@@ -227,7 +241,12 @@ class Tail:
         mid = msg.get('id')
         if msg.get('usage') and mid not in self.paid:
             self.paid.add(mid)
-            self.cost += message_cost(msg.get('model'), msg['usage'])
+            usd = message_cost(msg.get('model'), msg['usage'])
+            self.cost += usd
+            day = day_of(at)
+            self.daily[day] = self.daily.get(day, 0.0) + usd
+            for old in sorted(self.daily)[:-2]:
+                del self.daily[old]
         uses = [b for b in content or [] if isinstance(b, dict) and b.get('type') == 'tool_use']
         for b in uses:
             self.calls += 1
@@ -467,6 +486,7 @@ def agents_of(pdir, sid, now_ms):
             'endedAt': 0 if working else t.last,
             'calls': t.calls,
             'cost': round(t.cost, 4),
+            'today': round(today_cost(t), 4),
             'events': t.events,
         })
     agents.sort(key=lambda a: a['startedAt'])
@@ -490,6 +510,7 @@ def sessions():
             'working': working,
             'agents': len(agents),
             'cost': round(t.cost + sum(a['cost'] for a in agents), 2),
+            'today': round(today_cost(t) + sum(a['today'] for a in agents), 2),
             'folder': t.home,
             'hasOffice': bool(t.home) and os.path.exists(office_path(t.home)),
         })
@@ -605,8 +626,17 @@ def main():
     ap.add_argument('--port', type=int, default=8767)
     ap.add_argument('--host', default='127.0.0.1')
     ap.add_argument('--data', default=DATA, help='где хранить офисы папок')
+    ap.add_argument('--watch-parent', action='store_true', help='выйти, когда умрёт родительский процесс')
     args = ap.parse_args()
     DATA = os.path.expanduser(args.data)
+    if args.watch_parent:
+        ppid = os.getppid()
+
+        def watch():
+            while parent_alive(ppid):
+                time.sleep(2)
+            os._exit(0)
+        threading.Thread(target=watch, daemon=True).start()
     print('Agent Office: http://%s:%d' % (args.host, args.port), flush=True)
     ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
 
