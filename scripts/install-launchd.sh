@@ -13,7 +13,8 @@ LOG="$HOME/Library/Logs/agent-office.log"
 "$ROOT/scripts/build-menubar.sh" "$PORT"
 mkdir -p "$HOME/Applications" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
 rm -rf "$APP"
-cp -R "$ROOT/build/AgentOffice.app" "$APP"
+# move, not copy: a second Agent Office left in build/ shows up in Spotlight and Launchpad
+mv "$ROOT/build/AgentOffice.app" "$APP"
 
 cat > "$PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

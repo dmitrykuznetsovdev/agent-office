@@ -129,6 +129,11 @@ function logo(): string {
 function send(cmd: string, arg?: unknown) {
   if (bridge) bridge.postMessage({ cmd, arg })
 }
+// Height of the content itself: documentElement.scrollHeight never drops below the window,
+// so after the long stats tab the popover would stay tall on the short sessions tab.
+function fit() {
+  send('size', Math.ceil(document.body.getBoundingClientRect().height))
+}
 function openPath(path: string) {
   if (bridge) send('open', path)
   else window.open(path, '_blank')
@@ -390,7 +395,7 @@ function render() {
   main.innerHTML = tab === 'stats' ? renderStats() : renderSessions()
   window.scrollTo(0, y)
   $('autostart').classList.toggle('on', autostart)
-  send('size', document.documentElement.scrollHeight)
+  fit()
 }
 
 // ── Events ──
@@ -418,7 +423,7 @@ document.addEventListener('toggle', e => {
   const d = e.target as HTMLDetailsElement
   if (d.id === 'rest') {
     keep('rest', d.open ? '1' : '')
-    send('size', document.documentElement.scrollHeight)
+    fit()
   }
 }, true)
 
