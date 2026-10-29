@@ -111,7 +111,9 @@ final class Server {
 
     func stop() {
         quitting = true
-        child?.terminate()
+        guard let c = child, c.isRunning else { return }
+        c.terminate()
+        c.waitUntilExit()   // порт свободен к моменту, когда нас сменит другой инстанс
     }
 
     private func listeners() -> [pid_t] {
@@ -136,6 +138,77 @@ final class Server {
     }
 }
 
+// ── Автозапуск: тот же launchd-агент, что ставит scripts/install-launchd.sh ──
+enum Autostart {
+    static let label = "local.agent-office"
+    static var plist: String { NSHomeDirectory() + "/Library/LaunchAgents/\(label).plist" }
+    static var enabled: Bool { FileManager.default.fileExists(atPath: plist) }
+
+    static func enable(log: String) throws {
+        let exe = Bundle.main.bundlePath + "/Contents/MacOS/AgentOffice"
+        let path = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+        let xml = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+          <key>Label</key><string>\(label)</string>
+          <key>ProgramArguments</key>
+          <array><string>\(exe)</string></array>
+          <key>EnvironmentVariables</key>
+          <dict><key>PATH</key><string>\(path)</string></dict>
+          <key>RunAtLoad</key><true/>
+          <key>KeepAlive</key>
+          <dict><key>SuccessfulExit</key><false/></dict>
+          <key>ThrottleInterval</key><integer>30</integer>
+          <key>StandardOutPath</key><string>\(log)</string>
+          <key>StandardErrorPath</key><string>\(log)</string>
+        </dict>
+        </plist>
+
+        """
+        try FileManager.default.createDirectory(atPath: (plist as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        try xml.write(toFile: plist, atomically: true, encoding: .utf8)
+        launchctl(["enable", "gui/\(getuid())/\(label)"])
+    }
+
+    /// Снимаем только файл: bootout убил бы нас, если мы и есть этот job. Вступает в силу при следующем входе.
+    static func disable() throws {
+        try FileManager.default.removeItem(atPath: plist)
+        launchctl(["disable", "gui/\(getuid())/\(label)"])
+    }
+
+    /// Запущены ли мы самим launchd: в `launchctl print` у job'а наш pid.
+    static var managed: Bool {
+        let me = "pid = \(ProcessInfo.processInfo.processIdentifier)"
+        return launchctlOutput(["print", "gui/\(getuid())/\(label)"]).contains(me)
+    }
+
+    @discardableResult
+    static func launchctl(_ args: [String]) -> Int32 {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = args
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return -1 }
+        p.waitUntilExit()
+        return p.terminationStatus
+    }
+
+    static func launchctlOutput(_ args: [String]) -> String {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = args
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return "" }
+        p.waitUntilExit()
+        return String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    }
+}
+
 // ── Приложение ──────────────────────────────────────────────────────────────
 final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let cfg = Config.load()
@@ -147,11 +220,17 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var misses = 0              // опросов подряд без ответа
 
     func applicationDidFinishLaunching(_ note: Notification) {
-        if let me = Bundle.main.bundleIdentifier,
-           NSRunningApplication.runningApplications(withBundleIdentifier: me).count > 1 {
-            NSLog("Agent Office: already running, exiting")
-            NSApp.terminate(nil)
-            return
+        // второй инстанс не нужен; но предыдущий может как раз уступать нам место (передача в launchd) — ждём до 3 с
+        if let me = Bundle.main.bundleIdentifier {
+            let mine = ProcessInfo.processInfo.processIdentifier
+            let others = { NSRunningApplication.runningApplications(withBundleIdentifier: me).filter { $0.processIdentifier != mine } }
+            var waited = 0
+            while !others().isEmpty && waited < 30 { usleep(100_000); waited += 1 }
+            if !others().isEmpty {
+                NSLog("Agent Office: already running, exiting")
+                NSApp.terminate(nil)
+                return
+            }
         }
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let b = item.button {
@@ -249,10 +328,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(action("Перезапустить сервер", #selector(restartServer), key: "r"))
         menu.addItem(action("Показать лог", #selector(showLog), key: "l"))
         menu.addItem(.separator())
-        let plist = NSHomeDirectory() + "/Library/LaunchAgents/local.agent-office.plist"
-        let auto = FileManager.default.fileExists(atPath: plist)
-        menu.addItem(label("Автозапуск: " + (auto ? "включён" : "выключен (scripts/install-launchd.sh)")))
-        menu.addItem(action("Выход", #selector(NSApplication.terminate(_:)), key: "q"))
+        let auto = action("Автозапуск при входе", #selector(toggleAutostart), key: "")
+        auto.state = Autostart.enabled ? .on : .off
+        menu.addItem(auto)
+        menu.addItem(action("Выход", #selector(quit), key: "q"))
     }
 
     private func label(_ title: String) -> NSMenuItem {
@@ -296,6 +375,30 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func showLog() {
         NSWorkspace.shared.open(URL(fileURLWithPath: cfg.log))
+    }
+
+    @objc func quit() { NSApp.terminate(nil) }
+
+    @objc func toggleAutostart() {
+        do {
+            if Autostart.enabled {
+                try Autostart.disable()
+                return
+            }
+            try Autostart.enable(log: cfg.log)
+            if Autostart.managed { return }
+            // мы запущены вручную: отдаём место копии под launchd, чтобы она и поднимала нас после падений
+            server.stop()
+            Autostart.launchctl(["bootout", "gui/\(getuid())/\(Autostart.label)"])
+            Autostart.launchctl(["bootstrap", "gui/\(getuid())", Autostart.plist])
+            NSApp.terminate(nil)
+        } catch {
+            NSLog("Agent Office: autostart toggle failed: %@", error.localizedDescription)
+            let a = NSAlert()
+            a.messageText = "Не удалось изменить автозапуск"
+            a.informativeText = error.localizedDescription
+            a.runModal()
+        }
     }
 }
 
