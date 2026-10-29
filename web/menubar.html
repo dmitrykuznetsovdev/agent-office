@@ -10,6 +10,7 @@
     --bg: #14151f; --panel: #1c1d2b; --line: #2a2c40; --text: #e8e6f0; --muted: #8a8fb0; --gold: #f0c040; --ok: #4ade80; --off: #e05a5a;
     --floor: #2e3150; --wall: #191a29; --plate: #f4f1e8; --ink: #1d1f2e;
     --m-fable: #b8801c; --m-opus: #d0566e; --m-sonnet: #3a95cf; --m-haiku: #4a9e5c; --m-other: #8c6fd0;
+    --t-in: #3a95cf; --t-out: #f0c040; --t-read: #5d628f; --t-write: #c27ba0;
     --px: 2px;
   }
   * { box-sizing: border-box; }
@@ -46,6 +47,7 @@
   .tile .k { font-size: 11px; color: var(--muted); }
   .tile .v { font: 700 20px/1.2 Menlo, ui-monospace, monospace; font-variant-numeric: tabular-nums; display: flex; align-items: center; gap: 7px; margin: 2px 0 1px; }
   .tiles.four .tile .v { font-size: 16px; }
+  .tile .v small { font: 600 11px -apple-system, Helvetica, sans-serif; color: var(--muted); margin-left: -3px; }
   .tile .s { font-size: 10.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
   /* зелёная лампочка «в работе»: мигает ступенькой, как пиксель */
@@ -126,6 +128,7 @@
 <nav>
   <button data-tab="sessions" class="on">СЕССИИ</button>
   <button data-tab="stats">СТАТИСТИКА</button>
+  <button data-tab="tokens">ТОКЕНЫ</button>
 </nav>
 <main id="main"></main>
 <footer>

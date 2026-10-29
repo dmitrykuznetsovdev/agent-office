@@ -223,6 +223,50 @@ class LedgerTest(unittest.TestCase):
         self.assertEqual((days[self.day(-1)]['started'], today['started']), (1, 0))  # started yesterday
         self.assertEqual(today['tokens'], 2200)
 
+    def test_tokens_split_by_kind_model_and_project(self):
+        usage = {'input_tokens': 10, 'output_tokens': 20, 'cache_read_input_tokens': 30,
+                 'cache_creation': {'ephemeral_5m_input_tokens': 40, 'ephemeral_1h_input_tokens': 50}}
+        self.write(self.main, assistant('m1', usage=usage, ts=iso(local_day(0) + 3600)))
+        self.write(self.agent, assistant('a1', ts=iso(local_day(0) + 7200)))
+        ledger = server.Ledger(self.cache)
+        ledger.scan(self.dir.name)
+        today = ledger.report()['days'][-1]
+        self.assertEqual(today['tokParts'], [1010, 120, 30, 90])  # input, output, cache read, cache write
+        self.assertEqual(today['tokModels'], {'claude-sonnet-5-5': 1250})
+        self.assertEqual(today['tokProjects'], {'app': 1250})
+        self.assertEqual(today['tokens'], 1250)
+
+    def old_cache(self, journal_offset):
+        """stats.json before tokens were split: cells end with the total token count."""
+        hour = time.strftime('%Y-%m-%dT%H', time.localtime(local_day(-1) + 3600))
+        self.write(self.cache, json.dumps({
+            'files': {self.main: {'offset': journal_offset, 'ids': ['m1'], 'days': [hour[:10]], 'main': True}},
+            'hours': {hour: {'app': {'claude-sonnet-5-5': [self.usd, 0.0, 0.0, 0.0, 1100]}}},
+        }))
+
+    def test_old_cache_is_rebuilt_while_its_journals_are_on_disk(self):
+        text = assistant('m1', ts=iso(local_day(-1) + 3600))
+        self.write(self.main, text)
+        self.old_cache(len(text.encode()))
+        ledger = server.Ledger(self.cache)
+        ledger.scan(self.dir.name)
+        day = ledger.report()['days'][0]
+        self.assertAlmostEqual(day['usd'], self.usd)  # read again, not counted twice
+        self.assertEqual(day['tokParts'], [1000, 100, 0, 0])
+
+    def test_old_cache_keeps_totals_when_journals_are_gone(self):
+        self.old_cache(500)
+        ledger = server.Ledger(self.cache)
+        ledger.scan(self.dir.name)
+        day = ledger.report()['days'][0]
+        self.assertAlmostEqual(day['usd'], self.usd)
+        self.assertEqual((day['tokens'], day['tokParts']), (1100, [0, 0, 0, 0]))  # no split for that history
+        # a new journal writing into the same hour adds to the old cell
+        self.write(os.path.join(self.pdir, 'sid2.jsonl'), assistant('m2', ts=iso(local_day(-1) + 3600)))
+        ledger.scan(self.dir.name)
+        day = ledger.report()['days'][0]
+        self.assertEqual((day['tokens'], day['tokParts']), (2200, [1000, 100, 0, 0]))
+
     def test_report_fills_quiet_days_and_rolls_24h(self):
         self.write(self.main, assistant('m1', ts=iso(local_day(-3) + 3600)) + assistant('m2', ts=iso(time.time() - 600)))
         ledger = server.Ledger(self.cache)

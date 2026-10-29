@@ -32,13 +32,19 @@ function money(usd) {
         return '$' + usd.toFixed(2);
     return '$' + Math.round(usd).toLocaleString('ru-RU').replace(/\s/g, ' ');
 }
-const pct = (part, all) => all ? Math.round((part / all) * 100) + '%' : '0%';
+function pct(part, all) {
+    const p = all ? (part / all) * 100 : 0;
+    // a sliver is not «0%»: model output is well under a percent of all tokens
+    return p > 0 && p < 0.1 ? '<0.1%' : p > 0 && p < 1 ? p.toFixed(1) + '%' : Math.round(p) + '%';
+}
 function tokens(n) {
     if (n >= 1e9)
-        return (n / 1e9).toFixed(1) + ' млрд';
+        return (n / 1e9).toFixed(1).replace(/\.0$/, '') + ' млрд';
     if (n >= 1e6)
         return Math.round(n / 1e6) + ' млн';
-    return Math.round(n / 1e3) + ' тыс';
+    if (n >= 1e3)
+        return Math.round(n / 1e3) + ' тыс';
+    return String(Math.round(n));
 }
 const MONTHS = ['янв', 'фев', 'мар', 'апр', 'мая', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек'];
 const WEEKDAYS = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
@@ -59,10 +65,10 @@ function modelName(model) {
     const name = m[0] ?? model;
     return name[0]?.toUpperCase() + name.slice(1) + (m.length > 1 ? ' ' + m.slice(1).join('.') : '');
 }
-function byFamily(days) {
+function byFamily(days, of = d => d.models) {
     const out = new Map();
     for (const d of days) {
-        for (const [model, usd] of Object.entries(d.models)) {
+        for (const [model, usd] of Object.entries(of(d))) {
             const f = family(model);
             const slot = out.get(f) ?? { usd: 0, names: new Set() };
             slot.usd += usd;
@@ -133,7 +139,7 @@ async function refresh(withStats = false) {
     online = list !== null;
     if (list)
         sessions = list;
-    if (withStats || !stats || tab === 'stats')
+    if (withStats || !stats || tab !== 'sessions')
         stats = await get('api/stats') ?? stats;
     render();
 }
@@ -201,11 +207,13 @@ function weeks(days) {
         const key = `${monday.getFullYear()}-${String(monday.getMonth() + 1).padStart(2, '0')}-${String(monday.getDate()).padStart(2, '0')}`;
         let w = out[out.length - 1];
         if (!w || w.day !== key) {
-            w = { day: key, usd: 0, models: {}, projects: {}, parts: [0, 0, 0, 0], tokens: 0, sessions: 0, started: 0 };
+            w = { day: key, usd: 0, models: {}, projects: {}, parts: [0, 0, 0, 0], tokens: 0, tokParts: [0, 0, 0, 0], tokModels: {}, tokProjects: {}, sessions: 0, started: 0 };
             out.push(w);
         }
         w.usd += d.usd;
         w.started += d.started;
+        w.tokens += d.tokens;
+        w.tokParts = w.tokParts.map((n, i) => n + (d.tokParts[i] ?? 0));
         for (const [m, usd] of Object.entries(d.models))
             w.models[m] = (w.models[m] ?? 0) + usd;
     }
@@ -222,29 +230,30 @@ function tipOf(title, d, extra = '') {
         .flatMap(([, ms]) => ms.map(([m, usd]) => `${modelName(m)}: ${money(usd)}`));
     return `<b>${esc(title)}</b><br>итого ${money(d.usd)}${lines.length ? '<br>' + lines.join('<br>') : ''}${extra}`;
 }
+const usdByModel = r => MODELS.map(f => [color(f), Object.entries(r.models).filter(([m]) => family(m) === f).reduce((a, [, v]) => a + v, 0)]);
 // stacked bars, one per day or week, models in fixed order bottom-up
-function barChart(rows, label, tip, h = 104) {
-    const left = 40, top = 6, bottom = 14;
+function barChart(rows, label, tip, h = 104, stack = usdByModel, fmt = money) {
+    const top = 6, bottom = 14;
     const plot = h - top - bottom;
-    const max = niceMax(Math.max(...rows.map(r => r.usd), 0));
+    const max = niceMax(Math.max(...rows.map(r => stack(r).reduce((a, [, v]) => a + v, 0)), 0));
+    const left = Math.max(40, Math.ceil(Math.max(...[0, 0.5, 1].map(k => fmt(max * k).length)) * 5.5) + 6);
     const step = (W - left) / Math.max(rows.length, 1);
     const bw = Math.max(1, Math.floor(step) - (step > 6 ? 2 : 1));
     let s = '';
     for (const k of [0, 0.5, 1]) {
         const y = Math.round(top + plot - plot * k);
         s += `<rect x="${left}" y="${y}" width="${W - left}" height="1" fill="var(--line)"/>`;
-        s += `<text x="${left - 4}" y="${y + 3}" text-anchor="end">${money(max * k)}</text>`;
+        s += `<text x="${left - 4}" y="${y + 3}" text-anchor="end">${fmt(max * k)}</text>`;
     }
     rows.forEach((r, i) => {
         const x = Math.round(left + i * step + (step - bw) / 2);
         let y = top + plot;
-        for (const f of MODELS) {
-            const usd = Object.entries(r.models).filter(([m]) => family(m) === f).reduce((a, [, v]) => a + v, 0);
-            const hh = Math.round((usd / max) * plot);
+        for (const [fill, v] of stack(r)) {
+            const hh = Math.round((v / max) * plot);
             if (hh <= 0)
                 continue;
             y -= hh;
-            s += `<rect x="${x}" y="${y}" width="${bw}" height="${Math.max(hh - 1, 1)}" fill="${color(f)}"/>`;
+            s += `<rect x="${x}" y="${y}" width="${bw}" height="${Math.max(hh - 1, 1)}" fill="${fill}"/>`;
         }
         s += `<rect class="hit" x="${Math.round(left + i * step)}" y="0" width="${Math.ceil(step)}" height="${top + plot}" data-tip="${esc(tip(r, i))}"/>`;
     });
@@ -288,12 +297,17 @@ function heatmap(all) {
         s += `<text x="${left + hr * cw + (cw - 2) / 2}" y="${hy}" text-anchor="middle">${hr}</text>`;
     return `<svg viewBox="0 0 ${W} ${hy + 2}">${s}</svg>`;
 }
-function barList(rows, total) {
+function barList(rows, total, fmt = money) {
     const max = Math.max(...rows.map(r => r.usd), 0.01);
     return '<div class="bars">' + rows.map(r => `<div class="line"${r.tip ? ` data-tip="${esc(r.tip)}"` : ''}>
-    <span class="name">${r.fill.startsWith('var(--m-') ? `<i style="background:${r.fill}"></i>` : ''}${esc(r.name)}</span>
+    <span class="name">${/^var\(--[mt]-/.test(r.fill) ? `<i style="background:${r.fill}"></i>` : ''}${esc(r.name)}</span>
     <span class="track"><span class="fill" style="display:block;width:${(r.usd / max) * 100}%;background:${r.fill}"></span></span>
-    <span class="val">${money(r.usd)} <small>${pct(r.usd, total)}</small></span></div>`).join('') + '</div>';
+    <span class="val">${fmt(r.usd)} <small>${pct(r.usd, total)}</small></span></div>`).join('') + '</div>';
+}
+function rangeBar(all, days) {
+    return `<div class="seg">${ranges(all)
+        .map(([k, t]) => `<button data-range="${k}" class="${range === k ? 'on' : ''}">${t}</button>`).join('')}
+    <span class="since">${short(days[0].day)} — ${short(days[days.length - 1].day)}</span></div>`;
 }
 function renderStats() {
     if (!stats)
@@ -308,9 +322,7 @@ function renderStats() {
     const started = days.reduce((a, d) => a + d.started, 0);
     const active = days.filter(d => d.usd > 0).length;
     const tokensSum = days.reduce((a, d) => a + d.tokens, 0);
-    let html = `<div class="seg">${ranges(all)
-        .map(([k, t]) => `<button data-range="${k}" class="${range === k ? 'on' : ''}">${t}</button>`).join('')}
-    <span class="since">${short(days[0].day)} — ${short(days[days.length - 1].day)}</span></div>`;
+    let html = rangeBar(all, days);
     html += `<div class="tiles four">
     <div class="tile pix"><div class="k">Потрачено</div><div class="v">${money(total)}</div><div class="s">${tokens(tokensSum)} ток.</div></div>
     <div class="tile pix"><div class="k">В день</div><div class="v">${money(active ? total / active : 0)}</div><div class="s">${active} из ${days.length} дн.</div></div>
@@ -363,13 +375,84 @@ function renderStats() {
     html += `<p class="note">История с ${short(stats.since)}. Сервер копит её в своей папке, поэтому она переживает чистку журналов Claude Code.</p>`;
     return html;
 }
+// ── Tokens tab: the same history counted in tokens, no dollars ──
+const KINDS = [
+    { name: 'Вход', fill: 'var(--t-in)', tip: 'новый текст в контексте: ваши сообщения, файлы, вывод команд' },
+    { name: 'Ответы модели', fill: 'var(--t-out)', tip: 'то, что пишет модель: текст, код, вызовы инструментов' },
+    { name: 'Чтение кэша', fill: 'var(--t-read)', tip: 'контекст, перечитанный из кэша на каждом шаге, — растёт с длиной сессии' },
+    { name: 'Запись в кэш', fill: 'var(--t-write)', tip: 'контекст, положенный в кэш на 5 минут или час' },
+];
+// history from before the split knows only the total
+const unsplit = (d) => Math.max(0, d.tokens - d.tokParts.reduce((a, n) => a + n, 0));
+const tokByKind = r => [...KINDS.map((k, i) => [k.fill, r.tokParts[i] ?? 0]), ['var(--muted)', unsplit(r)]];
+function tokenTip(title, d, extra = '') {
+    const lines = KINDS.map((k, i) => [k.name, d.tokParts[i] ?? 0]).filter(([, n]) => n > 0)
+        .map(([name, n]) => `${name}: ${tokens(n)}`);
+    if (unsplit(d))
+        lines.push(`без разбивки: ${tokens(unsplit(d))}`);
+    return `<b>${esc(title)}</b><br>итого ${tokens(d.tokens)}${lines.length ? '<br>' + lines.join('<br>') : ''}${extra}`;
+}
+// «4.4 млрд» does not fit a third of the popover in the big font: the unit goes small
+function big(n) {
+    const [num, unit] = tokens(n).split(' ');
+    return unit ? `${num}<small>${unit}</small>` : num;
+}
+function renderTokens() {
+    if (!stats)
+        return `<div class="empty">${online ? 'Считаю токены по журналам…' : 'Сервер не отвечает'}</div>`;
+    const all = stats.days;
+    if (!all.length)
+        return '<div class="empty">Журналов с токенами пока нет</div>';
+    if (!ranges(all).some(([k]) => k === range))
+        range = 'all';
+    const days = rangeDays(all);
+    const sum = (ds) => ds.reduce((a, d) => a + d.tokens, 0);
+    const total = sum(days);
+    const active = days.filter(d => d.tokens > 0).length;
+    const today = all[all.length - 1];
+    const out = days.reduce((a, d) => a + (d.tokParts[1] ?? 0), 0);
+    let html = rangeBar(all, days);
+    html += `<div class="tiles">
+    <div class="tile pix"><div class="k">Сегодня</div><div class="v">${big(today.tokens)}</div><div class="s">с 00:00</div></div>
+    <div class="tile pix"><div class="k">В день</div><div class="v">${big(active ? total / active : 0)}</div><div class="s">${active} из ${days.length} дн.</div></div>
+    <div class="tile pix"><div class="k">Всё время</div><div class="v">${big(sum(all))}</div><div class="s">с ${short(stats.since)}</div></div>
+  </div>`;
+    const byWeek = days.length > 45;
+    const rows = byWeek ? weeks(days) : days;
+    html += `<section><h3>${byWeek ? 'ПО НЕДЕЛЯМ' : 'ПО ДНЯМ'} <span class="hint">${tokens(total)} за период</span></h3><div class="chart pix">`;
+    html += barChart(rows, r => short(r.day), r => tokenTip(byWeek ? 'неделя с ' + short(r.day) : `${WEEKDAYS[weekday(r.day)]}, ${short(r.day)}`, r), 104, tokByKind, tokens);
+    html += '<div class="legend">' + KINDS.map(k => `<span><i style="background:${k.fill}"></i>${k.name}</span>`).join('') + '</div></div></section>';
+    const parts = KINDS.map((k, i) => ({ name: k.name, usd: days.reduce((a, d) => a + (d.tokParts[i] ?? 0), 0), fill: k.fill, tip: `<b>${k.name}</b><br>${k.tip}` }));
+    const rest = days.reduce((a, d) => a + unsplit(d), 0);
+    if (rest > 0)
+        parts.push({ name: 'Без разбивки', usd: rest, fill: 'var(--muted)', tip: '<b>Без разбивки</b><br>история, журналы которой Claude Code уже удалил: известно только общее число' });
+    html += '<section><h3>ИЗ ЧЕГО <span class="hint">наведите на строку</span></h3><div class="stack">'
+        + parts.filter(p => p.usd > 0).map(p => `<span style="flex:${p.usd};background:${p.fill}"></span>`).join('') + '</div>';
+    html += barList(parts, total, tokens) + '</section>';
+    html += `<p class="note">Модель написала <b>${tokens(out)}</b> — ${pct(out, total)} от всех токенов периода. Остальное — контекст, который она читает на каждом шаге.</p>`;
+    const fams = byFamily(days, d => d.tokModels);
+    html += '<section><h3>МОДЕЛИ</h3>';
+    html += barList(MODELS.filter(f => fams.has(f)).map(f => ({ name: [...fams.get(f).names].join(', '), usd: fams.get(f).usd, fill: color(f) })), total, tokens);
+    html += '</section>';
+    const projects = new Map();
+    for (const d of days)
+        for (const [p, n] of Object.entries(d.tokProjects))
+            projects.set(p, (projects.get(p) ?? 0) + n);
+    const top = [...projects].sort((a, b) => b[1] - a[1]);
+    const shown = top.slice(0, 6).map(([name, n]) => ({ name, usd: n, fill: 'var(--gold)' }));
+    const other = top.slice(6).reduce((a, [, n]) => a + n, 0);
+    if (other > 0)
+        shown.push({ name: `прочие (${top.length - 6})`, usd: other, fill: 'var(--muted)' });
+    html += '<section><h3>ПАПКИ</h3>' + barList(shown, total, tokens) + '</section>';
+    return html;
+}
 // ── Render ──
 function render() {
     renderState();
     document.querySelectorAll('nav button').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
     const main = $('main');
     const y = window.scrollY;
-    main.innerHTML = tab === 'stats' ? renderStats() : renderSessions();
+    main.innerHTML = tab === 'stats' ? renderStats() : tab === 'tokens' ? renderTokens() : renderSessions();
     window.scrollTo(0, y);
     $('autostart').classList.toggle('on', autostart);
     fit();
@@ -386,7 +469,7 @@ document.addEventListener('click', e => {
         keep('tab', tab);
         window.scrollTo(0, 0);
         render();
-        if (tab === 'stats')
+        if (tab !== 'sessions')
             refresh(true);
         return;
     }

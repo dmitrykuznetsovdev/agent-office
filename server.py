@@ -149,9 +149,14 @@ def message_cost(model, usage):
     return sum(cost_parts(model, usage))
 
 
+def token_parts(usage):
+    """Токены ответа по статьям, в том же порядке, что cost_parts."""
+    return [usage.get('input_tokens', 0), usage.get('output_tokens', 0),
+            usage.get('cache_read_input_tokens', 0), sum(cache_writes(usage))]
+
+
 def tokens_of(usage):
-    return (usage.get('input_tokens', 0) + usage.get('output_tokens', 0)
-            + usage.get('cache_read_input_tokens', 0) + sum(cache_writes(usage)))
+    return sum(token_parts(usage))
 
 
 def day_of(at_ms):
@@ -600,26 +605,38 @@ HEAT_DAYS = 35  # сколько дней отдавать почасово, д�
 
 def blank_day(day):
     return {'day': day, 'usd': 0.0, 'models': {}, 'projects': {}, 'parts': [0.0, 0.0, 0.0, 0.0], 'tokens': 0,
-            'sessions': 0, 'started': 0}
+            'tokParts': [0, 0, 0, 0], 'tokModels': {}, 'tokProjects': {}, 'sessions': 0, 'started': 0}
 
 
 class Ledger:
     """Сводка трат по часам, моделям и папкам. Лежит на диске: Claude Code
     чистит журналы через месяц, а история трат остаётся."""
     IDS = 64  # ответ модели пишется кусками подряд — помним последние id файла
+    VERSION = 2  # 2: токены по статьям в ячейке
 
     def __init__(self, path):
         self.path = path
         self.files = {}  # журнал → {offset, ids, days, main}
-        self.hours = {}  # 'ГГГГ-ММ-ДДTЧЧ' → {папка: {модель: [вход, выход, чтение кэша, запись в кэш, токены]}}
+        # 'ГГГГ-ММ-ДДTЧЧ' → {папка: {модель: [$ вход, выход, чтение кэша, запись в кэш, токены, те же статьи в токенах]}}
+        self.hours = {}
         self.dirty = False
         self.saved_at = 0
         try:
             with open(path) as f:
                 data = json.load(f)
-            self.files, self.hours = data['files'], data['hours']
+            files, hours = data['files'], data['hours']
         except (OSError, ValueError, KeyError, TypeError):
-            pass
+            return
+        # старая сводка без токенов по статьям: пока журналы на месте, читаем их заново,
+        # иначе оставляем как есть — у той истории будет только общее число токенов
+        if data.get('v') != self.VERSION and all(os.path.exists(f) for f in files):
+            self.dirty = True
+            return
+        for projects in hours.values():
+            for models in projects.values():
+                for cell in models.values():
+                    cell.extend([0] * (9 - len(cell)))
+        self.files, self.hours = files, hours
 
     def scan(self, root=None):
         root = root or PROJECTS
@@ -677,15 +694,15 @@ class Ledger:
             rec['ids'].append(mid)
             del rec['ids'][:-self.IDS]
         model = msg.get('model') or '?'
-        parts, tokens = cost_parts(model, usage), tokens_of(usage)
+        parts, toks = cost_parts(model, usage), token_parts(usage)
+        tokens = sum(toks)
         if not tokens:
             return
         hour = time.strftime('%Y-%m-%dT%H', time.localtime(at / 1000))
         project = os.path.basename(home_of(d.get('cwd'))) or '?'
-        cell = self.hours.setdefault(hour, {}).setdefault(project, {}).setdefault(model, [0.0, 0.0, 0.0, 0.0, 0])
-        for i, usd in enumerate(parts):
-            cell[i] += usd
-        cell[4] += tokens
+        cell = self.hours.setdefault(hour, {}).setdefault(project, {}).setdefault(model, [0.0, 0.0, 0.0, 0.0, 0, 0, 0, 0, 0])
+        for i, n in enumerate(parts + [tokens] + toks):
+            cell[i] += n
         if rec['main'] and hour[:10] not in rec['days']:
             rec['days'].append(hour[:10])
 
@@ -695,7 +712,7 @@ class Ledger:
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         tmp = self.path + '.tmp'
         with open(tmp, 'w') as f:
-            json.dump({'files': self.files, 'hours': self.hours}, f, separators=(',', ':'))
+            json.dump({'v': self.VERSION, 'files': self.files, 'hours': self.hours}, f, separators=(',', ':'))
         os.replace(tmp, self.path)
         self.dirty, self.saved_at = False, time.time()
 
@@ -717,6 +734,9 @@ class Ledger:
                     row['projects'][project] = row['projects'].get(project, 0.0) + usd
                     row['parts'] = [a + b for a, b in zip(row['parts'], cell[:4])]
                     row['tokens'] += cell[4]
+                    row['tokParts'] = [a + b for a, b in zip(row['tokParts'], cell[5:9])]
+                    row['tokModels'][model] = row['tokModels'].get(model, 0) + cell[4]
+                    row['tokProjects'][project] = row['tokProjects'].get(project, 0) + cell[4]
             row['usd'] += spent
             if hour >= since_24:
                 last24 += spent
