@@ -1,0 +1,76 @@
+{
+  "folder": "/path/to/your/project",
+  "title": "МАСТЕРСКАЯ",
+  "zones": [
+    {
+      "name": "РАЗВЕДКА",
+      "desks": [
+        {
+          "type": "main",
+          "name": "Тимлид",
+          "prop": "crown",
+          "shirt": "#3b3f8f",
+          "hair": "#4a3020",
+          "skin": 1
+        },
+        {
+          "type": "my-plugin:investigator",
+          "name": "Сыщик",
+          "prop": "magnifier",
+          "shirt": "#2f6f6a",
+          "hair": "#2b1d14",
+          "skin": 2
+        }
+      ]
+    },
+    {
+      "name": "РАЗРАБОТКА",
+      "desks": [
+        {
+          "type": "my-plugin:builder",
+          "name": "Сборщик",
+          "prop": "box",
+          "shirt": "#a0602a",
+          "hair": "#5a3a1a",
+          "skin": 0
+        },
+        {
+          "type": "my-plugin:designer",
+          "name": "Дизайнер",
+          "prop": "tablet",
+          "shirt": "#7a3fb0",
+          "hair": "#e05a8a",
+          "skin": 3
+        }
+      ]
+    },
+    {
+      "name": "КАЧЕСТВО",
+      "desks": [
+        {
+          "type": "my-plugin:reviewer",
+          "name": "Ревьюер",
+          "prop": "clipboard",
+          "shirt": "#8f2f3a",
+          "hair": "#222",
+          "skin": 4
+        }
+      ]
+    }
+  ],
+  "guests": {
+    "general-purpose": {
+      "name": "Фрилансер",
+      "prop": "cap"
+    },
+    "Explore": {
+      "name": "Разведчик",
+      "prop": "binoculars"
+    },
+    "Plan": {
+      "name": "Архитектор",
+      "prop": "paper"
+    }
+  },
+  "generated": "manual"
+}

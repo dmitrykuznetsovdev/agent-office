@@ -1,0 +1,15 @@
+{
+  "name": "agent-office",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pixel office for watching Claude Code agents at work",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p .",
+    "check": "tsc -p . --noEmit",
+    "test": "python3 -m unittest discover -s tests"
+  },
+  "devDependencies": {
+    "typescript": "5.6.3"
+  }
+}

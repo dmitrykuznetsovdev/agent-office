@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Office</title>
+<style>
+  :root { --bg: #14151f; --panel: #1c1d2b; --line: #2a2c40; --text: #e8e6f0; --muted: #8a8fb0; --gold: #f0c040; --ok: #4ade80; --off: #e05a5a; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 14px/1.4 -apple-system, Helvetica, sans-serif; }
+  body { display: grid; grid-template-columns: 1fr 340px; grid-template-rows: auto 1fr; height: 100vh; }
+  header { grid-column: 1 / -1; display: flex; align-items: center; gap: 12px; padding: 8px 16px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  header .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--off); flex: none; }
+  header .dot.on { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  header .title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  header .status { color: var(--muted); font-size: 13px; white-space: nowrap; }
+  header .spacer { flex: 1; }
+  header .total { font: 600 15px Menlo, monospace; color: #6ee7a0; }
+  .sess .m .usd { color: #6ee7a0; font-family: Menlo, monospace; }
+  button { background: #2e3150; color: var(--text); border: 1px solid #44486a; border-radius: 6px; padding: 6px 12px; font: inherit; cursor: pointer; }
+  button:hover { background: #3a3e63; }
+  main { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+  .banner { display: flex; align-items: center; gap: 12px; margin: 12px 12px 0; padding: 8px 12px; border: 1px dashed #44486a; border-radius: 8px; color: var(--muted); font-size: 13px; }
+  .banner span { flex: 1; }
+  .banner.quiet { border: 0; padding: 0 12px; margin-top: 8px; justify-content: flex-end; }
+  .banner.quiet span { flex: 0 1 auto; }
+  .banner.quiet button { padding: 3px 9px; font-size: 12px; }
+  button:disabled { opacity: .55; cursor: default; }
+  #office { flex: 1; display: flex; align-items: center; justify-content: center; padding: 12px; min-height: 0; min-width: 0; }
+  #office svg { width: 100%; height: 100%; max-height: calc(100vh - 70px); image-rendering: pixelated; }
+  aside { border-left: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; min-height: 0; }
+  aside section { padding: 12px 14px; overflow: auto; }
+  aside section.sessions { max-height: 45%; border-bottom: 1px solid var(--line); flex: none; }
+  aside section.log { flex: 1; min-height: 0; }
+  aside h2 { margin: 0 0 8px; font-size: 12px; letter-spacing: .08em; color: var(--muted); font-weight: 600; display: flex; justify-content: space-between; align-items: center; }
+  aside h2 label { font-weight: 400; letter-spacing: 0; font-size: 12px; cursor: pointer; }
+  .sess { display: block; width: 100%; text-align: left; margin: 0 0 6px; padding: 7px 10px; background: #23253a; border: 1px solid transparent; border-radius: 8px; }
+  .sess:hover { background: #2b2e48; }
+  .sess.sel { border-color: var(--gold); background: #2b2e48; }
+  .sess .t { display: flex; gap: 7px; align-items: center; font-weight: 600; }
+  .sess .t span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sess .m { color: var(--muted); font-size: 12px; margin-top: 2px; padding-left: 15px; }
+  .sess .d { width: 8px; height: 8px; border-radius: 50%; background: #4a4d68; flex: none; }
+  .sess .d.live { background: var(--ok); }
+  .sess .d.busy { background: var(--gold); box-shadow: 0 0 6px var(--gold); }
+  .line { padding: 5px 0; border-bottom: 1px solid #25273a; font-size: 13px; }
+  .line time { color: var(--muted); font-family: Menlo, monospace; font-size: 12px; margin-right: 6px; }
+  .line b { color: var(--gold); font-weight: 600; }
+  .empty { color: var(--muted); }
+  @media (max-width: 900px) {
+    body { grid-template-columns: 1fr; grid-template-rows: auto auto 1fr; height: auto; }
+    aside { border-left: 0; border-top: 1px solid var(--line); }
+    aside section.sessions { max-height: none; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <span class="title" id="title">Agent Office</span>
+  <span class="status" id="status">подключаюсь…</span>
+  <span class="spacer"></span>
+  <span class="total" id="total"></span>
+</header>
+<main>
+  <div class="banner" id="banner" hidden>
+    <span id="bannerText"></span>
+    <button id="gen">Сгенерировать офис</button>
+  </div>
+  <div id="office"></div>
+</main>
+<aside>
+  <section class="sessions">
+    <h2>СЕССИИ <label><input type="checkbox" id="follow"> следить за активной</label></h2>
+    <div id="sessions"><div class="empty">Ищу сессии…</div></div>
+  </section>
+  <section class="log">
+    <h2>ЖУРНАЛ</h2>
+    <div id="log"><div class="empty">Пока тихо.</div></div>
+  </section>
+</aside>
+<script type="module">
+// метка в адресе: после правок office.js браузер не держит старый модуль
+const { render, roleName, money } = await import('./office.js?' + Date.now())
+
+const $ = id => document.getElementById(id)
+const office = $('office'), logBox = $('log'), dot = $('dot'), status = $('status')
+const titleEl = $('title'), list = $('sessions'), follow = $('follow'), total = $('total')
+
+let sessions = []
+let current = location.hash.slice(1)   // выбранная сессия живёт в адресе
+let live = null, lastText = '', lastDraw = 0
+
+follow.checked = !current
+function save(key, value) { try { localStorage.setItem(key, value) } catch {} }
+try { if (!current && localStorage.getItem('office.follow') === '0') follow.checked = false } catch {}
+
+const who = w => roleName(w, live?.office)
+const banner = $('banner'), bannerText = $('bannerText'), gen = $('gen')
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c])
+const hhmm = at => new Date(at).toTimeString().slice(0, 5)
+
+function ago(at) {
+  const m = Math.round((Date.now() - at) / 60000)
+  if (m < 1) return 'только что'
+  if (m < 60) return m + ' мин назад'
+  return Math.floor(m / 60) + ' ч назад'
+}
+
+function draw(st) {
+  // свежий <svg> — свои часы анимаций; отрицательный begin делает остальное
+  office.innerHTML = render(st, Date.now(), st.office)
+  drawBanner(st.office)
+  lastDraw = Date.now()
+  const lines = st.log.slice(-80).reverse()
+  logBox.innerHTML = lines.length === 0
+    ? '<div class="empty">Пока тихо.</div>'
+    : lines.map(l => `<div class="line"><time>${new Date(l.at).toTimeString().slice(0, 8)}</time><b>${esc(who(l.who))}</b> · ${esc(l.text)}</div>`).join('')
+}
+
+function drawList() {
+  if (sessions.length === 0) {
+    list.innerHTML = '<div class="empty">За сутки сессий не было.</div>'
+    return
+  }
+  const html = sessions.map(s => {
+    const cls = s.working ? 'busy' : s.isLive ? 'live' : ''
+    const work = s.working ? `в работе ${s.working}` : ago(s.at)
+    const agents = s.agents ? ` · агентов ${s.agents}` : ''
+    const usd = s.cost ? ` · <span class="usd">${money(s.cost)}</span>` : ''
+    return `<button class="sess${s.id === current ? ' sel' : ''}" data-id="${s.id}">
+      <div class="t"><span class="d ${cls}"></span><span>${esc(s.title)}</span></div>
+      <div class="m">${esc(s.project)} · ${work}${agents}${usd}</div></button>`
+  }).join('')
+  // не трогать список без перемен: иначе клик попадает в уже заменённую кнопку
+  if (html !== list.dataset.html) {
+    list.dataset.html = html
+    list.innerHTML = html
+  }
+}
+
+list.addEventListener('click', e => {
+  const b = e.target.closest('.sess')
+  if (!b) return
+  follow.checked = false
+  save('office.follow', '0')
+  pick(b.dataset.id)
+})
+
+follow.addEventListener('change', () => {
+  save('office.follow', follow.checked ? '1' : '0')
+  if (follow.checked) autoPick()
+})
+
+function pick(id) {
+  if (id === current) return
+  current = id
+  history.replaceState(null, '', '#' + id)
+  lastText = ''
+  drawList()
+  pollState()
+}
+
+// самая активная: где больше всего работают, потом — где писали последней
+function autoPick() {
+  const best = [...sessions].sort((a, b) => (b.working - a.working) || (b.at - a.at))[0]
+  if (best) pick(best.id)
+}
+
+async function pollSessions() {
+  try {
+    const res = await fetch('api/sessions', { cache: 'no-store' })
+    if (!res.ok) throw new Error(res.status)
+    sessions = await res.json()
+    dot.classList.add('on')
+    if (follow.checked || !sessions.some(s => s.id === current)) autoPick()
+    drawList()
+  } catch {
+    dot.classList.remove('on')
+    status.textContent = 'сервер офиса не отвечает'
+  }
+}
+
+function drawBanner(o) {
+  banner.hidden = !o.folder || o.folder === '?'
+  if (banner.hidden) return
+  const place = o.folder.replace(/^\/Users\/[^/]+/, '~')
+  banner.classList.toggle('quiet', o.saved)
+  gen.disabled = !!o.generating
+  if (o.generating) {
+    bannerText.textContent = `Собираю офис для ${place}: смотрю, какие агенты есть, раздаю должности и столы. Около 20 секунд.`
+    gen.textContent = 'Генерирую…'
+  } else if (o.saved) {
+    bannerText.textContent = ''
+    gen.textContent = 'Пересобрать офис'
+  } else {
+    bannerText.textContent = `Для папки ${place} офиса ещё нет: столы расставлены по плагинам, должности из названий агентов.`
+    gen.textContent = 'Сгенерировать офис'
+  }
+}
+
+gen.addEventListener('click', async () => {
+  if (live?.office.saved && !confirm('Пересобрать офис этой папки заново? Нынешняя раскладка заменится.')) return
+  gen.disabled = true
+  live.office.generating = true
+  drawBanner(live.office)
+  try {
+    const res = await fetch('api/office?s=' + encodeURIComponent(current), { method: 'POST' })
+    if (!res.ok) alert('Не вышло: ' + ((await res.json()).error ?? res.status))
+  } catch (e) {
+    alert('Сервер офиса не ответил: ' + e)
+  }
+  lastText = ''
+  pollSessions()
+  pollState()
+})
+
+async function pollState() {
+  if (!current) return
+  try {
+    const id = current
+    const res = await fetch('api/state?s=' + encodeURIComponent(id), { cache: 'no-store' })
+    if (!res.ok || id !== current) return
+    const text = await res.text()
+    if (text !== lastText) {
+      lastText = text
+      live = JSON.parse(text)
+      draw(live)
+    } else if (Date.now() - lastDraw > 30000) {
+      draw(live)
+    }
+    const s = sessions.find(s => s.id === current)
+    titleEl.textContent = s ? s.title : 'Agent Office'
+    const working = live.agents.filter(a => a.isWorking).length + (live.producer.isBusy ? 1 : 0)
+    total.textContent = money(live.cost)
+    total.title = `${roleName('main', live.office)} ${money(live.producer.cost)}, агенты ${money(live.cost - live.producer.cost)}`
+    status.textContent = !s ? '' : s.isLive ? `${s.project} · в работе ${working}` : `${s.project} · затихла ${ago(s.at)}`
+  } catch {}
+}
+
+function empty() {
+  return { agents: [], producer: { isBusy: false, activity: '', at: 0, calls: 0, cost: 0 }, cost: 0, log: [], since: Date.now(),
+    office: { folder: '', title: 'AGENT OFFICE', zones: [], guests: {}, saved: true } }
+}
+
+draw(empty())
+await pollSessions()
+pollState()
+setInterval(pollSessions, 4000)
+setInterval(pollState, 1000)
+</script>
+</body>
+</html>
