@@ -271,6 +271,111 @@ class LedgerTest(unittest.TestCase):
         self.assertAlmostEqual(usd, self.usd)
 
 
+FAKE_OK = '''#!/usr/bin/env python3
+import json, sys
+sys.stdin.read()
+print(json.dumps({"is_error": False, "structured_output": {
+    "title": "Новый", "boss": {"name": "Тимлид", "prop": "crown"},
+    "zones": [{"name": "код", "desks": [{"type": "kit:builder", "name": "Сборщик", "prop": "box"}]}], "guests": []}}))
+'''
+FAKE_LOGGED_OUT = '''#!/usr/bin/env python3
+import json, sys
+sys.stdin.read()
+print(json.dumps({"is_error": True, "result": "Not logged in · Please run /login"}))
+sys.exit(1)
+'''
+FAKE_STUCK = '''#!/usr/bin/env python3
+import time
+time.sleep(30)
+'''
+
+
+class GenerationTest(unittest.TestCase):
+    roster = {'kit:builder': '', 'Explore': ''}
+    folder = '/work/app'
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.data, server.DATA = server.DATA, self.dir.name
+        self.find, self.timeout = server.find_claude, server.GEN_TIMEOUT
+        server.JOBS.clear()
+
+    def tearDown(self):
+        for job in server.JOBS.values():
+            if job.get('proc') and job['proc'].poll() is None:
+                job['proc'].kill()
+        server.DATA, server.find_claude, server.GEN_TIMEOUT = self.data, self.find, self.timeout
+        self.dir.cleanup()
+
+    def fake(self, body):
+        path = os.path.join(self.dir.name, 'claude')
+        with open(path, 'w') as f:
+            f.write(body)
+        os.chmod(path, 0o755)
+        server.find_claude = lambda: path
+
+    def saved(self, title):
+        os.makedirs(os.path.dirname(server.office_path(self.folder)), exist_ok=True)
+        with open(server.office_path(self.folder), 'w') as f:
+            json.dump({'folder': self.folder, 'title': title, 'zones': [], 'guests': {}}, f)
+
+    def wait(self):
+        for _ in range(100):
+            view = server.job_view(self.folder)
+            if view['status'] != 'running':
+                return view
+            time.sleep(0.05)
+        self.fail('generation did not finish')
+
+    def test_generation_runs_in_background_and_keeps_the_old_office_for_undo(self):
+        self.fake(FAKE_OK)
+        self.saved('СТАРЫЙ')
+        server.start_office(self.folder, self.roster)
+        self.assertEqual(self.wait()['status'], 'done')
+        self.assertEqual(server.load_office(self.folder)['title'], 'НОВЫЙ')
+        self.assertTrue(server.job_view(self.folder)['canUndo'])
+        self.assertTrue(server.undo_office(self.folder))
+        self.assertEqual(server.load_office(self.folder)['title'], 'СТАРЫЙ')
+        self.assertFalse(server.job_view(self.folder)['canUndo'])
+
+    def test_failure_names_the_reason_and_leaves_the_office_alone(self):
+        self.fake(FAKE_LOGGED_OUT)
+        self.saved('СТАРЫЙ')
+        server.start_office(self.folder, self.roster)
+        view = self.wait()
+        self.assertEqual(view['status'], 'failed')
+        self.assertIn('Not logged in', view['error'])
+        self.assertEqual(server.load_office(self.folder)['title'], 'СТАРЫЙ')
+
+    def test_no_office_is_written_when_generation_fails(self):
+        self.fake(FAKE_LOGGED_OUT)
+        server.start_office(self.folder, self.roster)
+        self.wait()
+        self.assertIsNone(server.load_office(self.folder))
+
+    def test_cancel_stops_claude(self):
+        self.fake(FAKE_STUCK)
+        self.saved('СТАРЫЙ')
+        server.start_office(self.folder, self.roster)
+        time.sleep(0.3)
+        self.assertTrue(server.cancel_office(self.folder))
+        self.assertEqual(self.wait()['status'], 'cancelled')
+        self.assertEqual(server.load_office(self.folder)['title'], 'СТАРЫЙ')
+
+    def test_timeout_explains_what_to_check(self):
+        self.fake(FAKE_STUCK)
+        server.GEN_TIMEOUT = 0.5
+        server.start_office(self.folder, self.roster)
+        view = self.wait()
+        self.assertEqual(view['status'], 'failed')
+        self.assertIn('/login', view['error'])
+
+    def test_second_start_while_running_is_refused(self):
+        self.fake(FAKE_STUCK)
+        server.start_office(self.folder, self.roster)
+        self.assertIsNone(server.start_office(self.folder, self.roster))
+
+
 class WatchParentTest(unittest.TestCase):
     def test_parent_alive_false_when_ppid_differs(self):
         self.assertTrue(server.parent_alive(os.getppid()))

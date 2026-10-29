@@ -297,7 +297,8 @@ PROPS = ['crown', 'headphones', 'camera', 'scissors', 'beret', 'beretRed', 'book
 SHIRTS = ['#2f4f8f', '#c0583a', '#5a7a2e', '#8f2f3a', '#4b5a8a', '#3a7a4a', '#7a3fb0', '#1f6f8f',
           '#b08a2e', '#2f7a5a', '#c04a6a', '#8a6a3a', '#a0602a', '#2f6f6a', '#6b2d5c', '#5a5f6a']
 HAIRS = ['#2b1d14', '#1a1a1a', '#6b4a2b', '#c9a227', '#9a9a9a', '#3a2416', '#8a5a2b', '#e05a8a']
-GENERATING = {}  # папка → время старта генерации
+GEN_TIMEOUT = 120  # с: большой офис собирается за 15–30 с; дольше — claude чего-то ждёт
+JOBS = {}  # папка → последняя генерация: status running|done|failed|cancelled, started, ended, error, proc
 
 
 def hash_of(text):
@@ -394,33 +395,114 @@ def find_claude():
     return None
 
 
-def generate_office(folder, roster):
-    """Раскладка по смыслу — одним вызовом claude -p; не вышло — автораскладка."""
-    office = None
+class GenError(Exception):
+    pass
+
+
+def ask_claude(folder, roster, job):
+    """Раскладка по смыслу — одним вызовом claude -p. Процесс лежит в job: его можно убить."""
     exe = find_claude()
+    if not exe:
+        raise GenError('не нашёл claude: нужен установленный Claude Code')
     agents = '\n'.join('- %s — %s' % (t, clip(d, 220)) for t, d in sorted(roster.items()))
     prompt = PROMPT.format(name=os.path.basename(folder), folder=folder, agents=agents or '(только универсальные)',
                            builtin=', '.join(sorted(BUILTIN)))
-    if exe:
-        try:
-            out = subprocess.run(
-                [exe, '-p', '--model', 'sonnet', '--tools', '', '--no-session-persistence', '--setting-sources', '',
-                 '--output-format', 'json', '--json-schema', json.dumps(SCHEMA),
-                 '--system-prompt', 'Ты раскладываешь агентов по пиксельному офису. Отвечай только JSON по схеме.'],
-                input=prompt, capture_output=True, text=True, timeout=180, cwd=DATA if os.path.isdir(DATA) else HERE,
-                env=dict(os.environ, PATH=os.path.dirname(exe) + ':' + os.environ.get('PATH', '/usr/bin:/bin')))
-            office = json.loads(out.stdout).get('structured_output')
-        except (subprocess.SubprocessError, ValueError, OSError) as e:
-            sys.stderr.write('генерация офиса: %s\n' % e)
+    try:
+        proc = subprocess.Popen(
+            [exe, '-p', '--model', 'sonnet', '--tools', '', '--no-session-persistence', '--setting-sources', '',
+             '--output-format', 'json', '--json-schema', json.dumps(SCHEMA),
+             '--system-prompt', 'Ты раскладываешь агентов по пиксельному офису. Отвечай только JSON по схеме.'],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            cwd=DATA if os.path.isdir(DATA) else HERE,
+            env=dict(os.environ, PATH=os.path.dirname(exe) + ':' + os.environ.get('PATH', '/usr/bin:/bin')))
+    except OSError as e:
+        raise GenError('claude не запустился: %s' % e)
+    job['proc'] = proc
+    try:
+        out, err = proc.communicate(prompt, timeout=GEN_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        raise GenError('claude не ответил за %d с. Обычно он ждёт входа: запустите claude в терминале и войдите '
+                       '(/login), а если macOS спросит доступ к связке ключей — разрешите' % GEN_TIMEOUT)
+    if job.get('cancel'):
+        return None
+    try:
+        answer = json.loads(out)
+    except ValueError:
+        raise GenError('claude ответил не JSON: %s' % clip(err or out or 'пусто', 160))
+    if answer.get('is_error'):
+        raise GenError('claude: %s' % clip(answer.get('result') or 'ошибка без описания', 160))
+    office = answer.get('structured_output')
     if not office or not office.get('zones'):
-        result = auto_office(folder, roster)
-        result['generated'] = 'auto'
-    else:
-        result = tidy(folder, roster, office)
-    os.makedirs(os.path.dirname(office_path(folder)), exist_ok=True)
-    with open(office_path(folder), 'w') as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-    return result
+        raise GenError('claude вернул офис без отделов')
+    return office
+
+
+def backup_path(folder):
+    return office_path(folder)[:-5] + '.prev.json'
+
+
+def run_office(folder, roster, job):
+    """Фоновая генерация: при успехе прежний офис уходит в .prev.json, при неудаче остаётся как был."""
+    try:
+        office = ask_claude(folder, roster, job)
+        if office is not None:
+            result = tidy(folder, roster, office)
+            path = office_path(folder)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            if os.path.exists(path):
+                os.replace(path, backup_path(folder))
+            with open(path, 'w') as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+        job['status'] = 'cancelled' if job.get('cancel') else 'done'
+    except GenError as e:
+        job['status'], job['error'] = 'failed', str(e)
+    except Exception as e:  # генерация в потоке: ошибка не должна оставить «running» навсегда
+        job['status'], job['error'] = 'failed', 'сбой: %s' % e
+    finally:
+        sys.stderr.write('генерация офиса %s: %s %s\n' % (folder, job['status'], job.get('error', '')))
+        job['ended'] = time.time()
+
+
+def start_office(folder, roster):
+    """Запустить генерацию; None — уже идёт."""
+    job = JOBS.get(folder)
+    if job and job['status'] == 'running':
+        return None
+    job = JOBS[folder] = {'status': 'running', 'started': time.time(), 'ended': 0, 'error': ''}
+    threading.Thread(target=run_office, args=(folder, roster, job), daemon=True).start()
+    return job
+
+
+def cancel_office(folder):
+    job = JOBS.get(folder)
+    if not job or job['status'] != 'running':
+        return False
+    job['cancel'] = True
+    proc = job.get('proc')
+    if proc and proc.poll() is None:
+        proc.kill()
+    return True
+
+
+def undo_office(folder):
+    """Вернуть офис, который был до последней генерации."""
+    prev = backup_path(folder)
+    if not os.path.exists(prev):
+        return False
+    os.replace(prev, office_path(folder))
+    job = JOBS.get(folder)
+    if job and job['status'] == 'done':
+        job['status'] = 'undone'
+    return True
+
+
+def job_view(folder):
+    job = JOBS.get(folder) or {}
+    return {'status': job.get('status', ''), 'started': int(job.get('started', 0) * 1000),
+            'ended': int(job.get('ended', 0) * 1000), 'error': job.get('error', ''),
+            'canUndo': os.path.exists(backup_path(folder)), 'timeout': GEN_TIMEOUT}
 
 
 def tidy(folder, roster, raw):
@@ -716,7 +798,8 @@ def office_for(t):
     saved = load_office(t.home) if t.home else None
     office = saved or auto_office(t.home or '?', t.roster)
     office['saved'] = bool(saved)
-    office['generating'] = t.home in GENERATING
+    office['job'] = job_view(t.home) if t.home else None
+    office['generating'] = bool(office['job']) and office['job']['status'] == 'running'
     return office
 
 
@@ -778,25 +861,24 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_POST(self):
+        # /api/office — собрать заново, /api/office/cancel — отменить, /api/office/undo — вернуть прежний
         url = urlparse(self.path)
-        if url.path != '/api/office':
+        action = {'/api/office': 'start', '/api/office/cancel': 'cancel', '/api/office/undo': 'undo'}.get(url.path)
+        if not action:
             return self.send_json({'error': 'нет такого адреса'}, 404)
         sid = parse_qs(url.query).get('s', [''])[0]
         with LOCK:
             t = find_tail(sid)
             if not t or not t.home:
                 return self.send_json({'error': 'у сессии не нашлась папка'}, 404)
-            if t.home in GENERATING:
-                return self.send_json({'error': 'офис уже генерируется'}, 409)
             folder, roster = t.home, dict(t.roster)
-            GENERATING[folder] = time.time()
-        try:
-            office = generate_office(folder, roster)  # десятки секунд: без замка
-        except Exception as e:
-            return self.send_json({'error': str(e)}, 500)
-        finally:
-            GENERATING.pop(folder, None)
-        return self.send_json(office)
+        if action == 'start' and not start_office(folder, roster):
+            return self.send_json({'error': 'офис уже собирается'}, 409)
+        if action == 'cancel' and not cancel_office(folder):
+            return self.send_json({'error': 'отменять нечего'}, 409)
+        if action == 'undo' and not undo_office(folder):
+            return self.send_json({'error': 'прежнего офиса нет'}, 409)
+        return self.send_json(job_view(folder), 202 if action == 'start' else 200)
 
     def do_GET(self):
         url = urlparse(self.path)

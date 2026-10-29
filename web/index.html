@@ -41,9 +41,14 @@
 
   main { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
   .bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px var(--gap); padding: 12px var(--gap) 0; color: var(--muted); font-size: 12px; }
-  /* пустая подсказка не занимает места, иначе кнопка уезжает на новую строку */
-  .bar .note { flex: 1 1 0; min-width: 0; }
+  /* подсказка о генерации — своей строкой под переключателями; пустая не занимает места */
+  .bar .note { flex: 1 1 100%; min-width: 0; color: var(--text); }
   .bar .note:empty { display: none; }
+  .bar .note b.bad { color: var(--off); }
+  .bar .note b.good { color: var(--ok); }
+  .bar .note .dim { opacity: .6; }
+  .bar .note button.mini { padding: 1px 7px; margin: 0 4px; font-size: 11px; }
+  .spin { display: inline-block; width: 8px; height: 8px; margin-right: 7px; background: var(--gold); animation: blink .6s steps(2, jump-none) infinite; }
   .bar .k { font: 600 11px Menlo, monospace; letter-spacing: .1em; text-transform: uppercase; margin-right: 6px; }
   .bar .group { display: flex; align-items: center; }
 
@@ -259,26 +264,46 @@ async function pollSessions() {
   }
 }
 
+// Генерация офиса идёт на сервере в фоне: здесь только её состояние и кнопки.
+// Пересобрать можно сразу — прежний офис сервер сохраняет, его можно вернуть.
+const clockOf = ms => { const s = Math.max(0, Math.round(ms / 1000)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}` }
+const RECENT = 15 * 60e3   // итог генерации висит столько, пока его не закрыли
+let ticking = 0
+
+function seenKey(o) { return 'office.seen.' + o.folder }
+function seen(o) { try { return Number(localStorage.getItem(seenKey(o)) || 0) } catch { return 0 } }
+
 function drawBanner(o) {
+  const job = o.job
   gen.hidden = !o.folder || o.folder === '?'
   if (gen.hidden) { bannerText.textContent = ''; return }
   const place = o.folder.replace(/^\/Users\/[^/]+/, '~')
-  gen.disabled = !!o.generating
-  gen.classList.toggle('main', !o.saved)
-  if (o.generating) {
-    bannerText.textContent = `Собираю офис для ${place}: смотрю, какие агенты есть, раздаю должности и столы. Около 20 секунд.`
-    gen.textContent = 'Генерирую…'
-  } else if (armed) {
-    bannerText.textContent = 'Нынешняя раскладка столов заменится новой.'
-    gen.textContent = 'Точно пересобрать?'
-  } else if (o.saved) {
-    bannerText.textContent = ''
-    gen.textContent = 'Пересобрать офис'
-  } else {
-    bannerText.textContent = `Для папки ${place} офиса ещё нет: столы расставлены по плагинам, должности из названий агентов.`
-    gen.textContent = 'Сгенерировать офис'
+  const running = job?.status === 'running'
+  clearInterval(ticking)
+  if (running) ticking = setInterval(() => drawBanner(o), 1000)
+  gen.disabled = false
+  gen.classList.toggle('warn', running)
+  gen.classList.toggle('main', !running && (!o.saved || job?.status === 'failed'))
+  gen.dataset.act = running ? 'cancel' : 'start'
+  gen.textContent = running ? 'Отменить' : job?.status === 'failed' ? 'Повторить' : o.saved ? 'Пересобрать офис' : 'Сгенерировать офис'
+  const fresh = job && job.ended && Date.now() - job.ended < RECENT && job.ended > seen(o)
+  const close = '<button class="mini" data-act="seen" title="Скрыть">×</button>'
+  let html = ''
+  if (running) {
+    html = `<span class="spin"></span>Собираю офис для ${esc(place)}: claude раздаёт должности и столы · ${clockOf(Date.now() - job.started)} <span class="dim">из ${clockOf(job.timeout * 1000)}</span>`
+  } else if (fresh && job.status === 'failed') {
+    html = `<b class="bad">Не собралось.</b> ${esc(job.error)}. Офис остался прежним. ${close}`
+  } else if (fresh && job.status === 'cancelled') {
+    html = `Отменено, офис остался прежним. ${close}`
+  } else if (fresh && job.status === 'done') {
+    html = `<b class="good">Офис пересобран</b> за ${clockOf(job.ended - job.started)}.` +
+      (job.canUndo ? ' <button class="mini" data-act="undo">Вернуть прежний</button>' : '') + ` ${close}`
+  } else if (fresh && job.status === 'undone') {
+    html = `Вернул прежний офис. ${close}`
+  } else if (!o.saved) {
+    html = `Для ${esc(place)} офиса ещё нет: столы расставлены по плагинам, должности из названий агентов.`
   }
-  gen.classList.toggle('warn', armed && !o.generating)
+  if (bannerText.innerHTML !== html) bannerText.innerHTML = html
 }
 
 function fail(text) {
@@ -287,31 +312,28 @@ function fail(text) {
   setTimeout(() => { if (errBox.textContent === text) errBox.hidden = true }, 8000)
 }
 
-// пересборка затирает раскладку: второй клик подтверждает, без системного окна
-let armed = false, disarm = 0
-gen.addEventListener('click', async () => {
-  if (live?.office.saved && !armed) {
-    armed = true
-    drawBanner(live.office)
-    clearTimeout(disarm)
-    disarm = setTimeout(() => { armed = false; if (live) drawBanner(live.office) }, 5000)
-    return
+async function act(what) {
+  if (!live) return
+  if (what === 'seen') {
+    save(seenKey(live.office), String(Date.now()))
+    return drawBanner(live.office)
   }
-  armed = false
-  clearTimeout(disarm)
+  const path = { start: 'api/office', cancel: 'api/office/cancel', undo: 'api/office/undo' }[what]
   gen.disabled = true
-  live.office.generating = true
-  drawBanner(live.office)
   try {
-    const res = await fetch('api/office?s=' + encodeURIComponent(current), { method: 'POST' })
-    if (!res.ok) fail('Офис не собрался: ' + ((await res.json()).error ?? res.status))
+    const res = await fetch(path + '?s=' + encodeURIComponent(current), { method: 'POST' })
+    const body = await res.json()
+    if (!res.ok) fail(body.error ?? res.status)
+    else { live.office.job = body; if (what === 'start') save(seenKey(live.office), '0') }
   } catch (e) {
     fail('Сервер офиса не ответил: ' + e)
   }
+  drawBanner(live.office)
   lastText = ''
-  pollSessions()
   pollState()
-})
+}
+gen.addEventListener('click', () => act(gen.dataset.act || 'start'))
+bannerText.addEventListener('click', e => { const b = e.target.closest('button[data-act]'); if (b) act(b.dataset.act) })
 
 async function pollState() {
   if (!current) return
