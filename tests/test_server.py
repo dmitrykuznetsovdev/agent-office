@@ -385,11 +385,24 @@ class WatchParentTest(unittest.TestCase):
 class OfficeTest(unittest.TestCase):
     roster = {'kit:reviewer': '', 'kit:builder': '', 'solo': '', 'Explore': ''}
 
-    def test_auto_office_groups_by_plugin_and_skips_builtins(self):
-        office = server.auto_office('/work/app', self.roster)
-        zones = {z['name']: [d['type'] for d in z['desks']] for z in office['zones']}
-        self.assertEqual(zones, {'KIT': ['main', 'kit:reviewer', 'kit:builder'], 'СВОИ АГЕНТЫ': ['solo']})
+    def test_russian_job_titles(self):
+        self.assertEqual(server.ru_name('caveman:cavecrew-reviewer'), 'Ревьюер')
+        self.assertEqual(server.ru_name('codex:codex-rescue'), 'Спасатель')
+        self.assertEqual(server.ru_name('reels-core:motion-designer'), 'Аниматор')
+        self.assertEqual(server.ru_name('reels-core:qa-inspector'), 'Контролёр')
+        self.assertEqual(server.ru_name('x:art-director'), 'Арт-директор')
+        self.assertEqual(server.ru_name('x:layer-inspector'), 'Инспектор')  # head noun when the phrase is unknown
+        self.assertEqual(server.ru_name('solo'), 'Solo')  # nothing to translate: the name stays
+
+    def test_auto_office_groups_by_kind_of_work_in_russian(self):
+        roster = {'p:scout': '', 'p:reviewer': '', 'p:builder': '', 'q:codex-rescue': '', 'q:scriptwriter': '', 'solo': '', 'Explore': ''}
+        office = server.auto_office('/work/app', roster)
+        zones = {z['name']: [d['name'] for d in z['desks']] for z in office['zones']}
+        self.assertEqual(zones, {'РАЗВЕДКА': ['Главный', 'Скаут'], 'ПЛАН': ['Сценарист'], 'ПРОИЗВОДСТВО': ['Сборщик'],
+                                 'КАЧЕСТВО': ['Ревьюер'], 'ПОДДЕРЖКА': ['Спасатель'], 'ПРОЧИЕ': ['Solo']})
+        self.assertEqual([z['name'] for z in office['zones']], ['РАЗВЕДКА', 'ПЛАН', 'ПРОИЗВОДСТВО', 'КАЧЕСТВО', 'ПОДДЕРЖКА', 'ПРОЧИЕ'])
         self.assertTrue(all(d['prop'] in server.PROPS for z in office['zones'] for d in z['desks']))
+        self.assertEqual(office['title'], 'ОФИС · APP')
 
     def test_model_answer_is_tidied(self):
         raw = {
@@ -400,13 +413,22 @@ class OfficeTest(unittest.TestCase):
                 {'type': 'made:up', 'name': 'Призрак', 'prop': 'cap'},
                 {'type': 'kit:builder', 'name': 'Дубль', 'prop': 'box'},
             ]}],
-            'guests': [{'type': 'Explore', 'name': 'Разведчик', 'prop': 'binoculars'}],
+            # the model sat a plugin agent among the guests: it gets a desk, keeping its Russian title
+            'guests': [{'type': 'Explore', 'name': 'Разведчик', 'prop': 'binoculars'},
+                       {'type': 'kit:reviewer', 'name': 'Проверяльщик', 'prop': 'glasses'}],
         }
         office = server.tidy('/work/app', self.roster, raw)
         zones = {z['name']: [d['name'] for d in z['desks']] for z in office['zones']}
-        self.assertEqual(zones, {'КОД': ['Тимлид', 'Сборщик'], 'ПРОЧИЕ': ['Reviewer', 'Solo']})
+        self.assertEqual(zones, {'КОД': ['Тимлид', 'Сборщик'], 'ПРОЧИЕ': ['Проверяльщик', 'Solo']})
         self.assertEqual(office['guests'], {'Explore': {'name': 'Разведчик', 'prop': 'binoculars'}})
         self.assertEqual(office['title'], 'МАСТЕРСКАЯ')
+
+    def test_latin_titles_from_the_model_are_replaced(self):
+        raw = {'title': 'Офис', 'boss': {'name': 'Boss', 'prop': 'crown'},
+               'zones': [{'name': 'Build', 'desks': [{'type': 'kit:builder', 'name': 'Builder', 'prop': 'box'}]}], 'guests': []}
+        office = server.tidy('/work/app', {'kit:builder': ''}, raw)
+        self.assertEqual([d['name'] for d in office['zones'][0]['desks']], ['Главный', 'Сборщик'])
+        self.assertEqual(office['zones'][0]['name'], 'ПРОИЗВОДСТВО')
 
 
 if __name__ == '__main__':

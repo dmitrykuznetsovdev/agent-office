@@ -328,18 +328,65 @@ def humanize(t):
     return clip(key[:1].upper() + key[1:], 13)
 
 
+# Должности по-русски без модели: сначала словосочетание целиком, потом главное слово (последнее).
+PHRASES = {
+    'art-director': 'Арт-директор', 'motion-designer': 'Аниматор', 'sound-designer': 'Звукорежиссёр',
+    'cover-maker': 'Обложечник', 'subs-editor': 'Субтитровщик', 'qa-inspector': 'Контролёр', 'qa': 'Контролёр',
+    'style-critic': 'Стилист', 'selection-critic': 'Отборщик', 'code-reviewer': 'Ревьюер', 'statusline-setup': 'Наладчик',
+}
+WORDS = {
+    'reviewer': 'Ревьюер', 'review': 'Ревьюер', 'builder': 'Сборщик', 'investigator': 'Сыщик', 'rescue': 'Спасатель',
+    'analyst': 'Аналитик', 'director': 'Директор', 'camera': 'Оператор', 'copywriter': 'Копирайтер', 'maker': 'Мастер',
+    'editor': 'Редактор', 'interviewer': 'Интервьюер', 'inspector': 'Инспектор', 'librarian': 'Библиотекарь',
+    'loader': 'Загрузчик', 'designer': 'Дизайнер', 'packager': 'Упаковщик', 'scout': 'Скаут', 'scriptwriter': 'Сценарист',
+    'critic': 'Критик', 'writer': 'Автор', 'planner': 'Планировщик', 'plan': 'Архитектор', 'architect': 'Архитектор',
+    'tester': 'Тестировщик', 'researcher': 'Исследователь', 'explorer': 'Разведчик', 'explore': 'Разведчик',
+    'coder': 'Программист', 'developer': 'Разработчик', 'auditor': 'Аудитор', 'fixer': 'Наладчик', 'helper': 'Помощник',
+    'assistant': 'Помощник', 'manager': 'Менеджер', 'translator': 'Переводчик', 'summarizer': 'Конспектор',
+    'debugger': 'Отладчик', 'documenter': 'Документатор', 'guide': 'Гид', 'deployer': 'Выкладчик', 'optimizer': 'Оптимизатор',
+    'refactorer': 'Рефакторщик', 'migrator': 'Мигратор', 'monitor': 'Наблюдатель', 'operator': 'Оператор',
+}
+# Отделы по ходу работы: найти → придумать → сделать → проверить → выручить
+KINDS = [
+    ('РАЗВЕДКА', ['investigat', 'scout', 'explor', 'research', 'search', 'analyst', 'librarian', 'finder', 'locator', 'monitor']),
+    ('ПЛАН', ['plan', 'architect', 'script', 'copywrit', 'writer', 'interview', 'strateg', 'product']),
+    ('ПРОИЗВОДСТВО', ['build', 'editor', 'maker', 'design', 'director', 'camera', 'motion', 'sound', 'loader', 'packag',
+                      'render', 'cover', 'subs', 'coder', 'develop', 'refactor', 'migrat', 'translat', 'document', 'operator']),
+    ('КАЧЕСТВО', ['review', 'critic', 'inspector', 'qa', 'test', 'audit', 'verif', 'lint', 'check']),
+    ('ПОДДЕРЖКА', ['rescue', 'debug', 'fix', 'deploy', 'setup', 'support', 'ops', 'help', 'guide']),
+]
+LATIN = re.compile('[A-Za-z]')
+
+
+def ru_name(t):
+    key = t.split(':')[-1].lower()
+    if key in PHRASES:
+        return PHRASES[key]
+    head = re.split(r'[-_ ]+', key)[-1]
+    return WORDS.get(head) or humanize(t)
+
+
+def kind_of(t, desc=''):
+    key = t.split(':')[-1].lower()
+    for text in (key, desc.lower()):
+        for zone, words in KINDS:
+            if any(w in text for w in words):
+                return zone
+    return 'ПРОЧИЕ'
+
+
 def auto_office(folder, roster):
-    """Офис без сохранённой раскладки: отделы по плагинам, имена из названий."""
+    """Офис без модели: отделы по ходу работы, должности по-русски из названий агентов."""
+    order = [k for k, _ in KINDS] + ['ПРОЧИЕ']
     zones = {}
-    for t in roster:
+    for t, desc in roster.items():
         if t in BUILTIN:
             continue
-        ns = t.split(':')[0].upper() if ':' in t else 'СВОИ АГЕНТЫ'
-        zones.setdefault(ns, []).append(dress({'type': t, 'name': humanize(t)}))
+        zones.setdefault(kind_of(t, desc or ''), []).append(dress({'type': t, 'name': ru_name(t)}))
     boss = dress({'type': 'main', 'name': 'Главный', 'prop': 'crown', 'shirt': '#3b3f8f'})
     rows = [{'name': 'ГЛАВНЫЙ', 'desks': [boss]}] if not zones else []
-    for i, (name, desks) in enumerate(sorted(zones.items())):
-        rows.append({'name': name, 'desks': ([boss] if i == 0 else []) + desks})
+    for i, name in enumerate(n for n in order if n in zones):
+        rows.append({'name': name, 'desks': ([boss] if i == 0 else []) + zones[name]})
     return {'folder': folder, 'title': 'ОФИС · ' + os.path.basename(folder).upper(), 'zones': rows, 'guests': {}}
 
 
@@ -371,18 +418,20 @@ SCHEMA = {
 }
 
 PROMPT = """Сделай пиксельный офис для команды ИИ-агентов проекта «{name}» ({folder}).
-У главной сессии (руководителя) свой стол, остальные агенты — сотрудники.
+У главной сессии (руководителя) свой кабинет, остальные агенты — сотрудники по этажам-отделам.
 
 Агенты (тип — описание):
 {agents}
 
 Правила:
+- Всё по-русски, без латиницы: вывеска, отделы, должности (вместо QA — «Контролёр»).
 - title: вывеска офиса заглавными, 1–3 слова, по сути проекта.
-- boss: должность руководителя по-русски (например «Продюсер», «Тимлид»), предмет из списка.
-- zones: 1–4 отдела по смыслу работы, у каждого короткое название заглавными; в отделе до 5 столов, лучше 3–5.
-- Каждый агент, кроме универсальных ({builtin}), — ровно за одним столом; тип копируй дословно.
-- Универсальные агенты — в guests.
-- name: должность по-русски, до 12 знаков, не имя человека («Ревьюер», «Сыщик», «Монтажёр»).
+- boss: должность руководителя («Продюсер», «Тимлид», «Главред»), предмет из списка.
+- zones: 2–5 отделов по ходу работы — от поиска и подготовки к производству, проверке и выпуску; порядок отделов — этот же.
+  Название отдела — одно-два слова заглавными («РАЗВЕДКА», «МОНТАЖ», «КАЧЕСТВО»). В отделе 1–8 столов; не дроби отделы ради числа.
+- Каждый агент, кроме универсальных ({builtin}), — ровно за одним столом в zones; тип копируй дословно. В guests их не клади.
+- guests — только универсальные агенты из списка выше, если они есть.
+- name: должность по-русски, до 13 знаков, понятная без описания («Монтажёр», «Сценарист», «Ревьюер», «Сыщик»), не имя человека.
 - prop: предмет на столе, подходящий к работе, из списка в схеме."""
 
 
@@ -506,7 +555,17 @@ def job_view(folder):
 
 
 def tidy(folder, roster, raw):
-    """Ответ модели — в файл офиса: чужие типы выкинуть, забытых посадить, руководителя — первым."""
+    """Ответ модели — в файл офиса: чужие типы выкинуть, забытых посадить, руководителя — первым.
+    Должности и отделы — только по-русски: латиницу заменяем словарём."""
+    def russian(name):
+        name = ' '.join(str(name or '').split())
+        return name if name and not LATIN.search(name) else ''
+
+    # русское имя, которое модель дала агенту, где бы его ни посадила
+    given = {}
+    for d in [d for z in raw['zones'] for d in z.get('desks') or []] + list(raw.get('guests') or []):
+        given.setdefault(d.get('type'), russian(d.get('name')))
+    title = lambda t: clip(given.get(t) or ru_name(t), 13)
     seen, zones = set(), []
     for z in raw['zones']:
         desks = []
@@ -514,22 +573,24 @@ def tidy(folder, roster, raw):
             t = d.get('type')
             if t in roster and t not in BUILTIN and t not in seen:
                 seen.add(t)
-                desks.append(dress({'type': t, 'name': clip(d.get('name') or humanize(t), 13), 'prop': d.get('prop')}))
+                desks.append(dress({'type': t, 'name': title(t), 'prop': d.get('prop')}))
         if desks:
-            zones.append({'name': clip(z.get('name') or 'ОТДЕЛ', 24).upper(), 'desks': desks})
-    rest = [dress({'type': t, 'name': humanize(t)}) for t in roster if t not in BUILTIN and t not in seen]
+            kinds = [kind_of(d['type'], roster.get(d['type']) or '') for d in desks]
+            name = russian(z.get('name')) or max(set(kinds), key=kinds.count)
+            zones.append({'name': clip(name, 24).upper(), 'desks': desks})
+    rest = [dress({'type': t, 'name': title(t)}) for t in roster if t not in BUILTIN and t not in seen]
     if rest:
         zones.append({'name': 'ПРОЧИЕ', 'desks': rest})
-    boss = dress({'type': 'main', 'name': clip(raw['boss'].get('name') or 'Главный', 13), 'prop': raw['boss'].get('prop'),
+    boss = dress({'type': 'main', 'name': clip(russian(raw['boss'].get('name')) or 'Главный', 13), 'prop': raw['boss'].get('prop'),
                   'shirt': '#3b3f8f'})
     if not zones:
         zones = [{'name': 'ГЛАВНЫЙ', 'desks': []}]
     first = zones[0]['desks']
     # руководитель — в середине полного ряда, иначе первым
     first.insert(2 if len(first) == 4 else 0, boss)
-    guests = {g['type']: {'name': clip(g.get('name') or humanize(g['type']), 13), 'prop': g.get('prop') if g.get('prop') in PROPS else 'cap'}
-              for g in raw.get('guests') or [] if g.get('type') in roster}
-    return {'folder': folder, 'title': clip(raw.get('title') or os.path.basename(folder), 28).upper(),
+    guests = {g['type']: {'name': title(g['type']), 'prop': g.get('prop') if g.get('prop') in PROPS else 'cap'}
+              for g in raw.get('guests') or [] if g.get('type') in roster and g.get('type') in BUILTIN}
+    return {'folder': folder, 'title': clip(russian(raw.get('title')) or os.path.basename(folder), 28).upper(),
             'zones': zones, 'guests': guests, 'generated': 'claude'}
 
 
