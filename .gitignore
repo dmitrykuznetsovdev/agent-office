@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 .DS_Store
 build/
+.claude/settings.local.json
+.claude/launch.json
+.claude/worktrees/
