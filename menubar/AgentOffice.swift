@@ -216,7 +216,7 @@ final class Server {
         }
     }
 
-    /// Свой сервер перезапускаем; чужой на нашем порту — убиваем и поднимаем свой.
+    /// Свой сервер перезапускаем. Остался прежний экземпляр — гасим и поднимаем заново. Чужой процесс на порту не трогаем.
     func restart() {
         failures = 0
         if let c = child, c.isRunning {
@@ -224,7 +224,7 @@ final class Server {
             c.terminate()
             return
         }
-        for pid in listeners() { kill(pid, SIGTERM) }
+        for pid in listeners() where isOurServer(pid) { kill(pid, SIGTERM) }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.spawn() }
     }
 
@@ -246,6 +246,19 @@ final class Server {
         p.waitUntilExit()
         let text = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         return text.split(whereSeparator: { $0.isNewline }).compactMap { pid_t($0) }
+    }
+
+    private func isOurServer(_ pid: pid_t) -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/ps")
+        p.arguments = ["-ww", "-o", "command=", "-p", String(pid)]   // иначе ps обрежет длинный путь к python
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return false }
+        let text = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        p.waitUntilExit()
+        return text.contains(cfg.server)
     }
 
     private func openLog() -> FileHandle? {
@@ -564,6 +577,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, NSPopoverDeleg
 
     // ── Действия ──
     private func open(_ path: String) {
+        guard path.hasPrefix("/") else { return }   // иначе path допишется к имени хоста: localhost:8767@чужой.сайт
         if let u = URL(string: "http://localhost:\(cfg.port)" + path) { NSWorkspace.shared.open(u) }
     }
 

@@ -34,6 +34,7 @@ PROJECTS = os.path.join(CLAUDE_DIR, 'projects')
 DATA = os.path.join(CLAUDE_DIR, 'agent-office')  # офисы папок; меняется флагом --data
 SHOTS = os.path.expanduser('~/Pictures/Agent Office')  # скриншоты офиса; меняется флагом --shots
 SHOT_LIMIT = 64 * 1024 * 1024
+HOSTS = {'localhost', '127.0.0.1'}  # имена, по которым приходит своя страница; None — любые, см. trusted_hosts
 CODEX_DIR = os.environ.get('CODEX_HOME') or os.path.expanduser('~/.codex')
 CODEX_SESSIONS = os.path.join(CODEX_DIR, 'sessions')
 CODEX_INDEX = os.path.join(CODEX_DIR, 'session_index.jsonl')  # названия тредов
@@ -312,7 +313,6 @@ class Tail:
     def __init__(self, path):
         self.path = path
         self.offset = 0
-        self.rest = b''
         self.calls = 0
         self.first = 0
         self.last = 0          # время последней записи
@@ -340,17 +340,14 @@ class Tail:
             self.__init__(self.path)
         if size == self.offset:
             return self
-        with open(self.path, 'rb') as f:
-            f.seek(self.offset)
-            chunk = self.rest + f.read(size - self.offset)
-        self.offset = size
-        lines = chunk.split(b'\n')
-        self.rest = lines.pop()
-        for raw in lines:
-            try:
-                self.take(json.loads(raw))
-            except (ValueError, AttributeError):
-                continue  # битая строка
+        try:
+            for raw, self.offset in journal_lines(self.path, self.offset):
+                try:
+                    self.take(json.loads(raw))
+                except Exception:  # чужая запись не должна стоить всего списка сессий
+                    continue
+        except OSError:
+            pass  # журнал удалили между проверкой и чтением
         return self
 
     def listing(self, a):
@@ -513,6 +510,8 @@ LANG = 'ru'        # язык новых офисов; подписи живут
 SIGNS = {'ru': {'boss': 'Главный', 'other': 'ПРОЧИЕ', 'support': 'ПОДДЕРЖКА', 'language': 'по-русски, без латиницы (вместо QA — «Контролёр»)'},
          'en': {'boss': 'Lead', 'other': 'OTHER', 'support': 'SUPPORT', 'language': 'in English'}}
 AUTO_TRIED = {}    # папка → новички, для которых генерация уже запускалась
+JOBS_LOCK = threading.Lock()  # проверка «уже идёт» и запись новой генерации — одним шагом
+OFFICE_LOCK = threading.Lock()  # файл офиса пишут генерация и проверка штата
 JOBS = {}  # папка → последняя генерация: status running|done|failed|cancelled, started, ended, error, proc
 
 
@@ -690,17 +689,39 @@ def agent_files(folder):
     sources = [(path, plugin, scope) for plugin, path, scope in plugin_dirs(folder)]
     sources += [(CLAUDE_DIR, '', 'user'), (os.path.join(folder, '.claude'), '', 'project')]
     for root, plugin, scope in sources:
-        for path in sorted(glob.glob(os.path.join(root, 'agents', '*.md'))):
+        for path in sorted(glob.glob(os.path.join(glob.escape(root), 'agents', '*.md'))):
             info = read_agent(path, scope, plugin)
             if info:
                 found[info['type']] = info
     return found
 
 
+def names_in(folder):
+    """Имена в папке. Её может не быть: журналы чистятся прямо во время обхода."""
+    try:
+        return os.listdir(folder)
+    except OSError:
+        return []
+
+
+def mtime_of(path):
+    """Время правки файла. Удалённый файл старше любого порога и выпадает из свежих сам."""
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0
+
+
+def project_dirs(root):
+    """Папки проектов Claude Code. Папки журналов может не быть: у кого есть только Codex."""
+    return [p for p in (os.path.join(root, proj) for proj in names_in(root)) if os.path.isdir(p)]
+
+
 def journal_dirs(folder):
     """Папки журналов проекта и его рабочих копий."""
     code = re.sub(r'[^A-Za-z0-9]', '-', folder)
-    return glob.glob(os.path.join(PROJECTS, code)) + glob.glob(os.path.join(PROJECTS, code + '--claude-worktrees-*'))
+    root = glob.escape(PROJECTS)
+    return glob.glob(os.path.join(root, code)) + glob.glob(os.path.join(root, code + '--claude-worktrees-*'))
 
 
 def roster_in(path):
@@ -710,15 +731,15 @@ def roster_in(path):
             if b'agent_listing_delta' in raw:
                 try:
                     t.take(json.loads(raw))
-                except (ValueError, AttributeError):
+                except Exception:
                     continue
     return t.roster
 
 
 def newest_roster(folder):
     """Состав из самой свежей сессии папки: старая сессия не откатит штат назад."""
-    paths = [p for d in journal_dirs(folder) for p in glob.glob(os.path.join(d, '*.jsonl'))]
-    for path in sorted(paths, key=os.path.getmtime, reverse=True):
+    paths = [p for d in journal_dirs(folder) for p in glob.glob(os.path.join(glob.escape(d), '*.jsonl'))]
+    for path in sorted(paths, key=mtime_of, reverse=True):
         roster = roster_in(path)
         if roster:
             return roster
@@ -738,8 +759,8 @@ def usage_of(folder):
     """Сколько раз звали каждого агента и кого за кем: журналы чистятся, поэтому это только подсказка."""
     counts, pairs = {}, {}
     for d in journal_dirs(folder):
-        for sub in glob.glob(os.path.join(d, '*', 'subagents')):
-            metas = sorted(glob.glob(os.path.join(sub, 'agent-*.meta.json')), key=lambda p: (os.path.getmtime(p), p))
+        for sub in glob.glob(os.path.join(glob.escape(d), '*', 'subagents')):
+            metas = sorted(glob.glob(os.path.join(glob.escape(sub), 'agent-*.meta.json')), key=lambda p: (mtime_of(p), p))
             seq = [read_json(p).get('agentType') or 'general-purpose' for p in metas]
             for t in seq:
                 counts[t] = counts.get(t, 0) + 1
@@ -755,7 +776,7 @@ def find_lead(folder, files):
     roots = [p for _, p, scope in plugin_dirs(folder) if scope == 'project'] + [os.path.join(folder, '.claude')]
     best, score = None, 2
     for root in roots:
-        for path in glob.glob(os.path.join(root, 'skills', '*', 'SKILL.md')):
+        for path in glob.glob(os.path.join(glob.escape(root), 'skills', '*', 'SKILL.md')):
             try:
                 with open(path) as f:
                     text = f.read()
@@ -1070,11 +1091,12 @@ def write_office(folder, office):
     path = office_path(folder)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + '.tmp'
-    with open(tmp, 'w') as f:
-        json.dump(office, f, ensure_ascii=False, indent=2)
-    if os.path.exists(path):
-        shutil.copy2(path, backup_path(folder))
-    os.replace(tmp, path)
+    with OFFICE_LOCK:
+        with open(tmp, 'w') as f:
+            json.dump(office, f, ensure_ascii=False, indent=2)
+        if os.path.exists(path):
+            shutil.copy2(path, backup_path(folder))
+        os.replace(tmp, path)
 
 
 def changes(old, new):
@@ -1121,10 +1143,11 @@ def names_of(office, types):
 
 def start_office(folder, roster, mode='full'):
     """Запустить генерацию; None — уже идёт. mode: full — пересобрать, add — посадить новичков."""
-    job = JOBS.get(folder)
-    if job and job['status'] == 'running':
-        return None
-    job = JOBS[folder] = {'status': 'running', 'stage': 'queue', 'mode': mode, 'started': time.time(), 'ended': 0, 'error': ''}
+    with JOBS_LOCK:
+        job = JOBS.get(folder)
+        if job and job['status'] == 'running':
+            return None
+        job = JOBS[folder] = {'status': 'running', 'stage': 'queue', 'mode': mode, 'started': time.time(), 'ended': 0, 'error': ''}
     threading.Thread(target=run_office, args=(folder, roster, job, mode), daemon=True).start()
     return job
 
@@ -1394,19 +1417,15 @@ class Ledger:
             root, codex = PROJECTS, CODEX_SESSIONS
         if codex:
             self.scan_codex(codex)
-        for proj in os.listdir(root):
-            pdir = os.path.join(root, proj)
-            if not os.path.isdir(pdir):
-                continue
-            for name in os.listdir(pdir):
+        for pdir in project_dirs(root):
+            for name in names_in(pdir):
                 if name.endswith('.jsonl'):
                     self.feed(os.path.join(pdir, name), True)
                     continue
                 sub = os.path.join(pdir, name, 'subagents')
-                if os.path.isdir(sub):
-                    for agent in os.listdir(sub):
-                        if agent.endswith('.jsonl'):
-                            self.feed(os.path.join(sub, agent), False)
+                for agent in names_in(sub):
+                    if agent.endswith('.jsonl'):
+                        self.feed(os.path.join(sub, agent), False)
         return self
 
     def scan_codex(self, root):
@@ -1432,7 +1451,7 @@ class Ledger:
             return
         for raw, end in journal_lines(path, rec['offset']):
             if any(word in raw for word in CODEX_WORDS):
-                self.take_codex(rec, raw)
+                self.safely(self.take_codex, rec, raw)
             rec['offset'] = end
         if packed:
             rec['packed'] = size
@@ -1471,20 +1490,23 @@ class Ledger:
         except OSError:
             return
         if size < rec['offset']:
-            rec['offset'] = 0  # журнал переписан заново
+            rec['offset'] = size  # журнал укоротили: прочитанное уже в сводке, с начала — удвоили бы траты
         if size == rec['offset']:
             return
-        with open(path, 'rb') as f:
-            f.seek(rec['offset'])
-            data = f.read(size - rec['offset'])
-        cut = data.rfind(b'\n')
-        if cut < 0:
-            return  # строка ещё дописывается
-        rec['offset'] += cut + 1
-        for raw in data[:cut].split(b'\n'):
-            if b'"usage"' in raw:  # дешёвый отсев: json разбираем только у ответов модели
-                self.take(rec, raw)
-        self.dirty = True
+        try:
+            for raw, rec['offset'] in journal_lines(path, rec['offset']):
+                if b'"usage"' in raw:  # дешёвый отсев: json разбираем только у ответов модели
+                    self.safely(self.take, rec, raw)
+                self.dirty = True
+        except OSError:
+            pass  # журнал удалили между проверкой и чтением
+
+    def safely(self, take, rec, raw):
+        """Чужая запись теряется одна, а не вместе со всей статистикой."""
+        try:
+            take(rec, raw)
+        except Exception:
+            pass
 
     def take(self, rec, raw):
         try:
@@ -1608,19 +1630,14 @@ def tail(path, kind=Tail):
 def session_files():
     now = time.time()
     out = []
-    for proj in os.listdir(PROJECTS):
-        pdir = os.path.join(PROJECTS, proj)
-        if not os.path.isdir(pdir):
-            continue
-        for name in os.listdir(pdir):
+    for pdir in project_dirs(PROJECTS):
+        for name in names_in(pdir):
             if not name.endswith('.jsonl'):
                 continue
             path = os.path.join(pdir, name)
-            mtime = os.path.getmtime(path)
             sub = os.path.join(pdir, name[:-6], 'subagents')
-            if os.path.isdir(sub):
-                mtime = max([mtime] + [os.path.getmtime(os.path.join(sub, f)) for f in os.listdir(sub)])
-            if now - mtime < RECENT_S:
+            mtime = max([mtime_of(path)] + [mtime_of(os.path.join(sub, f)) for f in names_in(sub)])
+            if os.path.exists(path) and now - mtime < RECENT_S:
                 out.append((mtime, name[:-6], pdir, path))
     out.sort(reverse=True)
     return out
@@ -1634,10 +1651,8 @@ def project_name(pdir, cwd):
 
 def agents_of(pdir, sid, now_ms):
     sub = os.path.join(pdir, sid, 'subagents')
-    if not os.path.isdir(sub):
-        return []
     agents = []
-    for name in os.listdir(sub):
+    for name in names_in(sub):
         if not (name.startswith('agent-') and name.endswith('.jsonl')):
             continue
         aid = name[6:-6]
@@ -1648,7 +1663,7 @@ def agents_of(pdir, sid, now_ms):
         except (OSError, ValueError):
             meta = {}
         t = tail(path)
-        idle = now_ms - (os.path.getmtime(path) * 1000)
+        idle = now_ms - (mtime_of(path) * 1000)
         working = not meta.get('finished') and idle < AGENT_IDLE_S * 1000
         agents.append({
             'id': aid,
@@ -1706,9 +1721,15 @@ def codex_titles():
     try:
         mtime = os.path.getmtime(CODEX_INDEX)
         if mtime != CODEX_TITLES['mtime']:
+            names = {}
             with open(CODEX_INDEX) as f:
-                rows = [json.loads(raw) for raw in f if raw.strip()]
-            CODEX_TITLES.update(mtime=mtime, names={r.get('id'): r.get('thread_name') for r in rows})
+                for raw in f:
+                    try:
+                        row = json.loads(raw)
+                        names[row['id']] = row.get('thread_name')
+                    except (ValueError, KeyError, TypeError, AttributeError):
+                        continue  # одна странная запись не стоит всех названий
+            CODEX_TITLES.update(mtime=mtime, names=names)
     except (OSError, ValueError):
         return {}
     return CODEX_TITLES['names']
@@ -1721,7 +1742,7 @@ def codex_threads(now):
         for name in names:
             m = ROLLOUT.match(name)
             path = os.path.join(folder, name)
-            if not m or m.group(2) or now - os.path.getmtime(path) >= RECENT_S:
+            if not m or m.group(2) or now - mtime_of(path) >= RECENT_S:
                 continue  # сжатые журналы давно остыли
             t = tail(path, CodexTail)
             if (now * 1000 - t.last) >= RECENT_S * 1000:
@@ -1870,7 +1891,14 @@ def save_shot(data, name='agent-office'):
             n += 1
 
 
+def trusted_hosts(host):
+    """Имена сервера. На 0.0.0.0 его открыли всей сети сами: по какому имени придут, заранее неизвестно."""
+    return None if host in ('0.0.0.0', '::', '') else {'localhost', '127.0.0.1', host}
+
+
 class Handler(SimpleHTTPRequestHandler):
+    timeout = 30  # с: зависший клиент не держит поток вечно
+
     def __init__(self, *a, **kw):
         super().__init__(*a, directory=WEB, **kw)
 
@@ -1892,6 +1920,15 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def trusted(self):
+        """Запрос своей страницы. Чужой сайт приходит с доменом, направленным на 127.0.0.1 (свой Host),
+        или прямо со своей страницы (свой Origin): ни читать сессии, ни тратить деньги ему нельзя."""
+        if HOSTS is None:
+            return True
+        host = re.sub(r':\d+$', '', self.headers.get('Host', '')).lower()
+        origin = self.headers.get('Origin')
+        return host in HOSTS and (origin is None or urlparse(origin).hostname in HOSTS)
+
     def post_shot(self):
         # image/png чужая страница без preflight не пришлёт, а отвечать на него здесь некому
         if self.headers.get('Content-Type') != 'image/png':
@@ -1899,6 +1936,8 @@ class Handler(SimpleHTTPRequestHandler):
         try:
             size = int(self.headers.get('Content-Length', ''))
         except ValueError:
+            size = -1
+        if size < 0:
             return self.send_json({'error': 'нет размера'}, 400)
         if size > SHOT_LIMIT:
             return self.send_json({'error': 'скриншот слишком большой'}, 413)
@@ -1912,6 +1951,14 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json({'error': str(e)}, 500)
 
     def do_POST(self):
+        if not self.trusted():
+            return self.send_json({'error': 'чужой запрос'}, 403)
+        try:
+            return self.post()
+        except Exception as e:  # как в do_GET: ошибка — ответ, а не оборванное соединение
+            return self.send_json({'error': str(e)}, 500)
+
+    def post(self):
         # /api/office — собрать заново, /api/office/cancel — отменить, /api/office/undo — вернуть прежний
         url = urlparse(self.path)
         if url.path == '/api/shot':
@@ -1934,6 +1981,8 @@ class Handler(SimpleHTTPRequestHandler):
         return self.send_json(job_view(folder), 202 if action == 'start' else 200)
 
     def do_GET(self):
+        if not self.trusted():
+            return self.send_json({'error': 'чужой запрос'}, 403)
         url = urlparse(self.path)
         try:
             if url.path == '/api/sessions':
@@ -1959,7 +2008,7 @@ def on_term(signum, frame):
 
 
 def main():
-    global DATA, SHOTS
+    global DATA, SHOTS, HOSTS
     import argparse
     ap = argparse.ArgumentParser(description='Agent Office: пиксельный офис агентов Claude Code и Codex')
     ap.add_argument('--port', type=int, default=8767)
@@ -1970,6 +2019,7 @@ def main():
     args = ap.parse_args()
     DATA = os.path.expanduser(args.data)
     SHOTS = os.path.expanduser(args.shots)
+    HOSTS = trusted_hosts(args.host)
     if args.watch_parent:
         ppid = os.getppid()
 
@@ -1980,6 +2030,7 @@ def main():
             os._exit(0)
         threading.Thread(target=watch, daemon=True).start()
     signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)  # claude живёт в своей сессии: Ctrl-C до него не дойдёт
     threading.Thread(target=staff_loop, daemon=True).start()
     threading.Thread(target=stats, daemon=True).start()  # первый проход по журналам — заранее
     print('Agent Office: http://%s:%d' % (args.host, args.port), flush=True)
