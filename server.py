@@ -12,6 +12,7 @@
                             p — один провайдер: claude или codex
   /api/state?s=<id>         офис одной сессии (руководитель, агенты, журнал)
   POST /api/office?s=<id>   пересобрать офис папки сессии (новых агентов сервер сажает сам)
+  POST /api/shot?name=<имя> положить скриншот (image/png) в папку скриншотов
 """
 import glob
 import json
@@ -31,6 +32,8 @@ WEB = os.path.join(HERE, 'web')
 CLAUDE_DIR = os.environ.get('CLAUDE_CONFIG_DIR') or os.path.expanduser('~/.claude')
 PROJECTS = os.path.join(CLAUDE_DIR, 'projects')
 DATA = os.path.join(CLAUDE_DIR, 'agent-office')  # офисы папок; меняется флагом --data
+SHOTS = os.path.expanduser('~/Pictures/Agent Office')  # скриншоты офиса; меняется флагом --shots
+SHOT_LIMIT = 64 * 1024 * 1024
 CODEX_DIR = os.environ.get('CODEX_HOME') or os.path.expanduser('~/.codex')
 CODEX_SESSIONS = os.path.join(CODEX_DIR, 'sessions')
 CODEX_INDEX = os.path.join(CODEX_DIR, 'session_index.jsonl')  # названия тредов
@@ -1849,6 +1852,24 @@ def state(sid):
     return room(t, agents, t.busy and now * 1000 - t.last < LIVE_S * 1000, codex_office(t, agents))
 
 
+def shot_name(raw):
+    return re.sub(r'[^\w -]+', '', raw).strip(' -')[:80].strip() or 'agent-office'
+
+
+def save_shot(data, name='agent-office'):
+    os.makedirs(SHOTS, exist_ok=True)
+    stamp = '%s %s' % (name, time.strftime('%Y-%m-%d %H-%M-%S'))
+    n = 1
+    while True:
+        path = os.path.join(SHOTS, '%s%s.png' % (stamp, '-%d' % n if n > 1 else ''))
+        try:
+            with open(path, 'xb') as f:
+                f.write(data)
+            return path
+        except FileExistsError:
+            n += 1
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *a, **kw):
         super().__init__(*a, directory=WEB, **kw)
@@ -1871,9 +1892,30 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def post_shot(self):
+        # image/png чужая страница без preflight не пришлёт, а отвечать на него здесь некому
+        if self.headers.get('Content-Type') != 'image/png':
+            return self.send_json({'error': 'нужен image/png'}, 415)
+        try:
+            size = int(self.headers.get('Content-Length', ''))
+        except ValueError:
+            return self.send_json({'error': 'нет размера'}, 400)
+        if size > SHOT_LIMIT:
+            return self.send_json({'error': 'скриншот слишком большой'}, 413)
+        data = self.rfile.read(size)
+        if not data.startswith(b'\x89PNG\r\n\x1a\n'):
+            return self.send_json({'error': 'это не PNG'}, 400)
+        try:
+            name = shot_name(parse_qs(urlparse(self.path).query).get('name', [''])[0])
+            return self.send_json({'path': save_shot(data, name)}, 201)
+        except OSError as e:
+            return self.send_json({'error': str(e)}, 500)
+
     def do_POST(self):
         # /api/office — собрать заново, /api/office/cancel — отменить, /api/office/undo — вернуть прежний
         url = urlparse(self.path)
+        if url.path == '/api/shot':
+            return self.post_shot()
         action = {'/api/office': 'start', '/api/office/cancel': 'cancel', '/api/office/undo': 'undo'}.get(url.path)
         if not action:
             return self.send_json({'error': 'нет такого адреса'}, 404)
@@ -1917,15 +1959,17 @@ def on_term(signum, frame):
 
 
 def main():
-    global DATA
+    global DATA, SHOTS
     import argparse
     ap = argparse.ArgumentParser(description='Agent Office: пиксельный офис агентов Claude Code и Codex')
     ap.add_argument('--port', type=int, default=8767)
     ap.add_argument('--host', default='127.0.0.1')
     ap.add_argument('--data', default=DATA, help='где хранить офисы папок')
+    ap.add_argument('--shots', default=SHOTS, help='куда класть скриншоты офиса')
     ap.add_argument('--watch-parent', action='store_true', help='выйти, когда умрёт родительский процесс')
     args = ap.parse_args()
     DATA = os.path.expanduser(args.data)
+    SHOTS = os.path.expanduser(args.shots)
     if args.watch_parent:
         ppid = os.getppid()
 

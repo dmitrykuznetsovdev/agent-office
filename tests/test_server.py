@@ -1,11 +1,15 @@
 import datetime
+import http.client
 import json
 import os
 import re
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from unittest import mock
+from urllib.parse import quote
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import server  # noqa: E402
@@ -1367,6 +1371,83 @@ class OfficeTest(unittest.TestCase):
         office = server.tidy('/work/app', {'kit:builder': ''}, raw)
         self.assertEqual([d['name'] for d in office['zones'][0]['desks']], ['Главный', 'Сборщик'])
         self.assertEqual(office['zones'][0]['name'], 'ПРОИЗВОДСТВО')
+
+
+class ShotTest(unittest.TestCase):
+    png = b'\x89PNG\r\n\x1a\n' + b'pixels'
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = os.path.join(tmp.name, 'Agent Office')
+        shots, server.SHOTS = server.SHOTS, self.dir
+        self.addCleanup(setattr, server, 'SHOTS', shots)
+        self.http = server.ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=self.http.serve_forever, daemon=True).start()
+        self.addCleanup(self.http.server_close)
+        self.addCleanup(self.http.shutdown)
+
+    def post(self, body, headers=None, path='/api/shot'):
+        conn = http.client.HTTPConnection('127.0.0.1', self.http.server_port)
+        self.addCleanup(conn.close)
+        conn.request('POST', path, body, {'Content-Type': 'image/png'} if headers is None else headers)
+        res = conn.getresponse()
+        return res.status, json.loads(res.read())
+
+    def test_saves_png_into_its_folder(self):
+        status, body = self.post(self.png)
+        self.assertEqual(status, 201)
+        self.assertEqual(os.path.dirname(body['path']), self.dir)
+        self.assertRegex(os.path.basename(body['path']), r'^agent-office \d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2}\.png$')
+        with open(body['path'], 'rb') as f:
+            self.assertEqual(f.read(), self.png)
+
+    def test_two_shots_in_one_second_keep_both_files(self):
+        with mock.patch.object(server.time, 'strftime', return_value='2026-10-30 12-00-00'):
+            first = server.save_shot(self.png, 'Все на кофе')
+            second = server.save_shot(self.png, 'Все на кофе')
+        self.assertNotEqual(first, second)
+        self.assertEqual(sorted(os.listdir(self.dir)), ['Все на кофе 2026-10-30 12-00-00-2.png', 'Все на кофе 2026-10-30 12-00-00.png'])
+
+    def test_funny_name_goes_into_the_file_name(self):
+        status, body = self.post(self.png, path='/api/shot?name=' + quote('Все на кофе'))
+        self.assertEqual(status, 201)
+        self.assertTrue(os.path.basename(body['path']).startswith('Все на кофе 20'))
+
+    def test_name_cannot_leave_the_folder(self):
+        status, body = self.post(self.png, path='/api/shot?name=' + quote('../../.ssh/evil\0.png'))
+        self.assertEqual(status, 201)
+        self.assertEqual(os.path.dirname(body['path']), self.dir)
+        self.assertTrue(os.path.basename(body['path']).startswith('ssh'))
+
+    def test_empty_name_falls_back(self):
+        self.assertEqual(server.shot_name('/../..'), 'agent-office')
+        self.assertLessEqual(len(server.shot_name('я' * 300)), 80)
+
+    def test_refuses_what_is_not_a_png(self):
+        status, _ = self.post(b'<script>')
+        self.assertEqual(status, 400)
+        self.assertFalse(os.path.exists(self.dir))
+
+    def test_refuses_form_posts_from_other_sites(self):
+        # text/plain уходит с чужой страницы без preflight, image/png — нет
+        status, _ = self.post(self.png, {'Content-Type': 'text/plain'})
+        self.assertEqual(status, 415)
+        self.assertFalse(os.path.exists(self.dir))
+
+    def test_refuses_oversized_body_without_reading_it(self):
+        with mock.patch.object(server, 'SHOT_LIMIT', 4):
+            status, _ = self.post(self.png)
+        self.assertEqual(status, 413)
+        self.assertFalse(os.path.exists(self.dir))
+
+    def test_unwritable_folder_is_an_error_not_a_crash(self):
+        with open(os.path.join(os.path.dirname(self.dir), 'blocker'), 'w'):
+            pass
+        server.SHOTS = os.path.join(os.path.dirname(self.dir), 'blocker', 'shots')
+        status, body = self.post(self.png)
+        self.assertEqual(status, 500)
+        self.assertIn('error', body)
 
 
 if __name__ == '__main__':
