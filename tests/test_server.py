@@ -1549,6 +1549,21 @@ class EpicTest(unittest.TestCase):
         self.view(age=5 * 60)
         self.assertFalse(live())
 
+    def test_coordinator_stays_live_while_its_background_command_runs(self):
+        at = iso(time.time() - 20 * 60)
+        call = line(type='assistant', timestamp=at, cwd='/work/app', message={
+            'id': 'm1', 'model': 'claude-sonnet-5-5', 'stop_reason': 'tool_use', 'usage': {'input_tokens': 1, 'output_tokens': 1},
+            'content': [{'type': 'tool_use', 'id': 't1', 'name': 'Bash', 'input': {'command': 'make', 'description': 'сборка'}}]})
+        moved = line(type='user', timestamp=at, cwd='/work/app', toolUseResult={'backgroundTaskId': 'b1'}, message={
+            'role': 'user', 'content': [{'type': 'tool_result', 'tool_use_id': 't1', 'content': 'moved to the background'}]})
+        self.journal('-work-app', 'coord', call + moved + assistant('c2', stop='end_turn', ts=at), age=20 * 60)
+        self.view(age=5 * 60)
+        st = server.state('coord')
+        self.assertTrue(st['office'].get('epic'))
+        self.assertEqual([s['status'] for s in st['shells']], ['running'])
+        self.assertTrue(st['sessions'][0]['isLive'])
+        self.assertTrue([s for s in server.sessions() if s['id'] == 'coord'][0]['isLive'])
+
     def test_role_session_and_a_broken_view_are_no_epic(self):
         self.assertFalse(server.state('w2')['office'].get('epic'))
         self.view(raw='{не json')
@@ -2029,6 +2044,181 @@ class SignalTest(unittest.TestCase):
                 mock.patch('builtins.print'):
             server.main()
         self.assertIn(mock.call(signal.SIGINT, server.on_term), caught.call_args_list)
+
+
+class BackgroundShellTest(unittest.TestCase):
+    """Серверная: фоновые команды руководителя, их время и итог."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.projects, server.PROJECTS = server.PROJECTS, os.path.join(self.dir.name, 'projects')
+        self.live, server.SESSIONS_DIR = server.SESSIONS_DIR, os.path.join(self.dir.name, 'sessions')
+        self.codex, server.CODEX_SESSIONS = server.CODEX_SESSIONS, os.path.join(self.dir.name, 'нет-codex')
+        os.makedirs(server.SESSIONS_DIR)
+        server.TAILS.clear()
+        self.now = time.time()
+        self.pdir = os.path.join(server.PROJECTS, '-work-app')
+        os.makedirs(self.pdir)
+
+    def tearDown(self):
+        server.PROJECTS, server.SESSIONS_DIR, server.CODEX_SESSIONS = self.projects, self.live, self.codex
+        server.TAILS.clear()
+        self.dir.cleanup()
+
+    def ago(self, seconds):
+        return iso(self.now - seconds)
+
+    def asked(self, age):
+        return line(type='user', timestamp=self.ago(age), cwd='/work/app', message={'role': 'user', 'content': 'собери рилс'})
+
+    def called(self, tool_id, age, description='Сборка рилса', name='Bash', **more):
+        return line(type='assistant', timestamp=self.ago(age), cwd='/work/app', message={
+            'id': 'm' + tool_id, 'model': 'claude-sonnet-5-5', 'stop_reason': 'tool_use',
+            'content': [{'type': 'tool_use', 'id': tool_id, 'name': name, 'input': {'command': 'make', 'description': description, **more}}],
+            'usage': {'input_tokens': 10, 'output_tokens': 1}})
+
+    def in_background(self, tool_id, task, age):
+        return line(type='user', timestamp=self.ago(age), cwd='/work/app', toolUseResult={'backgroundTaskId': task}, message={
+            'role': 'user', 'content': [{'type': 'tool_result', 'tool_use_id': tool_id, 'content': 'moved to the background'}]})
+
+    def finished_now(self, tool_id, age):
+        return line(type='user', timestamp=self.ago(age), cwd='/work/app', toolUseResult={'stdout': 'ok'}, message={
+            'role': 'user', 'content': [{'type': 'tool_result', 'tool_use_id': tool_id, 'content': 'ok'}]})
+
+    def note(self, task, status='completed'):
+        return '<task-notification>\n<task-id>%s</task-id>\n<status>%s</status>\n<summary>итог</summary>\n</task-notification>' % (task, status)
+
+    def queued(self, task, age, status='completed'):
+        return line(type='queue-operation', operation='enqueue', timestamp=self.ago(age), content=self.note(task, status))
+
+    def told(self, task, age, status='completed'):
+        return line(type='user', timestamp=self.ago(age), cwd='/work/app', isMeta=True, message={'role': 'user', 'content': self.note(task, status)})
+
+    def killed(self, task, age, result=None):
+        result = {'message': 'Successfully stopped task: %s (make)' % task, 'task_id': task, 'task_type': 'local_bash', 'command': 'make'} if result is None else result
+        return line(type='user', timestamp=self.ago(age), cwd='/work/app', toolUseResult=result, message={
+            'role': 'user', 'content': [{'type': 'tool_result', 'tool_use_id': 'stop-' + task, 'content': 'stopped'}]})
+
+    def stopped(self, age):
+        return line(type='assistant', timestamp=self.ago(age), cwd='/work/app', message={
+            'id': 'end', 'model': 'claude-sonnet-5-5', 'stop_reason': 'end_turn', 'content': [{'type': 'text', 'text': 'жду'}],
+            'usage': {'input_tokens': 10, 'output_tokens': 1}})
+
+    def journal(self, sid, *rows, age=0):
+        path = os.path.join(self.pdir, sid + '.jsonl')
+        with open(path, 'w') as f:
+            f.writelines(rows)
+        os.utime(path, (self.now - age, self.now - age))
+
+    def shells(self, sid='s1'):
+        return server.state(sid)['shells']
+
+    def test_running_command_counts_from_the_call_not_from_the_move_to_background(self):
+        self.journal('s1', self.asked(300), self.called('t1', 200), self.in_background('t1', 'b1', 80))
+        self.assertEqual(self.shells(), [{'id': 'b1', 'name': 'Сборка рилса', 'session': 1, 'status': 'running',
+                                          'start': int((self.now - 200)) * 1000, 'end': 0}])
+
+    def test_command_finished_in_the_foreground_is_not_shown(self):
+        self.journal('s1', self.asked(300), self.called('t1', 200), self.finished_now('t1', 190))
+        self.assertEqual(self.shells(), [])
+
+    def test_notification_in_the_queue_ends_the_command(self):
+        self.journal('s1', self.asked(300), self.called('t1', 200), self.in_background('t1', 'b1', 190), self.queued('b1', 20))
+        got = self.shells()[0]
+        self.assertEqual((got['status'], got['end']), ('completed', int(self.now - 20) * 1000))
+
+    def test_notification_in_a_user_record_ends_the_command(self):
+        self.journal('s1', self.asked(300), self.called('t1', 200), self.in_background('t1', 'b1', 190), self.told('b1', 20, 'failed'))
+        self.assertEqual(self.shells()[0]['status'], 'failed')
+
+    def test_first_notification_keeps_the_end_time(self):
+        self.journal('s1', self.asked(300), self.called('t1', 200), self.in_background('t1', 'b1', 190),
+                     self.queued('b1', 30), self.told('b1', 10))
+        self.assertEqual(self.shells()[0]['end'], int(self.now - 30) * 1000)
+
+    def test_quoted_notification_of_an_unknown_task_changes_nothing(self):
+        self.journal('s1', self.asked(300), self.called('t1', 200), self.in_background('t1', 'b1', 190), self.told('чужой', 20))
+        self.assertEqual([s['status'] for s in self.shells()], ['running'])
+
+    def test_stopped_command_is_killed_at_the_time_of_the_stop(self):
+        self.journal('s1', self.asked(300), self.called('t1', 200), self.in_background('t1', 'b1', 190), self.killed('b1', 20))
+        got = self.shells()[0]
+        self.assertEqual((got['status'], got['end']), ('killed', int(self.now - 20) * 1000))
+
+    def test_session_cools_down_after_the_command_was_stopped(self):
+        quiet = server.LIVE_S + 60
+        self.journal('s1', self.asked(quiet + 50), self.called('t1', quiet + 20), self.in_background('t1', 'b1', quiet + 10), self.killed('b1', quiet), age=quiet)
+        got = {s['id']: s for s in server.sessions()}['s1']
+        self.assertEqual((got['isLive'], got['shells']), (False, 0))
+
+    def test_stop_of_an_unknown_task_changes_nothing(self):
+        self.journal('s1', self.asked(300), self.called('t1', 200), self.in_background('t1', 'b1', 190), self.killed('чужой', 20))
+        self.assertEqual([s['status'] for s in self.shells()], ['running'])
+
+    def test_failed_stop_with_a_text_result_changes_nothing(self):
+        self.journal('s1', self.asked(300), self.called('t1', 200), self.in_background('t1', 'b1', 190), self.killed('b1', 20, 'No task found with ID: b1'))
+        self.assertEqual([s['status'] for s in self.shells()], ['running'])
+
+    def test_stop_does_not_overwrite_a_finished_command(self):
+        self.journal('s1', self.asked(300), self.called('t1', 200), self.in_background('t1', 'b1', 190), self.queued('b1', 30), self.killed('b1', 10))
+        got = self.shells()[0]
+        self.assertEqual((got['status'], got['end']), ('completed', int(self.now - 30) * 1000))
+
+    def test_notification_after_a_stop_does_not_overwrite_it(self):
+        self.journal('s1', self.asked(300), self.called('t1', 200), self.in_background('t1', 'b1', 190), self.killed('b1', 30), self.queued('b1', 10, 'killed'))
+        got = self.shells()[0]
+        self.assertEqual((got['status'], got['end']), ('killed', int(self.now - 30) * 1000))
+
+    def test_notification_without_a_status_does_not_borrow_the_next_ones(self):
+        text = '<task-notification>\n<task-id>b1</task-id>\n<summary>предупреждение</summary>\n</task-notification>\n' + self.note('b2')
+        row = line(type='user', timestamp=self.ago(20), cwd='/work/app', isMeta=True, message={'role': 'user', 'content': text})
+        self.journal('s1', self.asked(300), self.called('t1', 200), self.in_background('t1', 'b1', 190),
+                     self.called('t2', 180), self.in_background('t2', 'b2', 170), row)
+        self.assertEqual({s['id']: s['status'] for s in self.shells()}, {'b1': 'running', 'b2': 'completed'})
+
+    def test_background_agent_stays_at_its_desk_and_out_of_the_server_room(self):
+        self.journal('s1', self.asked(300), self.called('t1', 200, name='Agent'), self.in_background('t1', 'b1', 190))
+        self.assertEqual(self.shells(), [])
+
+    def test_finished_commands_leave_after_a_while_failures_stay_longer(self):
+        self.journal('s1', self.asked(3000), self.called('t1', 2500), self.in_background('t1', 'ok-old', 2490), self.queued('ok-old', server.BG_DONE_S + 5),
+                     self.called('t2', 2400), self.in_background('t2', 'ok-new', 2390), self.queued('ok-new', server.BG_DONE_S - 5),
+                     self.called('t3', 2300), self.in_background('t3', 'bad-new', 2290), self.queued('bad-new', server.BG_DONE_S + 5, 'failed'),
+                     self.called('t4', 2200), self.in_background('t4', 'bad-old', 2190), self.queued('bad-old', server.BG_FAILED_S + 5, 'failed'))
+        self.assertEqual({s['id'] for s in self.shells()}, {'ok-new', 'bad-new'})
+
+    def test_command_without_an_end_is_lost_after_the_limit(self):
+        self.journal('s1', self.asked(server.BG_LOST_S + 100), self.called('t1', server.BG_LOST_S + 50), self.in_background('t1', 'b1', server.BG_LOST_S + 40))
+        self.assertEqual(self.shells(), [])
+
+    def test_order_is_failures_then_the_longest_running_then_done(self):
+        self.journal('s1', self.asked(900), self.called('t1', 100), self.in_background('t1', 'young', 90),
+                     self.called('t2', 800), self.in_background('t2', 'old', 790),
+                     self.called('t3', 300), self.in_background('t3', 'done', 290), self.queued('done', 5),
+                     self.called('t4', 200), self.in_background('t4', 'bad', 190), self.queued('bad', 5, 'failed'))
+        self.assertEqual([s['id'] for s in self.shells()], ['bad', 'old', 'young', 'done'])
+
+    def test_session_stays_live_while_a_command_runs(self):
+        quiet = server.LIVE_S + 60
+        self.journal('s1', self.asked(quiet + 50), self.called('t1', quiet + 20), self.in_background('t1', 'b1', quiet + 10), self.stopped(quiet), age=quiet)
+        got = {s['id']: s for s in server.sessions()}['s1']
+        self.assertEqual((got['isLive'], got['working'], got['shells']), (True, 0, 1))
+        head = server.state('s1')['sessions'][0]
+        self.assertEqual((head['isLive'], head['isBusy']), (True, False))
+
+    def test_quiet_session_with_only_a_finished_command_cools_down(self):
+        quiet = server.LIVE_S + 60
+        self.journal('s1', self.asked(quiet + 50), self.called('t1', quiet + 20), self.in_background('t1', 'b1', quiet + 10), self.queued('b1', quiet), age=quiet)
+        got = {s['id']: s for s in server.sessions()}['s1']
+        self.assertEqual((got['isLive'], got['shells']), (False, 0))
+
+    def test_pending_calls_do_not_pile_up(self):
+        rows = [self.asked(300)]
+        for i in range(50):
+            rows += [self.called('t%d' % i, 200), self.finished_now('t%d' % i, 190)]
+        self.journal('s1', *rows)
+        self.shells()
+        self.assertEqual(len(server.TAILS[os.path.join(self.pdir, 's1.jsonl')].calling_shells), 0)
 
 
 if __name__ == '__main__':
