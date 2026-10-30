@@ -28,7 +28,7 @@
   /* выход — значок выключения в углу: приглушённый, светлеет под курсором */
   header .quit { display: flex; align-items: center; gap: 5px; margin-left: 6px; background: transparent; color: var(--muted); border: 0; padding: 4px 6px; font: 11px -apple-system, Helvetica, sans-serif; cursor: pointer; }
   header .quit svg { width: 13px; height: 13px; shape-rendering: crispEdges; }
-  header .quit:hover { color: var(--text); background: var(--panel); }
+  header .quit:hover { color: var(--gold); background: var(--panel); }
   .tiles.two { grid-template-columns: repeat(2, 1fr); }
 
   nav { display: flex; gap: 6px; padding: 10px 14px 0; background: var(--wall); border-bottom: var(--px) solid var(--line); }
@@ -93,18 +93,21 @@
   .bars .fill { height: 100%; }
   .bars .val { text-align: right; white-space: nowrap; font: 12px Menlo, ui-monospace, monospace; }
   .bars .val small { color: var(--muted); font-size: 10px; }
-  .stack { display: flex; height: 14px; gap: 1px; background: var(--panel); margin-bottom: 8px; }
 
   #tip { position: fixed; pointer-events: none; z-index: 9; background: var(--plate); color: var(--ink); padding: 5px 8px; font: 11px/1.4 Menlo, ui-monospace, monospace; display: none; max-width: 230px; --c: var(--ink); }
   #tip b { font-family: -apple-system, Helvetica, sans-serif; }
 
-  footer { display: flex; gap: 4px; padding: 8px 14px 10px; border-top: var(--px) solid var(--line); background: var(--wall); flex-wrap: wrap; }
-  footer button { background: var(--panel); color: var(--text); border: 0; padding: 5px 9px; font: 12px -apple-system, Helvetica, sans-serif; cursor: pointer; }
+  footer { display: flex; align-items: center; gap: 8px; padding: 10px 14px 12px; border-top: var(--px) solid var(--line); background: var(--wall); }
+  footer button { display: flex; align-items: center; gap: 6px; height: 26px; white-space: nowrap; background: var(--panel); color: var(--text); border: 0; padding: 0 10px; font: 12px -apple-system, Helvetica, sans-serif; cursor: pointer; }
   footer button:hover { background: var(--floor); }
-  footer button.main { background: var(--gold); color: var(--ink); font-weight: 600; }
-  footer button.check::before { content: '☐ '; }
-  footer button.check.on::before { content: '☑ '; }
   footer .gap { flex: 1; }
+  footer button.main { background: var(--gold); color: var(--ink); font-weight: 600; }
+  footer button.main:hover { background: #f6d36a; }
+  footer button svg { width: 11px; height: 11px; shape-rendering: crispEdges; }
+  /* пиксельный тумблер: дорожка с квадратным ползунком, справа и зелёная — включено */
+  footer button.check::before { content: ''; width: 22px; height: 12px; flex: none;
+    background: linear-gradient(var(--muted), var(--muted)) 2px 2px / 8px 8px no-repeat, var(--bg); }
+  footer button.check.on::before { background: linear-gradient(var(--ink), var(--ink)) 12px 2px / 8px 8px no-repeat, var(--ok); }
   body:not(.app) .app-only { display: none; }
 </style>
 </head>
@@ -135,8 +138,12 @@
   <button class="main" id="office">Открыть офис</button>
   <span class="gap"></span>
   <button class="app-only check" id="autostart" title="Запускать при входе в систему">Автозапуск</button>
-  <button class="app-only" id="restart" title="Перезапустить сервер">⟳</button>
-  <button class="app-only" id="log" title="Лог сервера">Лог</button>
+  <button class="app-only" id="log" title="Открыть лог сервера">
+    <svg viewBox="0 0 9 9" fill="currentColor" aria-hidden="true">
+      <rect x="1" y="0" width="5" height="1"/><rect x="1" y="0" width="1" height="9"/><rect x="1" y="8" width="7" height="1"/>
+      <rect x="7" y="2" width="1" height="7"/><rect x="6" y="1" width="1" height="1"/>
+      <rect x="3" y="3" width="3" height="1"/><rect x="3" y="5" width="3" height="1"/>
+    </svg>Лог</button>
 </footer>
 <div id="tip" class="pix"></div>
 <script type="module" src="menubar.js"></script>
