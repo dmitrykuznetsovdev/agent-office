@@ -338,10 +338,14 @@ function drawBanner(o) {
   } else if (fresh && job.status === 'cancelled') {
     html = `Отменено, офис остался прежним. ${close}`
   } else if (fresh && job.status === 'done') {
-    html = `<b class="good">Офис пересобран</b> за ${clockOf(job.ended - job.started)}.` +
+    const sum = job.summary ?? {}
+    const did = [sum.moved && `пересели: ${sum.moved}`, sum.renamed && `новые должности: ${sum.renamed}`, sum.added && `новые столы: ${sum.added}`].filter(Boolean).join(', ')
+    html = (job.mode === 'add' ? `<b class="good">В штате пополнение:</b> ${esc(job.added.join(', '))}.` : `<b class="good">Офис пересобран</b> за ${clockOf(job.ended - job.started)}${did ? ': ' + did : ', всё осталось на местах'}.`) +
       (job.canUndo ? ' <button class="mini" data-act="undo">Вернуть прежний</button>' : '') + ` ${close}`
   } else if (fresh && job.status === 'undone') {
     html = `Вернул прежний офис. ${close}`
+  } else if (o.hidden) {
+    html = `<span class="dim">Эта сессия видит не весь штат: столов вне её состава — ${o.hidden}.</span>`
   } else if (!o.saved) {
     html = `Для ${esc(place)} офиса ещё нет: столы расставлены по плагинам, должности из названий агентов.`
   }

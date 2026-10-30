@@ -2,7 +2,7 @@
 // the producer's office on top, the lobby with the lounge at the bottom.
 // Drawn on a canvas every frame; text goes to an overlay canvas so it stays sharp.
 // Agents move only inside their own cell, along their floor's corridor and in the lift.
-import { GUESTS, deskOf, money, roleName } from './office.js';
+import { GUESTS, deskName, deskOf, money } from './office.js';
 const SKIN = ['#f1c27d', '#e0ac69', '#c68642', '#ffdbac', '#8d5524'];
 const HAIRS = ['#2b1d14', '#1a1a1a', '#6b4a2b', '#c9a227', '#9a9a9a', '#8a5a2b', '#3a2416', '#e05a8a'];
 const CAPS = ['#d06a2a', '#2f7a5a', '#c03040', '#3a6ab0'];
@@ -44,9 +44,9 @@ function building(st, now) {
     const office = st.office;
     const mainDesk = deskOf(office, 'main');
     const [bg, bm] = gradeOf(st.producer.model);
-    const boss = { key: 'boss', name: roleName('main', office), grade: bg, model: bm, boss: true, look: lookOf('boss', mainDesk, '#3b3f8f', true) };
+    const boss = { key: 'boss', name: deskName('main', office), grade: bg, model: bm, boss: true, look: lookOf('boss', mainDesk, '#3b3f8f', true) };
     const floors = office.zones
-        .map(z => ({ name: z.name, home: 0, cells: z.desks.filter(d => d.type !== 'main').map(d => ({ key: d.type, name: d.name })) }));
+        .map(z => ({ name: z.name, home: 0, cells: z.desks.filter(d => d.type !== 'main').map(d => ({ key: d.type, name: d.short ?? d.name })) }));
     const free = { name: 'ФРИЛАНС', cells: [], free: true, home: 0 };
     const gone = (a) => !a.isWorking && now - a.endedAt >= AWAY;
     // at work first, then home, newest first: a desk goes to whoever is here
@@ -56,7 +56,7 @@ function building(st, now) {
         const desk = deskOf(office, a.type);
         const own = desk && desk.type !== 'main' ? desk : undefined;
         const [grade, model] = gradeOf(a.model);
-        const name = roleName(a.type, office);
+        const name = deskName(a.type, office);
         // a desk's owner looks the same every time they are called
         const person = { key: a.id, name, grade, model, boss: false, agent: a, desk: !!own, look: lookOf(own ? own.type : a.id, own, GUESTS[a.type]?.shirt ?? '#5a6a8a') };
         const fi = own ? office.zones.findIndex(z => z.desks.includes(own)) : -1;

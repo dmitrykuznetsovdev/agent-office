@@ -27,14 +27,16 @@ export type Studio = {
   office: Office
 }
 
-export type OfficeDesk = { type: string; name: string; prop: string; shirt: string; hair: string; skin: number }
+export type OfficeDesk = { type: string; name: string; short?: string; prop: string; shirt: string; hair: string; skin: number; locked?: boolean }
 
 export type Office = {
   folder: string
   title: string
-  zones: Array<{ name: string; desks: OfficeDesk[] }>
+  zones: Array<{ id?: string; name: string; desks: OfficeDesk[] }>
   guests: Record<string, { name: string; prop: string }>
   saved?: boolean
+  lang?: string
+  hidden?: number
   generating?: boolean
   provider?: string
   accent?: string
