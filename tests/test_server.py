@@ -680,18 +680,39 @@ class LedgerCodexTest(unittest.TestCase):
 FAKE_OK = '''#!/usr/bin/env python3
 import json, sys
 sys.stdin.read()
-print(json.dumps({"is_error": False, "structured_output": {
+print(json.dumps({"type": "result", "is_error": False, "structured_output": {
     "title": "Новый", "boss": {"name": "Тимлид", "prop": "crown"},
     "zones": [{"name": "код", "desks": [{"type": "kit:builder", "name": "Сборщик", "prop": "box"}]}], "guests": []}}))
 '''
 FAKE_LOGGED_OUT = '''#!/usr/bin/env python3
 import json, sys
 sys.stdin.read()
-print(json.dumps({"is_error": True, "result": "Not logged in · Please run /login"}))
+print(json.dumps({"type": "result", "is_error": True, "result": "Not logged in · Please run /login"}))
 sys.exit(1)
 '''
 FAKE_STUCK = '''#!/usr/bin/env python3
 import time
+time.sleep(30)
+'''
+
+
+FAKE_ORPHAN = '''#!/bin/sh
+sleep 30 &
+echo $! > "$0.child"
+wait
+'''
+FAKE_NO_NETWORK = '''#!/usr/bin/env python3
+import json, sys, time
+sys.stdin.read()
+print(json.dumps({"type": "system", "subtype": "init"}), flush=True)
+print(json.dumps({"type": "system", "subtype": "api_retry", "error": "unknown"}), flush=True)
+print(json.dumps({"type": "system", "subtype": "api_retry", "error": "unknown"}), flush=True)
+time.sleep(30)
+'''
+FAKE_SILENT = '''#!/usr/bin/env python3
+import json, sys, time
+sys.stdin.read()
+print(json.dumps({"type": "system", "subtype": "init"}), flush=True)
 time.sleep(30)
 '''
 
@@ -703,14 +724,17 @@ class GenerationTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
         self.data, server.DATA = server.DATA, self.dir.name
-        self.find, self.timeout = server.find_claude, server.GEN_TIMEOUT
+        self.find, self.timeout, self.quiet = server.find_claude, server.GEN_TIMEOUT, server.GEN_QUIET
         server.JOBS.clear()
 
     def tearDown(self):
-        for job in server.JOBS.values():
-            if job.get('proc') and job['proc'].poll() is None:
-                job['proc'].kill()
-        server.DATA, server.find_claude, server.GEN_TIMEOUT = self.data, self.find, self.timeout
+        server.stop_jobs()
+        for job in list(server.JOBS.values()):
+            for _ in range(100):
+                if job['status'] != 'running':
+                    break
+                time.sleep(0.02)
+        server.DATA, server.find_claude, server.GEN_TIMEOUT, server.GEN_QUIET = self.data, self.find, self.timeout, self.quiet
         self.dir.cleanup()
 
     def fake(self, body):
@@ -780,6 +804,152 @@ class GenerationTest(unittest.TestCase):
         self.fake(FAKE_STUCK)
         server.start_office(self.folder, self.roster)
         self.assertIsNone(server.start_office(self.folder, self.roster))
+
+    def child_of_fake(self):
+        path = server.find_claude() + '.child'
+        for _ in range(100):
+            if os.path.exists(path) and open(path).read().strip():
+                return int(open(path).read())
+            time.sleep(0.02)
+        self.fail('fake claude did not start its child')
+
+    def alive(self, pid):
+        for _ in range(100):
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                return False
+            time.sleep(0.02)
+        return True
+
+    def test_cancel_takes_the_children_of_claude_too(self):
+        self.fake(FAKE_ORPHAN)
+        server.start_office(self.folder, self.roster)
+        child = self.child_of_fake()
+        self.assertTrue(server.cancel_office(self.folder))
+        self.assertEqual(self.wait()['status'], 'cancelled')
+        self.assertFalse(self.alive(child))
+
+    def test_timeout_does_not_wait_for_the_children_of_claude(self):
+        self.fake(FAKE_ORPHAN)
+        server.GEN_TIMEOUT = 0.3
+        server.start_office(self.folder, self.roster)
+        child = self.child_of_fake()
+        self.assertEqual(self.wait()['status'], 'failed')
+        self.assertFalse(self.alive(child))
+
+    def test_retries_against_the_api_fail_at_once_and_name_the_network(self):
+        self.fake(FAKE_NO_NETWORK)
+        server.start_office(self.folder, self.roster)
+        view = self.wait()
+        self.assertEqual(view['status'], 'failed')
+        self.assertIn('прокси', view['error'])
+
+    def test_silence_after_the_start_is_a_network_failure_too(self):
+        self.fake(FAKE_SILENT)
+        server.GEN_QUIET = 0.3
+        server.start_office(self.folder, self.roster)
+        view = self.wait()
+        self.assertEqual(view['status'], 'failed')
+        self.assertIn('прокси', view['error'])
+
+    def test_stage_tells_what_generation_waits_for(self):
+        self.fake(FAKE_SILENT)
+        server.start_office(self.folder, self.roster)
+        for _ in range(100):
+            if server.job_view(self.folder)['stage'] == 'answer':
+                return
+            time.sleep(0.02)
+        self.fail('stage never moved to answer')
+
+    def test_generations_go_one_at_a_time(self):
+        self.fake(FAKE_STUCK)
+        server.start_office(self.folder, self.roster)
+        server.start_office('/work/other', self.roster)
+        time.sleep(0.2)
+        self.assertEqual(server.job_view('/work/other')['stage'], 'queue')
+        server.cancel_office('/work/other')
+        for _ in range(100):
+            if server.job_view('/work/other')['status'] == 'cancelled':
+                return
+            time.sleep(0.02)
+        self.fail('queued generation was not cancelled')
+
+    def test_stopping_the_server_stops_claude(self):
+        self.fake(FAKE_ORPHAN)
+        server.start_office(self.folder, self.roster)
+        child = self.child_of_fake()
+        server.stop_jobs()
+        self.assertFalse(self.alive(child))
+
+    def test_failed_write_keeps_the_office(self):
+        self.saved('СТАРЫЙ')
+        real, server.json.dump = server.json.dump, lambda *a, **kw: 1 / 0
+        try:
+            with self.assertRaises(ZeroDivisionError):
+                server.write_office(self.folder, {'title': 'НОВЫЙ'})
+        finally:
+            server.json.dump = real
+        self.assertEqual(server.load_office(self.folder)['title'], 'СТАРЫЙ')
+
+
+class ClaudeEnvTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.env = dict(os.environ)
+        self.scutil = server.system_proxy
+        for key in list(os.environ):
+            if key.lower().endswith('_proxy'):
+                del os.environ[key]
+        server.system_proxy = lambda: {}
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self.env)
+        server.system_proxy = self.scutil
+        self.dir.cleanup()
+
+    def shell(self, body):
+        path = os.path.join(self.dir.name, 'sh')
+        with open(path, 'w') as f:
+            f.write('#!/bin/sh\n' + body)
+        os.chmod(path, 0o755)
+        os.environ['SHELL'] = path
+
+    def test_proxy_comes_from_the_users_shell(self):
+        self.shell('echo HTTPS_PROXY=http://proxy.test:1\necho OTHER=1\n')
+        env = server.claude_env('/bin/claude')
+        self.assertEqual(env['HTTPS_PROXY'], 'http://proxy.test:1')
+        self.assertNotIn('OTHER', env)
+        self.assertTrue(env['PATH'].startswith('/bin:'))
+
+    def test_proxy_already_set_wins(self):
+        os.environ['HTTPS_PROXY'] = 'http://own.test:2'
+        self.shell('echo HTTPS_PROXY=http://proxy.test:1\n')
+        self.assertEqual(server.claude_env('/bin/claude')['HTTPS_PROXY'], 'http://own.test:2')
+
+    def test_system_proxy_when_the_shell_has_none(self):
+        self.shell('echo OTHER=1\n')
+        server.system_proxy = lambda: {'HTTPS_PROXY': 'http://system.test:3'}
+        self.assertEqual(server.claude_env('/bin/claude')['HTTPS_PROXY'], 'http://system.test:3')
+
+    def test_broken_shell_is_not_fatal(self):
+        os.environ['SHELL'] = os.path.join(self.dir.name, 'нет')
+        self.assertNotIn('HTTPS_PROXY', server.claude_env('/bin/claude'))
+
+    def test_scutil_answer_is_read(self):
+        text = """<dictionary> {
+  HTTPEnable : 1
+  HTTPPort : 7890
+  HTTPProxy : 127.0.0.1
+  HTTPSEnable : 1
+  HTTPSPort : 7891
+  HTTPSProxy : 127.0.0.1
+}"""
+        self.assertEqual(server.read_scutil(text), {'HTTP_PROXY': 'http://127.0.0.1:7890', 'HTTPS_PROXY': 'http://127.0.0.1:7891'})
+
+    def test_scutil_without_proxy_gives_nothing(self):
+        self.assertEqual(server.read_scutil('<dictionary> {\n  HTTPEnable : 0\n}'), {})
 
 
 class WatchParentTest(unittest.TestCase):

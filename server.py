@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -498,6 +499,10 @@ SHIRTS = ['#2f4f8f', '#c0583a', '#5a7a2e', '#8f2f3a', '#4b5a8a', '#3a7a4a', '#7a
           '#b08a2e', '#2f7a5a', '#c04a6a', '#8a6a3a', '#a0602a', '#2f6f6a', '#6b2d5c', '#5a5f6a']
 HAIRS = ['#2b1d14', '#1a1a1a', '#6b4a2b', '#c9a227', '#9a9a9a', '#3a2416', '#8a5a2b', '#e05a8a']
 GEN_TIMEOUT = 120  # с: большой офис собирается за 15–30 с; дольше — claude чего-то ждёт
+GEN_QUIET = 45     # с: после старта модель молчит дольше — до API не дошли
+GEN_RETRIES = 2    # столько повторов запроса подряд — связи нет, дальше не ждём
+GEN_SLOT = threading.Lock()  # генерации идут по одной
+NO_NETWORK = 'нет связи с API: проверьте интернет и прокси'
 JOBS = {}  # папка → последняя генерация: status running|done|failed|cancelled, started, ended, error, proc
 
 
@@ -649,6 +654,102 @@ class GenError(Exception):
     pass
 
 
+def read_scutil(text):
+    """Ответ scutil --proxy → переменные окружения."""
+    keys = dict(re.findall(r'^\s*(\w+) : (.+)$', text, re.M))
+    return {var: 'http://%s:%s' % (keys[kind + 'Proxy'], keys.get(kind + 'Port', '80'))
+            for kind, var in (('HTTP', 'HTTP_PROXY'), ('HTTPS', 'HTTPS_PROXY'))
+            if keys.get(kind + 'Enable') == '1' and keys.get(kind + 'Proxy')}
+
+
+def system_proxy():
+    try:
+        return read_scutil(subprocess.run(['/usr/sbin/scutil', '--proxy'], capture_output=True, text=True, timeout=5).stdout)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+
+
+def shell_proxy():
+    """Прокси из оболочки пользователя: launchd не читает её файлы, а claude без прокси может не достать до API."""
+    try:
+        out = subprocess.run([os.environ.get('SHELL') or '/bin/zsh', '-c', 'env'], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    pairs = (row.split('=', 1) for row in out.splitlines() if '=' in row)
+    return {k: v for k, v in pairs if k.lower().endswith('_proxy')}
+
+
+def claude_env(exe):
+    """Окружение claude: сервер под launchd получает его почти пустым, а системный прокси Node не видит."""
+    env = dict(os.environ, PATH=os.path.dirname(exe) + ':' + os.environ.get('PATH', '/usr/bin:/bin'))
+    if not any(k.lower() in ('https_proxy', 'all_proxy') for k in env):
+        env.update(shell_proxy() or system_proxy())
+    return env
+
+
+def kill_job(job):
+    """Убить claude вместе с его детьми: они держат трубы открытыми."""
+    proc = job.get('proc')
+    if proc:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def read_stream(proc, prompt, job, got):
+    """События claude по мере поступления: job знает, чего он ждёт, got — итог и последние строки."""
+    try:
+        proc.stdin.write(prompt)
+        proc.stdin.close()
+    except (OSError, ValueError):
+        return
+    try:
+        for raw in proc.stdout:
+            got['tail'] = raw
+            try:
+                e = json.loads(raw)
+            except ValueError:
+                continue
+            if e.get('type') == 'system' and e.get('subtype') == 'api_retry':
+                job['retries'] = job.get('retries', 0) + 1
+                continue
+            job['heard'] = time.time()
+            if e.get('type') == 'system' and e.get('subtype') == 'init':
+                job['stage'] = 'answer'
+            elif e.get('type') == 'result':
+                got['answer'] = e
+    except (OSError, ValueError):
+        pass
+
+
+def wait_for(proc, prompt, job):
+    """Дождаться ответа, но не дольше лимитов; итог — словарь с answer, причина отказа — в why."""
+    got = {'tail': '', 'why': ''}
+    reader = threading.Thread(target=read_stream, args=(proc, prompt, job, got), daemon=True)
+    began = job['heard'] = time.time()
+    reader.start()
+    while reader.is_alive() and not job.get('cancel'):
+        now = time.time()
+        if job.get('retries', 0) >= GEN_RETRIES or (job.get('stage') == 'answer' and now - job['heard'] > GEN_QUIET):
+            got['why'] = NO_NETWORK
+        elif now - began > GEN_TIMEOUT:
+            got['why'] = ('claude не успел за %d с' % GEN_TIMEOUT if job.get('stage') == 'answer' else
+                          'claude не запустился за %d с. Обычно он ждёт входа: запустите claude в терминале и войдите '
+                          '(/login), а если macOS спросит доступ к связке ключей — разрешите' % GEN_TIMEOUT)
+        if got['why']:
+            break
+        reader.join(0.1)
+    kill_job(job)
+    reader.join(2)  # труба могла остаться у того, кто сбежал из группы: ждать его незачем
+    try:
+        proc.wait(2)
+        proc.stdout.close()
+    except (subprocess.SubprocessError, OSError, ValueError):
+        pass
+    return got
+
+
 def ask_claude(folder, roster, job):
     """Раскладка по смыслу — одним вызовом claude -p. Процесс лежит в job: его можно убить."""
     exe = find_claude()
@@ -658,29 +759,22 @@ def ask_claude(folder, roster, job):
     prompt = PROMPT.format(name=os.path.basename(folder), folder=folder, agents=agents or '(только универсальные)',
                            builtin=', '.join(sorted(BUILTIN)))
     try:
-        proc = subprocess.Popen(
+        job['proc'] = subprocess.Popen(
             [exe, '-p', '--model', 'sonnet', '--tools', '', '--no-session-persistence', '--setting-sources', '',
-             '--output-format', 'json', '--json-schema', json.dumps(SCHEMA),
+             '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--json-schema', json.dumps(SCHEMA),
              '--system-prompt', 'Ты раскладываешь агентов по пиксельному офису. Отвечай только JSON по схеме.'],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            cwd=DATA if os.path.isdir(DATA) else HERE,
-            env=dict(os.environ, PATH=os.path.dirname(exe) + ':' + os.environ.get('PATH', '/usr/bin:/bin')))
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True,
+            cwd=DATA if os.path.isdir(DATA) else HERE, env=claude_env(exe))
     except OSError as e:
         raise GenError('claude не запустился: %s' % e)
-    job['proc'] = proc
-    try:
-        out, err = proc.communicate(prompt, timeout=GEN_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.communicate()
-        raise GenError('claude не ответил за %d с. Обычно он ждёт входа: запустите claude в терминале и войдите '
-                       '(/login), а если macOS спросит доступ к связке ключей — разрешите' % GEN_TIMEOUT)
+    got = wait_for(job['proc'], prompt, job)
     if job.get('cancel'):
         return None
-    try:
-        answer = json.loads(out)
-    except ValueError:
-        raise GenError('claude ответил не JSON: %s' % clip(err or out or 'пусто', 160))
+    if got['why']:
+        raise GenError(got['why'])
+    answer = got.get('answer')
+    if not answer:
+        raise GenError('claude завершился без ответа: %s' % clip(got['tail'] or 'пусто', 160))
     if answer.get('is_error'):
         raise GenError('claude: %s' % clip(answer.get('result') or 'ошибка без описания', 160))
     office = answer.get('structured_output')
@@ -693,24 +787,37 @@ def backup_path(folder):
     return office_path(folder)[:-5] + '.prev.json'
 
 
+def write_office(folder, office):
+    """Новый файл — целиком, потом замена: прежний офис уходит в .prev.json, сбой его не задевает."""
+    path = office_path(folder)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(office, f, ensure_ascii=False, indent=2)
+    if os.path.exists(path):
+        shutil.copy2(path, backup_path(folder))
+    os.replace(tmp, path)
+
+
 def run_office(folder, roster, job):
-    """Фоновая генерация: при успехе прежний офис уходит в .prev.json, при неудаче остаётся как был."""
+    """Фоновая генерация: при неудаче офис остаётся как был."""
+    slot = False
     try:
-        office = ask_claude(folder, roster, job)
-        if office is not None:
-            result = tidy(folder, roster, office)
-            path = office_path(folder)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            if os.path.exists(path):
-                os.replace(path, backup_path(folder))
-            with open(path, 'w') as f:
-                json.dump(result, f, ensure_ascii=False, indent=2)
+        while not slot and not job.get('cancel'):
+            slot = GEN_SLOT.acquire(timeout=0.1)
+        if slot:
+            job.update(stage='start', started=time.time())
+            office = ask_claude(folder, roster, job)
+            if office is not None:
+                write_office(folder, tidy(folder, roster, office))
         job['status'] = 'cancelled' if job.get('cancel') else 'done'
     except GenError as e:
         job['status'], job['error'] = 'failed', str(e)
     except Exception as e:  # генерация в потоке: ошибка не должна оставить «running» навсегда
         job['status'], job['error'] = 'failed', 'сбой: %s' % e
     finally:
+        if slot:
+            GEN_SLOT.release()
         sys.stderr.write('генерация офиса %s: %s %s\n' % (folder, job['status'], job.get('error', '')))
         job['ended'] = time.time()
 
@@ -720,7 +827,7 @@ def start_office(folder, roster):
     job = JOBS.get(folder)
     if job and job['status'] == 'running':
         return None
-    job = JOBS[folder] = {'status': 'running', 'started': time.time(), 'ended': 0, 'error': ''}
+    job = JOBS[folder] = {'status': 'running', 'stage': 'queue', 'started': time.time(), 'ended': 0, 'error': ''}
     threading.Thread(target=run_office, args=(folder, roster, job), daemon=True).start()
     return job
 
@@ -730,10 +837,16 @@ def cancel_office(folder):
     if not job or job['status'] != 'running':
         return False
     job['cancel'] = True
-    proc = job.get('proc')
-    if proc and proc.poll() is None:
-        proc.kill()
+    kill_job(job)
     return True
+
+
+def stop_jobs():
+    """Сервер закрывается: claude не должен пережить его и потратить деньги впустую."""
+    for job in list(JOBS.values()):
+        if job['status'] == 'running':
+            job['cancel'] = True
+            kill_job(job)
 
 
 def undo_office(folder):
@@ -750,7 +863,7 @@ def undo_office(folder):
 
 def job_view(folder):
     job = JOBS.get(folder) or {}
-    return {'status': job.get('status', ''), 'started': int(job.get('started', 0) * 1000),
+    return {'status': job.get('status', ''), 'stage': job.get('stage', ''), 'started': int(job.get('started', 0) * 1000),
             'ended': int(job.get('ended', 0) * 1000), 'error': job.get('error', ''),
             'canUndo': os.path.exists(backup_path(folder)), 'timeout': GEN_TIMEOUT}
 
@@ -1377,6 +1490,12 @@ class Handler(SimpleHTTPRequestHandler):
         return super().do_GET()
 
 
+def on_term(signum, frame):
+    stop_jobs()
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)  # код выхода тот же: приложение строки меню по нему решает, поднимать ли сервер
+
+
 def main():
     global DATA
     import argparse
@@ -1393,8 +1512,10 @@ def main():
         def watch():
             while parent_alive(ppid):
                 time.sleep(2)
+            stop_jobs()
             os._exit(0)
         threading.Thread(target=watch, daemon=True).start()
+    signal.signal(signal.SIGTERM, on_term)
     threading.Thread(target=stats, daemon=True).start()  # первый проход по журналам — заранее
     print('Agent Office: http://%s:%d' % (args.host, args.port), flush=True)
     ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
