@@ -3,10 +3,13 @@ import http.client
 import json
 import os
 import re
+import signal
+import socket
 import sys
 import tempfile
 import threading
 import time
+import tracemalloc
 import unittest
 from unittest import mock
 from urllib.parse import quote
@@ -1467,6 +1470,273 @@ class ShotTest(unittest.TestCase):
         status, body = self.post(self.png)
         self.assertEqual(status, 500)
         self.assertIn('error', body)
+
+    def test_negative_length_is_refused(self):
+        # rfile.read(-1) читал бы, пока клиент не закроет соединение
+        with socket.create_connection(('127.0.0.1', self.http.server_port), timeout=2) as s:
+            s.sendall(b'POST /api/shot HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: image/png\r\nContent-Length: -1\r\n\r\n')
+            self.assertIn(b' 400 ', s.recv(200))
+
+    def test_stalled_upload_is_dropped(self):
+        self.assertGreater(server.Handler.timeout or 0, 0)
+        with mock.patch.object(server.Handler, 'timeout', 0.2), socket.create_connection(('127.0.0.1', self.http.server_port), timeout=3) as s:
+            s.sendall(b'POST /api/shot HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: image/png\r\nContent-Length: 10\r\n\r\n')
+            while s.recv(200):  # что бы сервер ни ответил, соединение он закрывает сам, клиента не ждёт
+                pass
+
+    def test_failed_post_answers_with_json(self):
+        with mock.patch.object(server, 'find_tail', side_effect=RuntimeError('сбой')):
+            status, body = self.post(b'', {}, '/api/office?s=x')
+        self.assertEqual(status, 500)
+        self.assertIn('error', body)
+
+
+class ForeignRequestTest(unittest.TestCase):
+    """Чужой сайт не должен достучаться до офиса: ни через свой домен на 127.0.0.1, ни запросом со своей страницы."""
+    png = b'\x89PNG\r\n\x1a\n' + b'pixels'
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.shots = os.path.join(tmp.name, 'shots')
+        for name, value in (('SHOTS', self.shots), ('PROJECTS', tmp.name), ('CODEX_SESSIONS', os.path.join(tmp.name, 'нет'))):
+            self.addCleanup(setattr, server, name, getattr(server, name))
+            setattr(server, name, value)
+        self.http = server.ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=self.http.serve_forever, daemon=True).start()
+        self.addCleanup(self.http.server_close)
+        self.addCleanup(self.http.shutdown)
+        self.port = self.http.server_port
+
+    def ask(self, method, path, headers, body=None):
+        conn = http.client.HTTPConnection('127.0.0.1', self.port)
+        self.addCleanup(conn.close)
+        conn.request(method, path, body, headers)
+        res = conn.getresponse()
+        res.read()
+        return res.status
+
+    def shot(self, **headers):
+        return self.ask('POST', '/api/shot', dict({'Content-Type': 'image/png'}, **headers), self.png)
+
+    def test_foreign_host_reads_nothing(self):
+        for path in ('/api/sessions', '/api/stats', '/api/state?s=x', '/'):
+            self.assertEqual(self.ask('GET', path, {'Host': 'evil.example:%d' % self.port}), 403, path)
+
+    def test_foreign_host_writes_nothing(self):
+        self.assertEqual(self.shot(Host='evil.example'), 403)
+        self.assertFalse(os.path.exists(self.shots))
+
+    def test_foreign_origin_writes_nothing(self):
+        self.assertEqual(self.shot(Origin='https://evil.example'), 403)
+        self.assertEqual(self.shot(Origin='null'), 403)
+        self.assertFalse(os.path.exists(self.shots))
+
+    def test_own_page_works(self):
+        for host in ('localhost', '127.0.0.1'):
+            own = '%s:%d' % (host, self.port)
+            self.assertEqual(self.ask('GET', '/api/sessions', {'Host': own}), 200)
+            self.assertEqual(self.shot(Host=own, Origin='http://' + own), 201)
+
+    def test_server_opened_to_the_network_takes_any_name(self):
+        with mock.patch.object(server, 'HOSTS', server.trusted_hosts('0.0.0.0')):
+            self.assertEqual(self.ask('GET', '/api/sessions', {'Host': '192.168.1.5:%d' % self.port}), 200)
+
+    def test_named_address_is_trusted(self):
+        hosts = server.trusted_hosts('192.168.1.5')
+        self.assertIn('192.168.1.5', hosts)
+        self.assertIn('localhost', hosts)
+        self.assertNotIn('evil.example', hosts)
+
+
+class BrokenJournalTest(unittest.TestCase):
+    """Журналы пишет другая программа: странная запись теряется сама, а не вместе со всем списком."""
+    roster_line = line(type='attachment', attachment={'type': 'agent_listing_delta', 'addedTypes': ['b']})
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = os.path.join(self.dir.name, 's.jsonl')
+
+    def write(self, text):
+        with open(self.path, 'w') as f:
+            f.write(text)
+
+    def ledger(self):
+        return server.Ledger(os.path.join(self.dir.name, 'stats.json'))
+
+    def odd(self, **message):
+        return line(type='assistant', timestamp='2026-01-01T10:00:00Z', message=dict({
+            'id': 'odd', 'model': 'claude-sonnet-5-5', 'usage': {'input_tokens': 1}, 'content': []}, **message))
+
+    def test_tail_skips_a_line_it_cannot_take(self):
+        self.write(self.odd(model=['x']) + self.odd(id={}) + assistant('m1', [('Read', {'file_path': 'a'})]))
+        self.assertEqual(server.Tail(self.path).feed().calls, 1)
+
+    def test_ledger_skips_a_line_it_cannot_take(self):
+        self.write(self.odd(model=['x']) + assistant('m1'))
+        ledger = self.ledger()
+        ledger.feed(self.path, True)
+        self.assertEqual([list(models) for hour in ledger.hours.values() for models in hour.values()], [['claude-sonnet-5-5']])
+
+    def test_codex_ledger_skips_a_line_it_cannot_take(self):
+        self.write(meta() + context(model=['x']) + usage_record() + rec('token_usage_record', {'usage': {'input_tokens': None}})
+                   + context() + usage_record())
+        ledger = self.ledger()
+        ledger.feed_codex(self.path, self.path)
+        self.assertEqual([list(models) for hour in ledger.hours.values() for models in hour.values()], [['gpt-5.6-sol']])
+
+    def test_roster_skips_a_line_it_cannot_take(self):
+        self.write(self.roster_line + line(type='attachment', attachment={'type': 'agent_listing_delta', 'removedTypes': [[]]}))
+        self.assertEqual(list(server.roster_in(self.path)), ['b'])
+
+    def test_shortened_journal_is_not_counted_twice(self):
+        # id ответов ledger помнит не все: перечитать журнал с начала значит удвоить траты
+        ledger = self.ledger()
+        self.write(''.join(assistant('m%d' % i) for i in range(ledger.IDS + 1)) + line(type='progress'))
+        ledger.feed(self.path, True)
+        before = json.dumps(ledger.hours, sort_keys=True)
+        self.write(''.join(assistant('m%d' % i) for i in range(ledger.IDS + 1)))
+        ledger.feed(self.path, True)
+        self.assertEqual(json.dumps(ledger.hours, sort_keys=True), before)
+
+    def test_unfinished_line_waits_for_its_end(self):
+        whole = assistant('m1', [('Read', {'file_path': 'a'})])
+        self.write(whole[:20])
+        t = server.Tail(self.path).feed()
+        self.assertEqual(t.calls, 0)
+        self.write(whole)
+        self.assertEqual(t.feed().calls, 1)
+
+    def peak_of(self, read):
+        noise = line(type='progress', data='x' * 1000)
+        self.write(noise * 20000)
+        tracemalloc.start()
+        try:
+            read()
+            return tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+
+    def test_tail_does_not_load_a_huge_journal_at_once(self):
+        self.assertLess(self.peak_of(lambda: server.Tail(self.path).feed()), 2_000_000)
+
+    def test_ledger_does_not_load_a_huge_journal_at_once(self):
+        self.assertLess(self.peak_of(lambda: self.ledger().feed(self.path, True)), 2_000_000)
+
+    def test_codex_titles_skip_bad_rows(self):
+        self.write('[1, 2]\nне json\n{"id": ["x"]}\n{"id": "a", "thread_name": "Имя"}\n')
+        with mock.patch.object(server, 'CODEX_INDEX', self.path), mock.patch.dict(server.CODEX_TITLES, mtime=0, names={}):
+            self.assertEqual(server.codex_titles(), {'a': 'Имя'})
+
+
+class VanishingJournalTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.addCleanup(server.TAILS.clear)
+        for name, value in (('PROJECTS', self.dir.name), ('CODEX_SESSIONS', os.path.join(self.dir.name, 'нет'))):
+            self.addCleanup(setattr, server, name, getattr(server, name))
+            setattr(server, name, value)
+        server.TAILS.clear()
+        self.proj = os.path.join(self.dir.name, 'proj')
+        self.sub = os.path.join(self.proj, 'live', 'subagents')
+        os.makedirs(self.sub)
+        for path in (os.path.join(self.proj, 'live.jsonl'), os.path.join(self.proj, 'gone.jsonl'), os.path.join(self.sub, 'agent-gone.jsonl')):
+            with open(path, 'w') as f:
+                f.write(assistant('m1', ts=iso(time.time())))
+
+    def test_list_survives_a_journal_deleted_during_the_scan(self):
+        real = os.path.getmtime
+
+        def getmtime(path):
+            if 'gone' in os.path.basename(str(path)):
+                raise FileNotFoundError(path)
+            return real(path)
+        with mock.patch.object(server.os.path, 'getmtime', getmtime):
+            self.assertEqual([s['id'] for s in server.sessions()], ['live'])
+
+
+class GlobPathTest(unittest.TestCase):
+    """Скобка в пути проекта не должна превращать путь в шаблон glob."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+
+    def test_agents_of_a_folder_with_brackets(self):
+        folder = os.path.join(self.dir.name, 'проект [2]')
+        os.makedirs(os.path.join(folder, '.claude', 'agents'))
+        with open(os.path.join(folder, '.claude', 'agents', 'builder.md'), 'w') as f:
+            f.write('# Сборщик\n')
+        self.assertIn('builder', server.agent_files(folder))
+
+    def test_journals_under_a_config_folder_with_brackets(self):
+        root = os.path.join(self.dir.name, 'конфиг [2]')
+        sub = os.path.join(root, '-work-app', 's', 'subagents')
+        os.makedirs(sub)
+        with open(os.path.join(sub, 'agent-a.meta.json'), 'w') as f:
+            json.dump({'agentType': 'kit:builder'}, f)
+        with mock.patch.object(server, 'PROJECTS', root):
+            self.assertEqual(server.journal_dirs('/work/app'), [os.path.join(root, '-work-app')])
+            self.assertEqual(server.usage_of('/work/app')[0], {'kit:builder': 1})
+
+
+class ConcurrencyTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.addCleanup(setattr, server, 'DATA', server.DATA)
+        server.DATA = self.dir.name
+
+    def test_office_writes_wait_for_each_other(self):
+        entered, release, calls = threading.Event(), threading.Event(), []
+        real = json.dump
+
+        def slow(obj, f, **kw):
+            calls.append(obj)
+            if len(calls) == 1:
+                entered.set()
+                release.wait(5)
+            real(obj, f, **kw)
+        with mock.patch.object(server.json, 'dump', slow):
+            first = threading.Thread(target=server.write_office, args=('/work/app', {'n': 1}))
+            second = threading.Thread(target=server.write_office, args=('/work/app', {'n': 2}))
+            first.start()
+            entered.wait(5)
+            second.start()
+            second.join(0.3)
+            overlapped = not second.is_alive()
+            release.set()
+            first.join()
+            second.join()
+        self.assertFalse(overlapped)
+        self.assertEqual(server.load_office('/work/app')['n'], 2)
+
+    def test_two_starts_make_one_job(self):
+        class Slow(dict):
+            def get(self, *a):
+                value = super().get(*a)
+                time.sleep(0.05)
+                return value
+        started = []
+        with mock.patch.object(server, 'JOBS', Slow()), mock.patch.object(server, 'run_office'):
+            threads = [threading.Thread(target=lambda: started.append(server.start_office('/work/app', {}))) for _ in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(sum(job is not None for job in started), 1)
+
+
+class SignalTest(unittest.TestCase):
+    def test_ctrl_c_stops_claude_too(self):
+        # claude живёт в своей сессии: Ctrl-C до него не дойдёт, погасить его должен сервер
+        with mock.patch.object(sys, 'argv', ['server.py']), mock.patch.object(server, 'ThreadingHTTPServer'), \
+                mock.patch.object(server.threading, 'Thread'), mock.patch.object(server.signal, 'signal') as caught, \
+                mock.patch('builtins.print'):
+            server.main()
+        self.assertIn(mock.call(signal.SIGINT, server.on_term), caught.call_args_list)
 
 
 if __name__ == '__main__':
