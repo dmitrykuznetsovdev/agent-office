@@ -39,6 +39,7 @@ CODEX_DIR = os.environ.get('CODEX_HOME') or os.path.expanduser('~/.codex')
 CODEX_SESSIONS = os.path.join(CODEX_DIR, 'sessions')
 CODEX_INDEX = os.path.join(CODEX_DIR, 'session_index.jsonl')  # названия тредов
 CODEX_ACCENT = '#4fb3c8'  # вывеска офиса Codex
+EPICS = os.path.join(CLAUDE_DIR, 'epics')  # эпики orchestrating-epics: <эпик>/view.json пишет мод координатора
 RECENT_S = 24 * 3600     # сессии в списке
 LIVE_S = 10 * 60         # тишина дольше — сессия считается остывшей
 AGENT_IDLE_S = 10 * 60   # агент без finished и без записей дольше — ушёл
@@ -1689,9 +1690,11 @@ def agents_of(pdir, sid, now_ms):
 def sessions():
     now = time.time()
     out = []
+    views = epic_views()
     for mtime, sid, pdir, path in session_files():
         t = tail(path)
-        live = now - mtime < LIVE_S
+        # координатор эпика молчит, пока ждёт роли, но жив, пока его мод переписывает view.json
+        live = now - mtime < LIVE_S or now - views.get(sid, (None, 0))[1] < VIEW_STALE_S
         agents = agents_of(pdir, sid, now * 1000)
         working = sum(a['isWorking'] for a in agents) + (1 if live and t.busy else 0)
         out.append({
@@ -1837,6 +1840,98 @@ def find_tail(sid):
     return None
 
 
+# ── Эпики orchestrating-epics: мод координатора пишет <эпик>/view.json, офис рисует его и ledger не разбирает ──
+VIEW_STALE_S = 3 * 60  # мод переписывает view.json раз в минуту; тишина дольше — процесс координатора не обновляет
+VIEW_CACHE = {}  # view.json → (mtime, разобранный вид или None)
+GATES = {'passed': '●', 'next': '◉', 'rejected': '✖', 'ahead': '○'}  # стадии PATCH_READY → REVIEWED → INTEGRATED → DEPLOYED
+ROLE_NAMES = {'writer': 'Писатель', 'qa': 'Контролёр', 'critic': 'Критик', 'researcher': 'Исследователь'}
+ROLE_PROPS = {'writer': 'tablet', 'qa': 'magnifier', 'critic': 'clipboard', 'researcher': 'books'}
+AT_WORK = ('working', 'idle')  # job-файл роли: работает или ждёт; done и stopped — ушла
+
+
+def epic_views():
+    """view.json, переписанные за сутки: CLI-сессия координатора → (вид, время записи)."""
+    out = {}
+    for path in glob.glob(os.path.join(glob.escape(EPICS), '*', 'view.json')):
+        mtime = mtime_of(path)
+        if time.time() - mtime >= RECENT_S:
+            continue
+        if VIEW_CACHE.get(path, (None,))[0] != mtime:
+            view = read_json(path)
+            VIEW_CACHE[path] = (mtime, view if isinstance(view, dict) and view.get('schema') == 1 else None)
+        view = VIEW_CACHE[path][1]
+        coord = view.get('coordinator') if view else None
+        session = coord.get('session') if isinstance(coord, dict) else None
+        if isinstance(session, str) and session:
+            out[session] = (view, mtime)
+    return out
+
+
+def journal_of(session, files):
+    """Самый свежий журнал сессии; мод может записать и короткий id из 8 знаков."""
+    return next((f for f in files if f[1] == session or (len(session) == 8 and f[1].startswith(session))), None)
+
+
+def epic_floors(view):
+    """Этажи эпика сверху вниз: спека, исследования, пакет за пакетом. Этаж — (имя, примечание, [(тип стола, должность, кто, роль)])."""
+    epic, floors = str(view.get('epic', '?')), []
+    items = lambda key: [x for x in view.get(key) or [] if isinstance(x, dict)]
+    roles = lambda x: [r for r in x.get('roles') or [] if isinstance(r, dict) and isinstance(r.get('session'), str) and r.get('role') in ROLE_NAMES]
+    crit = items('critiques')
+    if crit:
+        floors.append(('СПЕКА', ' · '.join('r%s %s' % (c.get('round'), c.get('verdict') or '…') for c in crit),
+                       [('%s/spec/r%s' % (epic, c.get('round')), 'Критик r%s' % c.get('round'), 'Критик r%s' % c.get('round'), r) for c in crit for r in roles(c)]))
+    res = items('researchers')
+    if res:
+        floors.append(('ИССЛЕДОВАНИЯ', ' · '.join(str(r.get('question')) for r in res if not r.get('answered')),
+                       [('%s/research/%s' % (epic, q.get('question')), 'Исследователь %s' % q.get('question'), 'Исследователь %s' % q.get('question'), r)
+                        for q in res for r in roles(q)]))
+    for p in items('packages'):
+        gates = ''.join(GATES.get(g, '?') for g in p.get('gates') or [])
+        floors.append(('%s %s' % (p.get('id'), gates), str(p.get('text') or ''),
+                       [('%s/%s/%s' % (epic, p.get('id'), r['role']), ROLE_NAMES[r['role']], '%s %s' % (ROLE_NAMES[r['role']], p.get('id')), r) for r in roles(p)]))
+    return floors
+
+
+def role_agent(kind, name, role, f):
+    """Сессия роли как агент офиса. Работает ли она, говорит её job-файл, а не тишина в журнале."""
+    t = tail(f[3])
+    job = role.get('state') if isinstance(role.get('state'), str) else ''
+    detail = role.get('detail') if isinstance(role.get('detail'), str) else ''
+    working = job in AT_WORK if job else t.busy and time.time() - f[0] < AGENT_IDLE_S
+    return {
+        'id': f[1], 'type': kind, 'desc': clip(t.title or name, 40), 'isWorking': working, 'job': job,
+        'activity': detail or t.activity or name, 'startedAt': t.first, 'endedAt': 0 if working else t.last,
+        'calls': t.calls, 'cost': round(t.cost, 4), 'today': round(today_cost(t), 4), 'model': t.model, 'tool': t.tool,
+        'at': t.activity_at or t.last, 'finished': not working, 'events': t.events,
+    }
+
+
+def epic_room(t, agents, busy, view, files):
+    """Офис эпика: наверху оркестратор, ниже этажи из view.json. Этаж, где никто не работает, свёрнут в полоску."""
+    zones, seated = [], []
+    for i, (name, note, seats) in enumerate(epic_floors(view)):
+        desks, here = [], []
+        for kind, desk, who, role in seats:
+            f = journal_of(role['session'], files)
+            if f:
+                desks.append(dress({'type': kind, 'name': desk, 'prop': ROLE_PROPS[role['role']]}))
+                here.append((role_agent(kind, desk, role, f), who))
+        zones.append({'id': 'epic-%d' % i, 'name': name, 'note': note, 'strip': not any(a['isWorking'] for a, _ in here), 'desks': desks})
+        seated += here
+    if zones:
+        zones[0]['desks'].insert(0, dress({'type': 'main', 'name': 'Оркестратор', 'prop': 'crown', 'shirt': '#3b3f8f'}))
+    coord = view.get('coordinator') if isinstance(view.get('coordinator'), dict) else {}
+    progress = view.get('progress') if isinstance(view.get('progress'), dict) else {}
+    title = 'EPIC %s · SPEC R%s · %s/%s' % (str(view.get('epic', '?')).upper(), view.get('revision', '?'), progress.get('landed', '?'), progress.get('total', '?'))
+    office = {'v': OFFICE_V, 'lang': LANG, 'folder': t.home or '?', 'title': title, 'zones': zones, 'guests': {}, 'saved': True,
+              'job': None, 'generating': False, 'epic': {'context': coord.get('context_tokens'), 'limit': coord.get('context_limit')}}
+    st = room(t, agents + [a for a, _ in seated], busy, office)
+    st['producer']['waitingFor'] = ', '.join(who for a, who in seated if a['job'] == 'working')
+    st['producer']['owner'] = bool(coord.get('owner_needed'))
+    return st
+
+
 def room(t, agents, busy, office):
     """Состояние офиса сессии: руководитель, агенты, общий журнал."""
     log = [(at, 'producer', text) for at, text in t.events]
@@ -1860,11 +1955,16 @@ def room(t, agents, busy, office):
 
 def state(sid):
     now = time.time()
-    for mtime, s, pdir, path in session_files():
+    files = session_files()
+    for mtime, s, pdir, path in files:
         if s == sid:
             t = tail(path)
             agents = agents_of(pdir, sid, now * 1000)
-            return room(t, agents, t.busy and now - mtime < LIVE_S, office_for(t, [a['type'] for a in agents]))
+            busy = t.busy and now - mtime < LIVE_S
+            view = epic_views().get(sid)
+            if view:
+                return epic_room(t, agents, busy, view[0], files)
+            return room(t, agents, busy, office_for(t, [a['type'] for a in agents]))
     mains, kids = codex_threads(now)
     t = mains.get(sid)
     if t is None:

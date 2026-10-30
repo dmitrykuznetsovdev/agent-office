@@ -1281,6 +1281,104 @@ class SessionViewTest(TeamCase):
         self.assertEqual(len(self.seats(server.office_for(server.tail(path)))), 3)
 
 
+class EpicTest(unittest.TestCase):
+    """Эпик orchestrating-epics: мод координатора пишет view.json, офис рисует по нему, а не по ledger-у."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.saved = server.PROJECTS, server.EPICS, server.DATA
+        server.PROJECTS, server.EPICS, server.DATA = (os.path.join(self.dir.name, p) for p in ('projects', 'epics', 'data'))
+        server.TAILS.clear()
+        server.VIEW_CACHE.clear()
+        self.journal('-work-app', 'coord', assistant('c1', stop='end_turn'))
+        self.journal('-work-app--wt-p1', 'w1', assistant('w1', stop='end_turn'))
+        self.journal('-work-app--wt-p1-qa', 'q1', assistant('q1', stop='end_turn'))
+        self.journal('-work-app--wt-p2', 'w2', assistant('w2', [('Bash', {'command': 'npm test'})]))
+        self.journal('-work-app', 'c1', assistant('c1x', stop='end_turn'))
+        self.journal('-work-app', 'abcdef12-3456-7890-abcd-ef1234567890', assistant('r1', [('Read', {'file_path': '/work/app/a.py'})]))
+        self.view()
+
+    def tearDown(self):
+        server.PROJECTS, server.EPICS, server.DATA = self.saved
+        server.TAILS.clear()
+        server.VIEW_CACHE.clear()
+        self.dir.cleanup()
+
+    def journal(self, project, sid, text, age=0):
+        os.makedirs(os.path.join(server.PROJECTS, project), exist_ok=True)
+        path = os.path.join(server.PROJECTS, project, sid + '.jsonl')
+        with open(path, 'w') as f:
+            f.write(text)
+        at = time.time() - age
+        os.utime(path, (at, at))
+
+    def view(self, raw=None, age=0, owner=False, name='e1'):
+        """view.json, как его пишет мод: пакеты в порядке манифеста, роли с сессиями и job-состоянием."""
+        os.makedirs(os.path.join(server.EPICS, name), exist_ok=True)
+        path = os.path.join(server.EPICS, name, 'view.json')
+        now = time.time() - age
+        with open(path, 'w') as f:
+            f.write(raw if raw is not None else json.dumps({
+                'schema': 1, 'updated_at': iso(now), 'epic': 'e1', 'revision': 2, 'status': None,
+                'coordinator': {'session': 'coord', 'task_id': 'local_x', 'context_tokens': 147000, 'context_limit': 250000, 'owner_needed': owner},
+                'progress': {'landed': 1, 'total': 3},
+                'packages': [
+                    {'id': 'P1', 'attempt': 1, 'stage': 'INTEGRATED', 'gates': ['passed', 'passed', 'passed', 'next'], 'text': 'поп. 1 · gone · ACCEPT', 'is_open': False,
+                     'roles': [{'role': 'writer', 'session': 'w1', 'state': 'done', 'detail': ''}, {'role': 'qa', 'session': 'q1', 'state': 'done', 'detail': ''}]},
+                    {'id': 'P2', 'attempt': 2, 'stage': 'IMPLEMENTING', 'gates': ['next', 'ahead', 'ahead', 'ahead'], 'text': 'поп. 2 · active', 'is_open': True,
+                     'roles': [{'role': 'writer', 'session': 'w2', 'state': 'working', 'detail': 'clippy+fmt clean'}]},
+                    {'id': 'P3', 'attempt': 0, 'stage': 'PLANNED', 'gates': ['ahead'] * 4, 'text': 'не выдан', 'is_open': False, 'roles': []},
+                ],
+                'critiques': [{'round': 1, 'verdict': 'ACCEPT', 'roles': [{'role': 'critic', 'session': 'c1', 'state': 'done', 'detail': ''}]}],
+                'researchers': [{'question': 'Q1', 'dispatch': 'p2-a2', 'answered': False,
+                                 'roles': [{'role': 'researcher', 'session': 'abcdef12', 'state': 'working', 'detail': 'weighing two queues'}]}],
+            }))
+        os.utime(path, (now, now))
+
+    def floors(self, office):
+        return [(z['name'], z.get('note'), bool(z.get('strip')), [d['name'] for d in z['desks'] if d['type'] != 'main']) for z in office['zones']]
+
+    def test_floor_per_package_in_manifest_order_spec_and_research_above(self):
+        office = server.state('coord')['office']
+        self.assertEqual(office['title'], 'EPIC E1 · SPEC R2 · 1/3')
+        self.assertEqual(office['epic'], {'context': 147000, 'limit': 250000})
+        self.assertEqual(self.floors(office), [
+            ('СПЕКА', 'r1 ACCEPT', True, ['Критик r1']),
+            ('ИССЛЕДОВАНИЯ', 'Q1', False, ['Исследователь Q1']),
+            ('P1 ●●●◉', 'поп. 1 · gone · ACCEPT', True, ['Писатель', 'Контролёр']),
+            ('P2 ◉○○○', 'поп. 2 · active', False, ['Писатель']),
+            ('P3 ○○○○', 'не выдан', True, []),
+        ])
+
+    def test_roles_carry_their_job_state(self):
+        agents = {a['id']: a for a in server.state('coord')['agents']}
+        w2, r1, w1 = agents['w2'], agents['abcdef12-3456-7890-abcd-ef1234567890'], agents['w1']
+        self.assertEqual((w2['type'], w2['job'], w2['isWorking'], w2['activity']), ('e1/P2/writer', 'working', True, 'clippy+fmt clean'))
+        self.assertEqual((r1['type'], r1['job'], r1['isWorking']), ('e1/research/Q1', 'working', True))
+        self.assertEqual((w1['job'], w1['isWorking'], w1['finished']), ('done', False, True))
+
+    def test_idle_coordinator_waits_for_the_roles_at_work_and_calls_the_owner(self):
+        producer = server.state('coord')['producer']
+        self.assertEqual(producer['waitingFor'], 'Исследователь Q1, Писатель P2')
+        self.assertFalse(producer['owner'])
+        self.view(owner=True)
+        self.assertTrue(server.state('coord')['producer']['owner'])
+
+    def test_coordinator_is_live_while_its_mod_rewrites_the_view(self):
+        self.journal('-work-app', 'coord', assistant('c1', stop='end_turn'), age=20 * 60)
+        live = lambda: [s for s in server.sessions() if s['id'] == 'coord'][0]['isLive']
+        self.assertTrue(live())
+        self.view(age=5 * 60)
+        self.assertFalse(live())
+
+    def test_role_session_and_a_broken_view_are_no_epic(self):
+        self.assertFalse(server.state('w2')['office'].get('epic'))
+        self.view(raw='{не json')
+        st = server.state('coord')
+        self.assertFalse(st['office'].get('epic'))
+        self.assertFalse(st['producer'].get('waitingFor'))
+
+
 class ClaudeEnvTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
