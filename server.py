@@ -1850,7 +1850,13 @@ def find_tail(sid):
 VIEW_STALE_S = 3 * 60  # мод переписывает view.json раз в минуту; тишина дольше — процесс координатора не обновляет
 VIEW_CACHE = {}  # view.json → (mtime, разобранный вид или None)
 STAGES = ('патч', 'QA', 'влит', 'выкачен')  # PATCH_READY → REVIEWED → INTEGRATED → DEPLOYED: дорожка этажа пакета
-VERDICTS = {'ACCEPT': 'passed', 'REJECT': 'rejected'}  # раунд критики: нет вердикта — идёт
+VERDICTS = {'ACCEPT': 'passed', 'REJECT': 'rejected'}
+# the epic branch going to the delivery ref: what the release floor says and its track, by the mod's release.state
+RELEASE = {
+    'packages': ('%s → %s, когда влиты все пакеты', [['пакеты', 'next'], ['«да»', 'ahead']]),
+    'owner': ('ждёт «да» владельца: %s → %s', [['пакеты', 'passed'], ['«да»', 'next']]),
+    'done': ('%s влит в %s', [['пакеты', 'passed'], ['«да»', 'passed']]),
+}  # раунд критики: нет вердикта — идёт
 ROLE_NAMES = {'writer': 'Писатель', 'qa': 'Контролёр', 'critic': 'Критик', 'researcher': 'Исследователь'}
 ROLE_PROPS = {'writer': 'tablet', 'qa': 'magnifier', 'critic': 'clipboard', 'researcher': 'books'}
 AT_WORK = ('working', 'idle')  # job-файл роли: работает или ждёт; done и stopped — ушла
@@ -1903,7 +1909,7 @@ def child_of(sid, cwd, children):
 
 
 def epic_floors(view):
-    """Этажи эпика сверху вниз: спека, исследования, влитые пакеты одним этажом, остальные пакеты по манифесту.
+    """Этажи эпика сверху вниз: спека, исследования, влитые пакеты одним этажом, остальные пакеты по манифесту, выпуск в ветку поставки.
     Этаж — (имя, примечание, [(тип стола, должность, кто, роль или None — пустой стол)], дорожка [[подпись, passed|next|rejected|ahead]] или None,
     идёт ли там работа: спека до ACCEPT, открытый вопрос, открытый пакет)."""
     epic, floors = str(view.get('epic', '?')), []
@@ -1933,7 +1939,16 @@ def epic_floors(view):
         if p.get('is_open') and not any(r['role'] == 'qa' for *_, r in here):
             here.append(('%s/%s/qa' % (epic, pid), ROLE_NAMES['qa'], '%s %s' % (ROLE_NAMES['qa'], pid), None))
         gates = [g if g in ('passed', 'next', 'rejected') else 'ahead' for g in p.get('gates') or []]
-        floors.append((str(pid), str(p.get('text') or ''), here, [list(x) for x in zip(STAGES, gates)], bool(p.get('is_open'))))
+        note, waits = str(p.get('text') or ''), p.get('waits_for')
+        # an undispatched package says what holds it: a dependency not on the epic branch yet, or only the orchestrator
+        if not p.get('attempt') and isinstance(waits, list):
+            note = 'ждёт ' + ', '.join(map(str, waits)) if waits else 'можно выдавать'
+        floors.append((str(pid), note, here, [list(x) for x in zip(STAGES, gates)], bool(p.get('is_open'))))
+    rel = view.get('release')
+    if isinstance(rel, dict) and rel.get('state') in RELEASE:
+        note, track = RELEASE[rel['state']]
+        ref = lambda key: str(rel.get(key) or '?').removeprefix('refs/heads/')
+        floors.append(('ВЫПУСК', note % (ref('from'), ref('to')), [], [list(x) for x in track], False))
     return floors
 
 

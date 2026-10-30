@@ -429,14 +429,17 @@ function homeSign(c: C2, x: number, deskTop: number) {
 // an epic floor's stages as a row of lamps: green passed, blue next (it pulses), red rejected, grey ahead
 const STAGE_COLOR: Record<string, string> = { passed: '#2f9e57', next: '#3a7bd5', rejected: '#c8403a', ahead: '#4a4a58' }
 const SEG = { w: 30, h: 9, gap: 2 }
-function stageTrack(c: C2, labels: Array<{ x: number; y: number; text: string; px: number; color?: string; w?: number; stroke?: boolean }>, track: Array<[string, string]>, x: number, y: number, t: number): number {
+// room: the width the track may take; a long one (the landed packages of a big epic) narrows its plates to fit.
+// ponytail: plates stop narrowing at 14 px, so past ~30 landed packages the track runs into the wall: group them then
+function stageTrack(c: C2, labels: Array<{ x: number; y: number; text: string; px: number; color?: string; w?: number; stroke?: boolean; maxw?: number }>, track: Array<[string, string]>, x: number, y: number, t: number, room = Infinity): number {
+  const w = Math.max(14, Math.min(SEG.w, Math.floor(room / track.length) - SEG.gap))
   track.forEach(([text, state], i) => {
-    const sx = x + i * (SEG.w + SEG.gap)
-    box(c, sx, y, SEG.w, SEG.h, STAGE_COLOR[state] ?? STAGE_COLOR.ahead!, '#1b1d2e')
-    if (state === 'next') { c.globalAlpha = 0.25 + 0.25 * Math.sin(t * 4); R(c, sx + 1, y + 1, SEG.w - 2, SEG.h - 2, '#ffffff'); c.globalAlpha = 1 }
-    labels.push({ x: sx + SEG.w / 2, y: y + 1.6, text, px: 3.3, color: state === 'ahead' ? 'rgba(235,235,250,0.55)' : '#ffffff', w: 600, stroke: false })
+    const sx = x + i * (w + SEG.gap)
+    box(c, sx, y, w, SEG.h, STAGE_COLOR[state] ?? STAGE_COLOR.ahead!, '#1b1d2e')
+    if (state === 'next') { c.globalAlpha = 0.25 + 0.25 * Math.sin(t * 4); R(c, sx + 1, y + 1, w - 2, SEG.h - 2, '#ffffff'); c.globalAlpha = 1 }
+    labels.push({ x: sx + w / 2, y: y + 1.6, text, px: 3.3, color: state === 'ahead' ? 'rgba(235,235,250,0.55)' : '#ffffff', w: 600, stroke: false, maxw: w - 2 })
   })
-  return track.length * (SEG.w + SEG.gap)
+  return track.length * (w + SEG.gap)
 }
 
 function whiteboard(c: C2, x: number, y: number, w: number, h: number) {
@@ -648,7 +651,8 @@ export function mountFloors(scene: HTMLCanvasElement, overlay: HTMLCanvasElement
       whiteboard(c, xL + 2, fl.y + 2, FL.plaque - 6, 19)
       labels.push({ x: xL + 4, y: fl.y + 3.3, text: fl.def.name, px: 3.4, color: '#2445a8', w: 600, align: 'left', maxw: FL.plaque - 10, stroke: false })
       if (fl.def.strip) {
-        const used = track ? stageTrack(c, labels, track, x0 + 4, fl.y + 6, t) : 0
+        // the band keeps room for what it says after the track
+        const used = track ? stageTrack(c, labels, track, x0 + 4, fl.y + 6, t, L.cols * FL.cw - 80) : 0
         labels.push({ x: x0 + 8 + used, y: fl.y + 8.2, text: second, px: 3.6, color: 'rgba(245,245,255,0.92)', w: 600, align: 'left', maxw: L.cols * FL.cw - used - 12, stroke: false })
         continue
       }

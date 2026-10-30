@@ -1329,8 +1329,9 @@ class EpicTest(unittest.TestCase):
                      'roles': [{'role': 'writer', 'session': 'w1', 'state': 'done', 'detail': ''}, {'role': 'qa', 'session': 'q1', 'state': 'done', 'detail': ''}]},
                     {'id': 'P2', 'attempt': 2, 'stage': 'IMPLEMENTING', 'gates': ['next', 'ahead', 'ahead', 'ahead'], 'text': 'поп. 2 · active', 'is_open': True,
                      'roles': [{'role': 'writer', 'session': 'w2', 'state': 'working', 'detail': 'clippy+fmt clean'}]},
-                    {'id': 'P3', 'attempt': 0, 'stage': 'PLANNED', 'gates': ['ahead'] * 4, 'text': 'не выдан', 'is_open': False, 'roles': []},
+                    {'id': 'P3', 'attempt': 0, 'stage': 'PLANNED', 'gates': ['ahead'] * 4, 'text': 'не выдан', 'is_open': False, 'waits_for': ['P2'], 'roles': []},
                 ],
+                'release': {'from': 'refs/heads/epic/e1', 'to': 'refs/heads/main', 'state': 'packages'},
                 'critiques': [{'round': 1, 'verdict': verdict, 'roles': [{'role': 'critic', 'session': 'c1', 'state': 'done', 'detail': ''}]}],
                 'researchers': [{'question': 'Q1', 'dispatch': 'p2-a2', 'answered': False,
                                  'roles': [{'role': 'researcher', 'session': 'abcdef12', 'state': 'working', 'detail': 'weighing two queues'}]}],
@@ -1354,17 +1355,38 @@ class EpicTest(unittest.TestCase):
             ('ИССЛЕДОВАНИЯ', 'Q1', ['Исследователь Q1']),
             ('СДАНО', 'сдано 1 из 3', ['Писатель', 'Контролёр']),
             ('P2', 'поп. 2 · active', ['Писатель', 'Контролёр']),
-            ('P3', 'не выдан', []),
+            ('P3', 'ждёт P2', []),
+            ('ВЫПУСК', 'epic/e1 → main, когда влиты все пакеты', []),
         ])
-        # only the work in progress is a full floor: the accepted spec, the landed packages and the plan are bands
-        self.assertEqual(self.strips(office), [True, False, True, False, True])
+        # only the work in progress is a full floor: the accepted spec, the landed packages, the plan and the release are bands
+        self.assertEqual(self.strips(office), [True, False, True, False, True, True])
 
-    def test_an_open_package_floor_stays_full_while_its_roles_rest(self):
+    def edit_view(self, change):
         path = os.path.join(server.EPICS, 'e1', 'view.json')
         with open(path) as f:
             view = json.load(f)
-        view['packages'][1]['roles'][0]['state'] = 'idle'
+        change(view)
         self.view(raw=json.dumps(view))
+
+    def test_a_planned_package_says_what_it_waits_for(self):
+        self.edit_view(lambda v: v['packages'][2].update(waits_for=[]))
+        self.assertEqual(self.floors(server.state('coord')['office'])[4][:2], ('P3', 'можно выдавать'))
+        # a view written by an older mod has no waits_for: the package keeps the mod's own words
+        self.edit_view(lambda v: v['packages'][2].pop('waits_for'))
+        self.assertEqual(self.floors(server.state('coord')['office'])[4][:2], ('P3', 'не выдан'))
+
+    def test_the_release_floor_says_what_is_left_before_the_epic_is_delivered(self):
+        floor = lambda: [(z['note'], z['track']) for z in server.state('coord')['office']['zones'] if z['name'] == 'ВЫПУСК']
+        self.edit_view(lambda v: v['release'].update(state='owner'))
+        self.assertEqual(floor(), [('ждёт «да» владельца: epic/e1 → main', [['пакеты', 'passed'], ['«да»', 'next']])])
+        self.edit_view(lambda v: v['release'].update(state='done'))
+        self.assertEqual(floor(), [('epic/e1 влит в main', [['пакеты', 'passed'], ['«да»', 'passed']])])
+        # no promotion declared: the packages land straight on the delivery ref, no release floor
+        self.edit_view(lambda v: v.update(release=None))
+        self.assertEqual(floor(), [])
+
+    def test_an_open_package_floor_stays_full_while_its_roles_rest(self):
+        self.edit_view(lambda v: v['packages'][1]['roles'][0].update(state='idle'))
         self.assertEqual(self.strips(server.state('coord')['office'])[3], False)
 
     def test_spec_floor_stays_until_the_critique_accepts(self):
@@ -1377,7 +1399,8 @@ class EpicTest(unittest.TestCase):
         tracks = [z.get('track') for z in server.state('coord')['office']['zones']]
         self.assertEqual(tracks, [[['r1', 'passed']], None, [['P1', 'passed']],
                                   [['патч', 'next'], ['QA', 'ahead'], ['влит', 'ahead'], ['выкачен', 'ahead']],
-                                  [['патч', 'ahead'], ['QA', 'ahead'], ['влит', 'ahead'], ['выкачен', 'ahead']]])
+                                  [['патч', 'ahead'], ['QA', 'ahead'], ['влит', 'ahead'], ['выкачен', 'ahead']],
+                                  [['пакеты', 'next'], ['«да»', 'ahead']]])
 
     def test_an_open_package_keeps_an_empty_desk_for_its_qa(self):
         p2 = server.state('coord')['office']['zones'][3]
