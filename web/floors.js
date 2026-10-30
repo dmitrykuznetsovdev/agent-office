@@ -46,7 +46,7 @@ function building(st, now) {
     const [bg, bm] = gradeOf(st.producer.model);
     const boss = { key: 'boss', name: deskName('main', office), grade: bg, model: bm, boss: true, look: lookOf('boss', mainDesk, '#3b3f8f', true) };
     const floors = office.zones
-        .map(z => ({ name: z.name, note: z.note, strip: z.strip, home: 0, cells: z.strip ? [] : z.desks.filter(d => d.type !== 'main').map(d => ({ key: d.type, name: d.short ?? d.name })) }));
+        .map(z => ({ name: z.name, note: z.note, strip: z.strip, track: z.track, home: 0, cells: z.strip ? [] : z.desks.filter(d => d.type !== 'main').map(d => ({ key: d.type, name: d.short ?? d.name })) }));
     const free = { name: 'ФРИЛАНС', cells: [], free: true, home: 0 };
     const gone = (a) => !a.isWorking && now - a.endedAt >= AWAY;
     // at work first, then home, newest first: a desk goes to whoever is here
@@ -652,6 +652,22 @@ function homeSign(c, x, deskTop) {
         if (row[i] === '#')
             R(c, x + 2 + i, deskTop - 7 + j, 1, 1, '#a0502a'); });
 }
+// an epic floor's stages as a row of lamps: green passed, blue next (it pulses), red rejected, grey ahead
+const STAGE_COLOR = { passed: '#2f9e57', next: '#3a7bd5', rejected: '#c8403a', ahead: '#4a4a58' };
+const SEG = { w: 30, h: 9, gap: 2 };
+function stageTrack(c, labels, track, x, y, t) {
+    track.forEach(([text, state], i) => {
+        const sx = x + i * (SEG.w + SEG.gap);
+        box(c, sx, y, SEG.w, SEG.h, STAGE_COLOR[state] ?? STAGE_COLOR.ahead, '#1b1d2e');
+        if (state === 'next') {
+            c.globalAlpha = 0.25 + 0.25 * Math.sin(t * 4);
+            R(c, sx + 1, y + 1, SEG.w - 2, SEG.h - 2, '#ffffff');
+            c.globalAlpha = 1;
+        }
+        labels.push({ x: sx + SEG.w / 2, y: y + 1.6, text, px: 3.3, color: state === 'ahead' ? 'rgba(235,235,250,0.55)' : '#ffffff', w: 600, stroke: false });
+    });
+    return track.length * (SEG.w + SEG.gap);
+}
 function whiteboard(c, x, y, w, h) {
     box(c, x, y, w, h, '#f4f4ee', '#8a8a96');
     R(c, x + 1, y + 1, w - 2, 1, '#ffffff');
@@ -904,18 +920,23 @@ export function mountFloors(scene, overlay, onError) {
             }
             const busyHere = people.filter(p => now_.get(p.key).work).length;
             const second = fl.def.note ?? `в деле ${busyHere}` + (fl.def.home ? ` · дома ${fl.def.home}` : '');
-            // a folded floor: a band with what the floor says written along it, and no desks
+            // a folded floor: a band with its stages and what the floor says, and no desks; a package not dispatched yet is dark
+            const track = fl.def.track;
             if (fl.def.strip) {
-                R(c, xL, fl.y, xR - xL, fl.h - 2, room.wall2);
+                const dark = !!track && track.every(([, s]) => s === 'ahead');
+                R(c, xL, fl.y, xR - xL, fl.h - 2, dark ? shade(room.wall2, 0.55) : room.wall2);
                 R(c, xL, fl.y + fl.h - 2, xR - xL, 2, room.slab);
             }
             whiteboard(c, xL + 2, fl.y + 2, FL.plaque - 6, 19);
             labels.push({ x: xL + 4, y: fl.y + 3.3, text: fl.def.name, px: 3.4, color: '#2445a8', w: 600, align: 'left', maxw: FL.plaque - 10, stroke: false });
             if (fl.def.strip) {
-                whiteboard(c, x0 + 4, fl.y + 6, Math.min(L.cols * FL.cw - 8, 150), 11);
-                labels.push({ x: x0 + 7, y: fl.y + 8.2, text: second, px: 3.6, color: '#2a2a33', align: 'left', maxw: 144, stroke: false });
+                const used = track ? stageTrack(c, labels, track, x0 + 4, fl.y + 6, t) : 0;
+                labels.push({ x: x0 + 8 + used, y: fl.y + 8.2, text: second, px: 3.6, color: 'rgba(245,245,255,0.92)', w: 600, align: 'left', maxw: L.cols * FL.cw - used - 12, stroke: false });
                 continue;
             }
+            // a floor at work keeps its track on the wall, right of the desks
+            if (track)
+                stageTrack(c, labels, track, xR - track.length * (SEG.w + SEG.gap) - 4, fl.y + 2, t);
             labels.push({ x: xL + 4, y: fl.y + 8.6, text: second, px: 3.1, color: '#2a2a33', align: 'left', maxw: FL.plaque - 10, stroke: false });
             labels.push({ x: xL + 4, y: fl.y + 13.8, text: money(sum), px: 3.3, color: '#1f7a3a', w: 600, align: 'left', stroke: false });
         }

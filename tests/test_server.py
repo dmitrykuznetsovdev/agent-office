@@ -1345,10 +1345,26 @@ class EpicTest(unittest.TestCase):
         self.assertEqual(self.floors(office), [
             ('СПЕКА', 'r1 ACCEPT', True, ['Критик r1']),
             ('ИССЛЕДОВАНИЯ', 'Q1', False, ['Исследователь Q1']),
-            ('P1 ●●●◉', 'поп. 1 · gone · ACCEPT', True, ['Писатель', 'Контролёр']),
-            ('P2 ◉○○○', 'поп. 2 · active', False, ['Писатель']),
-            ('P3 ○○○○', 'не выдан', True, []),
+            ('P1', 'поп. 1 · gone · ACCEPT', True, ['Писатель', 'Контролёр']),
+            ('P2', 'поп. 2 · active', False, ['Писатель', 'Контролёр']),
+            ('P3', 'не выдан', True, []),
         ])
+
+    def test_each_floor_carries_its_track_of_stages(self):
+        tracks = [z.get('track') for z in server.state('coord')['office']['zones']]
+        self.assertEqual(tracks, [
+            [['r1', 'passed']],
+            None,
+            [['патч', 'passed'], ['QA', 'passed'], ['влит', 'passed'], ['выкачен', 'next']],
+            [['патч', 'next'], ['QA', 'ahead'], ['влит', 'ahead'], ['выкачен', 'ahead']],
+            [['патч', 'ahead'], ['QA', 'ahead'], ['влит', 'ahead'], ['выкачен', 'ahead']],
+        ])
+
+    def test_an_open_package_keeps_an_empty_desk_for_its_qa(self):
+        p2 = server.state('coord')['office']['zones'][3]
+        qa = [d for d in p2['desks'] if d['name'] == 'Контролёр']
+        self.assertEqual([d['type'] for d in qa], ['e1/P2/qa'])
+        self.assertNotIn('e1/P2/qa', [a['type'] for a in server.state('coord')['agents']])
 
     def test_roles_carry_their_job_state(self):
         agents = {a['id']: a for a in server.state('coord')['agents']}

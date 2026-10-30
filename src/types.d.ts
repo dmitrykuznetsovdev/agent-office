@@ -34,8 +34,9 @@ export type OfficeDesk = { type: string; name: string; short?: string; prop: str
 export type Office = {
   folder: string
   title: string
-  // note: the plaque's second line instead of the head count; strip: a floor folded to a band, nobody at work there
-  zones: Array<{ id?: string; name: string; desks: OfficeDesk[]; note?: string; strip?: boolean }>
+  // note: the plaque's second line instead of the head count; strip: a floor folded to a band, nobody at work there;
+  // track: an epic floor's stages left to right, each [label, passed | next | rejected | ahead]
+  zones: Array<{ id?: string; name: string; desks: OfficeDesk[]; note?: string; strip?: boolean; track?: Array<[string, string]> | null }>
   guests: Record<string, { name: string; prop: string }>
   saved?: boolean
   lang?: string

@@ -1843,7 +1843,8 @@ def find_tail(sid):
 # ── Эпики orchestrating-epics: мод координатора пишет <эпик>/view.json, офис рисует его и ledger не разбирает ──
 VIEW_STALE_S = 3 * 60  # мод переписывает view.json раз в минуту; тишина дольше — процесс координатора не обновляет
 VIEW_CACHE = {}  # view.json → (mtime, разобранный вид или None)
-GATES = {'passed': '●', 'next': '◉', 'rejected': '✖', 'ahead': '○'}  # стадии PATCH_READY → REVIEWED → INTEGRATED → DEPLOYED
+STAGES = ('патч', 'QA', 'влит', 'выкачен')  # PATCH_READY → REVIEWED → INTEGRATED → DEPLOYED: дорожка этажа пакета
+VERDICTS = {'ACCEPT': 'passed', 'REJECT': 'rejected'}  # раунд критики: нет вердикта — идёт
 ROLE_NAMES = {'writer': 'Писатель', 'qa': 'Контролёр', 'critic': 'Критик', 'researcher': 'Исследователь'}
 ROLE_PROPS = {'writer': 'tablet', 'qa': 'magnifier', 'critic': 'clipboard', 'researcher': 'books'}
 AT_WORK = ('working', 'idle')  # job-файл роли: работает или ждёт; done и stopped — ушла
@@ -1873,23 +1874,28 @@ def journal_of(session, files):
 
 
 def epic_floors(view):
-    """Этажи эпика сверху вниз: спека, исследования, пакет за пакетом. Этаж — (имя, примечание, [(тип стола, должность, кто, роль)])."""
+    """Этажи эпика сверху вниз: спека, исследования, пакет за пакетом.
+    Этаж — (имя, примечание, [(тип стола, должность, кто, роль или None — пустой стол)], дорожка [[подпись, passed|next|rejected|ahead]] или None)."""
     epic, floors = str(view.get('epic', '?')), []
     items = lambda key: [x for x in view.get(key) or [] if isinstance(x, dict)]
     roles = lambda x: [r for r in x.get('roles') or [] if isinstance(r, dict) and isinstance(r.get('session'), str) and r.get('role') in ROLE_NAMES]
     crit = items('critiques')
     if crit:
         floors.append(('СПЕКА', ' · '.join('r%s %s' % (c.get('round'), c.get('verdict') or '…') for c in crit),
-                       [('%s/spec/r%s' % (epic, c.get('round')), 'Критик r%s' % c.get('round'), 'Критик r%s' % c.get('round'), r) for c in crit for r in roles(c)]))
+                       [('%s/spec/r%s' % (epic, c.get('round')), 'Критик r%s' % c.get('round'), 'Критик r%s' % c.get('round'), r) for c in crit for r in roles(c)],
+                       [['r%s' % c.get('round'), VERDICTS.get(c.get('verdict'), 'next')] for c in crit]))
     res = items('researchers')
     if res:
         floors.append(('ИССЛЕДОВАНИЯ', ' · '.join(str(r.get('question')) for r in res if not r.get('answered')),
                        [('%s/research/%s' % (epic, q.get('question')), 'Исследователь %s' % q.get('question'), 'Исследователь %s' % q.get('question'), r)
-                        for q in res for r in roles(q)]))
+                        for q in res for r in roles(q)], None))
     for p in items('packages'):
-        gates = ''.join(GATES.get(g, '?') for g in p.get('gates') or [])
-        floors.append(('%s %s' % (p.get('id'), gates), str(p.get('text') or ''),
-                       [('%s/%s/%s' % (epic, p.get('id'), r['role']), ROLE_NAMES[r['role']], '%s %s' % (ROLE_NAMES[r['role']], p.get('id')), r) for r in roles(p)]))
+        pid, seats = p.get('id'), [('%s/%s/%s' % (epic, p.get('id'), r['role']), ROLE_NAMES[r['role']], '%s %s' % (ROLE_NAMES[r['role']], p.get('id')), r) for r in roles(p)]
+        # an open package keeps a desk for its QA, empty until the review starts: the floor shows who comes next
+        if p.get('is_open') and not any(r['role'] == 'qa' for *_, r in seats):
+            seats.append(('%s/%s/qa' % (epic, pid), ROLE_NAMES['qa'], '%s %s' % (ROLE_NAMES['qa'], pid), None))
+        gates = [g if g in ('passed', 'next', 'rejected') else 'ahead' for g in p.get('gates') or []]
+        floors.append((str(pid), str(p.get('text') or ''), seats, [list(x) for x in zip(STAGES, gates)]))
     return floors
 
 
@@ -1910,14 +1916,17 @@ def role_agent(kind, name, role, f):
 def epic_room(t, agents, busy, view, files):
     """Офис эпика: наверху оркестратор, ниже этажи из view.json. Этаж, где никто не работает, свёрнут в полоску."""
     zones, seated = [], []
-    for i, (name, note, seats) in enumerate(epic_floors(view)):
+    for i, (name, note, seats, track) in enumerate(epic_floors(view)):
         desks, here = [], []
         for kind, desk, who, role in seats:
+            if role is None:
+                desks.append(dress({'type': kind, 'name': desk, 'prop': ROLE_PROPS['qa']}))
+                continue
             f = journal_of(role['session'], files)
             if f:
                 desks.append(dress({'type': kind, 'name': desk, 'prop': ROLE_PROPS[role['role']]}))
                 here.append((role_agent(kind, desk, role, f), who))
-        zones.append({'id': 'epic-%d' % i, 'name': name, 'note': note, 'strip': not any(a['isWorking'] for a, _ in here), 'desks': desks})
+        zones.append({'id': 'epic-%d' % i, 'name': name, 'note': note, 'strip': not any(a['isWorking'] for a, _ in here), 'desks': desks, 'track': track})
         seated += here
     if zones:
         zones[0]['desks'].insert(0, dress({'type': 'main', 'name': 'Оркестратор', 'prop': 'crown', 'shirt': '#3b3f8f'}))
