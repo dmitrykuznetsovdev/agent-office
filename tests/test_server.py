@@ -539,6 +539,20 @@ class CodexSessionsTest(unittest.TestCase):
         server.CODEX_SESSIONS = os.path.join(self.dir.name, 'нет')
         self.assertEqual(server.sessions(), [])
 
+    def test_no_claude_folder_still_shows_codex(self):
+        server.PROJECTS = os.path.join(self.dir.name, 'нет')
+        self.write(THREAD, meta() + context(ts=self.now()))
+        self.assertEqual([s['provider'] for s in server.sessions()], ['codex'])
+        self.assertIsNotNone(server.state(THREAD))
+        self.assertIsNone(server.find_tail('нет-такой'))
+
+    def test_no_claude_folder_still_gives_stats(self):
+        server.PROJECTS = os.path.join(self.dir.name, 'нет')
+        self.write(THREAD, meta() + context(ts=self.now()) + usage_record(ts=self.now()))
+        with mock.patch.object(server, 'LEDGER', None):
+            report = server.stats()
+        self.assertEqual(list(report['days'][-1]['models']), ['gpt-5.6-sol'])
+
 
 class LedgerCodexTest(unittest.TestCase):
     usd = server.message_cost('gpt-5.6-sol', USAGE)
@@ -575,6 +589,11 @@ class LedgerCodexTest(unittest.TestCase):
 
     def session(self):
         return meta() + context(ts=self.at) + usage_record(ts=self.at)
+
+    def test_no_claude_folder_still_counts_codex(self):
+        self.write(self.session())
+        self.claude = os.path.join(self.dir.name, 'нет')
+        self.assertEqual(list(self.scan().report()['days'][-1]['models']), ['gpt-5.6-sol'])
 
     def test_codex_spending_lands_in_the_same_report(self):
         self.write(self.session())

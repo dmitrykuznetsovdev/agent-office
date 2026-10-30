@@ -697,6 +697,15 @@ def agent_files(folder):
     return found
 
 
+def project_dirs(root):
+    """Папки проектов Claude Code. Папки журналов может не быть: у кого есть только Codex."""
+    try:
+        paths = [os.path.join(root, proj) for proj in os.listdir(root)]
+    except OSError:
+        return []
+    return [p for p in paths if os.path.isdir(p)]
+
+
 def journal_dirs(folder):
     """Папки журналов проекта и его рабочих копий."""
     code = re.sub(r'[^A-Za-z0-9]', '-', folder)
@@ -1394,10 +1403,7 @@ class Ledger:
             root, codex = PROJECTS, CODEX_SESSIONS
         if codex:
             self.scan_codex(codex)
-        for proj in os.listdir(root):
-            pdir = os.path.join(root, proj)
-            if not os.path.isdir(pdir):
-                continue
+        for pdir in project_dirs(root):
             for name in os.listdir(pdir):
                 if name.endswith('.jsonl'):
                     self.feed(os.path.join(pdir, name), True)
@@ -1608,10 +1614,7 @@ def tail(path, kind=Tail):
 def session_files():
     now = time.time()
     out = []
-    for proj in os.listdir(PROJECTS):
-        pdir = os.path.join(PROJECTS, proj)
-        if not os.path.isdir(pdir):
-            continue
+    for pdir in project_dirs(PROJECTS):
         for name in os.listdir(pdir):
             if not name.endswith('.jsonl'):
                 continue
