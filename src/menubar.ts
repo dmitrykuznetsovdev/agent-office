@@ -245,6 +245,22 @@ function weeks(days: Day[]): Day[] {
   return out
 }
 
+// this week vs the same weekdays of the last one: on Wednesday, Mon–Wed against Mon–Wed
+function weekOverWeek(all: Day[]): string {
+  const thisWeek = weeks(all).at(-1)
+  if (!thisWeek) return ''
+  const n = weekday(all[all.length - 1]!.day) + 1
+  const prev = all.filter(d => d.day < thisWeek.day).slice(-7).filter(d => weekday(d.day) < n).reduce((a, d) => a + d.usd, 0)
+  if (!prev) return ''
+  const delta = Math.round(((thisWeek.usd - prev) / prev) * 100)
+  return `${delta > 0 ? '+' : ''}${delta}% к тем же дням прошлой`
+}
+
+function vsPrev(ws: Day[], i: number): string {
+  const r = ws[i]!, before = ws[i - 1]
+  return before && before.usd ? `<br>к прошлой: ${r.usd >= before.usd ? '+' : ''}${Math.round(((r.usd - before.usd) / before.usd) * 100)}%` : ''
+}
+
 function niceMax(v: number): number {
   if (v <= 0) return 1
   const p = 10 ** Math.floor(Math.log10(v))
@@ -362,41 +378,33 @@ function renderStats(): string {
   const fams = byFamily(days)
   const byWeek = days.length > 45
   const rows = byWeek ? weeks(days) : days
-  html += `<section><h3>${byWeek ? 'ПО НЕДЕЛЯМ' : 'ПО ДНЯМ'} <span class="hint">наведите на столбик</span></h3><div class="chart pix">`
-  html += barChart(rows, r => short(r.day), r => tipOf(byWeek ? 'неделя с ' + short(r.day) : `${WEEKDAYS[weekday(r.day)]}, ${short(r.day)}`, r,
-    `<br>сессий: ${r.started}`))
+  // week over week only makes sense over the whole history, not inside a 7- or 30-day window
+  const wow = range === 'all' ? weekOverWeek(all) : ''
+  html += `<section><h3>${byWeek ? 'ПО НЕДЕЛЯМ' : 'ПО ДНЯМ'} <span class="hint">${byWeek && wow ? wow : 'наведите на столбик'}</span></h3><div class="chart pix">`
+  html += barChart(rows, r => short(r.day), (r, i) => tipOf(byWeek ? 'неделя с ' + short(r.day) : `${WEEKDAYS[weekday(r.day)]}, ${short(r.day)}`, r,
+    (byWeek ? vsPrev(rows, i) : '') + `<br>сессий: ${r.started}`))
   html += legend(fams) + '</div></section>'
 
-  // week over week, always the last 8 weeks; this week vs the same days of the last one
-  const ws = weeks(all).slice(-8)
-  const thisWeek = ws[ws.length - 1]
-  if (!byWeek && ws.length > 1 && thisWeek) {
-    const n = weekday(all[all.length - 1]!.day) + 1
-    const prevDays = all.filter(d => d.day < thisWeek.day).slice(-7).filter(d => weekday(d.day) < n)
-    const prev = prevDays.reduce((a, d) => a + d.usd, 0)
-    const delta = prev ? Math.round(((thisWeek.usd - prev) / prev) * 100) : 0
-    html += `<section><h3>НЕДЕЛЯ К НЕДЕЛЕ <span class="hint">${prev ? `${delta > 0 ? '+' : ''}${delta}% к тем же дням прошлой` : ''}</span></h3><div class="chart pix">`
-    html += barChart(ws, r => short(r.day), (r, i) => {
-      const before = ws[i - 1]
-      const change = before && before.usd ? `<br>к прошлой: ${r.usd >= before.usd ? '+' : ''}${Math.round(((r.usd - before.usd) / before.usd) * 100)}%` : ''
-      return tipOf('неделя с ' + short(r.day), r, change + `<br>сессий: ${r.started}`)
-    }, 84)
+  // the main chart is daily here, so the weeks get their own; by week it already shows them
+  const ws = weeks(all)
+  if (range === 'all' && !byWeek && ws.length > 1) {
+    html += `<section><h3>НЕДЕЛЯ К НЕДЕЛЕ <span class="hint">${wow}</span></h3><div class="chart pix">`
+    html += barChart(ws, r => short(r.day), (r, i) => tipOf('неделя с ' + short(r.day), r, vsPrev(ws, i) + `<br>сессий: ${r.started}`), 84)
     html += '</div></section>'
   }
 
-  html += '<section><h3>МОДЕЛИ</h3><div class="stack">' + MODELS.filter(f => fams.has(f))
-    .map(f => `<span style="flex:${fams.get(f)!.usd};background:${color(f)}"></span>`).join('') + '</div>'
+  html += '<section><h3>МОДЕЛИ</h3>'
   html += barList(MODELS.filter(f => fams.has(f)).map(f => ({ name: [...fams.get(f)!.names].join(', '), usd: fams.get(f)!.usd, fill: color(f) })), total)
   html += '</section>'
 
   const parts = [0, 1, 2, 3].map(i => days.reduce((a, d) => a + (d.parts[i] ?? 0), 0))
   const partNames = ['Вход', 'Ответы модели', 'Чтение кэша', 'Запись в кэш']
   const partTips = ['новый текст в контексте', 'то, что пишет модель', 'повторное чтение контекста — растёт с длиной сессии', 'кэширование контекста на 5 мин или час']
-  html += '<section><h3>ИЗ ЧЕГО СЧЁТ</h3>'
+  html += '<section><h3>ЗА ЧТО ПЛАТИМ <span class="hint">наведите на строку</span></h3>'
   html += barList(partNames.map((name, i) => ({ name, usd: parts[i] ?? 0, fill: '#7a80a8', tip: `<b>${name}</b><br>${partTips[i]}` })), total)
   html += '</section>'
 
-  html += `<section><h3>КОГДА ТРАТИМ <span class="hint">последние ${range === '7' ? 7 : 28} дн., по часам</span></h3><div class="chart pix">${heatmap(all)}</div></section>`
+  html += `<section><h3>ТРАТЫ ПО ЧАСАМ <span class="hint">дни недели × часы, за ${range === '7' ? 7 : 28} дн.</span></h3><div class="chart pix">${heatmap(all)}</div></section>`
 
   const projects = new Map<string, number>()
   for (const d of days) for (const [p, usd] of Object.entries(d.projects)) projects.set(p, (projects.get(p) ?? 0) + usd)
@@ -404,7 +412,7 @@ function renderStats(): string {
   const shown = top.slice(0, 6).map(([name, usd]) => ({ name, usd, fill: 'var(--gold)' }))
   const other = top.slice(6).reduce((a, [, usd]) => a + usd, 0)
   if (other > 0) shown.push({ name: `прочие (${top.length - 6})`, usd: other, fill: 'var(--muted)' })
-  html += '<section><h3>ПАПКИ</h3>' + barList(shown, total) + '</section>'
+  html += '<section><h3>ПРОЕКТЫ <span class="hint">по папке, где запущен Claude Code</span></h3>' + barList(shown, total) + '</section>'
   html += `<p class="note">История с ${short(stats.since)}. Сервер копит её в своей папке, поэтому она переживает чистку журналов Claude Code.</p>`
   return html
 }
@@ -442,18 +450,18 @@ function renderTokens(): string {
   const sum = (ds: Day[]) => ds.reduce((a, d) => a + d.tokens, 0)
   const total = sum(days)
   const active = days.filter(d => d.tokens > 0).length
-  const today = all[all.length - 1]!
+  const started = days.reduce((a, d) => a + d.started, 0)
   const out = days.reduce((a, d) => a + (d.tokParts[1] ?? 0), 0)
   let html = rangeBar(all, days)
   html += `<div class="tiles">
-    <div class="tile pix"><div class="k">Сегодня</div><div class="v">${big(today.tokens)}</div><div class="s">с 00:00</div></div>
+    <div class="tile pix"><div class="k">Всего</div><div class="v">${big(total)}</div><div class="s">за ${days.length} дн.</div></div>
     <div class="tile pix"><div class="k">В день</div><div class="v">${big(active ? total / active : 0)}</div><div class="s">${active} из ${days.length} дн.</div></div>
-    <div class="tile pix"><div class="k">Всё время</div><div class="v">${big(sum(all))}</div><div class="s">с ${short(stats.since)}</div></div>
+    <div class="tile pix"><div class="k">Сессия</div><div class="v">${big(started ? total / started : 0)}</div><div class="s">в среднем из ${started}</div></div>
   </div>`
 
   const byWeek = days.length > 45
   const rows = byWeek ? weeks(days) : days
-  html += `<section><h3>${byWeek ? 'ПО НЕДЕЛЯМ' : 'ПО ДНЯМ'} <span class="hint">${tokens(total)} за период</span></h3><div class="chart pix">`
+  html += `<section><h3>${byWeek ? 'ПО НЕДЕЛЯМ' : 'ПО ДНЯМ'} <span class="hint">наведите на столбик</span></h3><div class="chart pix">`
   html += barChart(rows, r => short(r.day), r => tokenTip(byWeek ? 'неделя с ' + short(r.day) : `${WEEKDAYS[weekday(r.day)]}, ${short(r.day)}`, r),
     104, tokByKind, tokens)
   html += '<div class="legend">' + KINDS.map(k => `<span><i style="background:${k.fill}"></i>${k.name}</span>`).join('') + '</div></div></section>'
@@ -461,8 +469,7 @@ function renderTokens(): string {
   const parts = KINDS.map((k, i) => ({ name: k.name, usd: days.reduce((a, d) => a + (d.tokParts[i] ?? 0), 0), fill: k.fill, tip: `<b>${k.name}</b><br>${k.tip}` }))
   const rest = days.reduce((a, d) => a + unsplit(d), 0)
   if (rest > 0) parts.push({ name: 'Без разбивки', usd: rest, fill: 'var(--muted)', tip: '<b>Без разбивки</b><br>история, журналы которой Claude Code уже удалил: известно только общее число' })
-  html += '<section><h3>ИЗ ЧЕГО <span class="hint">наведите на строку</span></h3><div class="stack">'
-    + parts.filter(p => p.usd > 0).map(p => `<span style="flex:${p.usd};background:${p.fill}"></span>`).join('') + '</div>'
+  html += '<section><h3>ТИПЫ ТОКЕНОВ <span class="hint">наведите на строку</span></h3>'
   html += barList(parts, total, tokens) + '</section>'
   html += `<p class="note">Модель написала <b>${tokens(out)}</b> — ${pct(out, total)} от всех токенов периода. Остальное — контекст, который она читает на каждом шаге.</p>`
 
@@ -477,7 +484,7 @@ function renderTokens(): string {
   const shown = top.slice(0, 6).map(([name, n]) => ({ name, usd: n, fill: 'var(--gold)' }))
   const other = top.slice(6).reduce((a, [, n]) => a + n, 0)
   if (other > 0) shown.push({ name: `прочие (${top.length - 6})`, usd: other, fill: 'var(--muted)' })
-  html += '<section><h3>ПАПКИ</h3>' + barList(shown, total, tokens) + '</section>'
+  html += '<section><h3>ПРОЕКТЫ <span class="hint">по папке, где запущен Claude Code</span></h3>' + barList(shown, total, tokens) + '</section>'
   return html
 }
 
@@ -538,7 +545,6 @@ document.addEventListener('mousemove', e => {
 document.addEventListener('mouseleave', () => { tip.style.display = 'none' })
 
 $('office').onclick = () => openPath('/')
-$('restart').onclick = () => send('restart')
 $('log').onclick = () => send('log')
 $('quit').onclick = () => send('quit')
 $('autostart').onclick = () => send('autostart')
