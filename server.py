@@ -4,10 +4,11 @@
 Читает журналы всех сессий (~/.claude/projects) и отдаёт состояние офиса
 выбранной сессии. В журналы ничего не пишет, хуки не нужны.
 
-  python3 server.py [--port 8767] [--data ~/.claude/agent-office]
+  python3 server.py [--port 8767] [--data ~/.claude/agent-office] [--watch-parent]
 
   /                         страница офиса
-  /api/sessions             сессии за последние сутки
+  /api/sessions             сессии за последние сутки; today — потрачено сегодня
+  /api/stats                траты по дням, моделям и папкам за всё время, почасово — за 5 недель
   /api/state?s=<id>         офис одной сессии (руководитель, агенты, журнал)
   POST /api/office?s=<id>   сгенерировать офис для папки сессии
 """
@@ -124,17 +125,51 @@ def describe(tool, inp):
     return tool
 
 
+def cache_writes(usage):
+    """Записи в кэш: (на 5 минут, на час)."""
+    cc = usage.get('cache_creation') or {}
+    if not cc:
+        return usage.get('cache_creation_input_tokens', 0), 0
+    return cc.get('ephemeral_5m_input_tokens', 0), cc.get('ephemeral_1h_input_tokens', 0)
+
+
+def cost_parts(model, usage):
+    """Стоимость ответа по статьям: вход, выход, чтение кэша, запись в кэш."""
+    if model not in PRICES:
+        return [0.0, 0.0, 0.0, 0.0]
+    p_in, p_out, p_read = PRICES[model]
+    w5m, w1h = cache_writes(usage)
+    k = (2 if usage.get('speed') == 'fast' else 1) / 1e6
+    return [usage.get('input_tokens', 0) * p_in * k, usage.get('output_tokens', 0) * p_out * k,
+            usage.get('cache_read_input_tokens', 0) * p_read * k, (w5m * 1.25 + w1h * 2) * p_in * k]
+
+
 def message_cost(model, usage):
     """Стоимость одного ответа модели, формула reel.py cost."""
-    if model not in PRICES:
-        return 0.0
-    p_in, p_out, p_read = PRICES[model]
-    cc = usage.get('cache_creation') or {}
-    w1h = cc.get('ephemeral_1h_input_tokens', 0)
-    w5m = cc.get('ephemeral_5m_input_tokens', 0) if cc else usage.get('cache_creation_input_tokens', 0)
-    usd = (usage.get('input_tokens', 0) * p_in + usage.get('output_tokens', 0) * p_out
-           + usage.get('cache_read_input_tokens', 0) * p_read + w5m * p_in * 1.25 + w1h * p_in * 2) / 1e6
-    return usd * (2 if usage.get('speed') == 'fast' else 1)
+    return sum(cost_parts(model, usage))
+
+
+def token_parts(usage):
+    """Токены ответа по статьям, в том же порядке, что cost_parts."""
+    return [usage.get('input_tokens', 0), usage.get('output_tokens', 0),
+            usage.get('cache_read_input_tokens', 0), sum(cache_writes(usage))]
+
+
+def tokens_of(usage):
+    return sum(token_parts(usage))
+
+
+def day_of(at_ms):
+    """Локальная календарная дата записи журнала."""
+    return time.strftime('%Y-%m-%d', time.localtime(at_ms / 1000))
+
+
+def today_cost(t):
+    return t.daily.get(day_of(time.time() * 1000), 0.0)
+
+
+def parent_alive(ppid):
+    return os.getppid() == ppid
 
 
 def clip(text, n=60):
@@ -171,6 +206,7 @@ class Tail:
         self.roster = {}       # агенты, доступные сессии: тип → описание
         self.events = []       # [(at, text)]
         self.cost = 0.0
+        self.daily = {}        # локальная дата → $, последние два дня
         self.paid = set()      # ответ модели пишется в журнал кусками — платим за id один раз
 
     def feed(self):
@@ -240,7 +276,12 @@ class Tail:
         self.model = msg.get('model') or self.model
         if msg.get('usage') and mid not in self.paid:
             self.paid.add(mid)
-            self.cost += message_cost(msg.get('model'), msg['usage'])
+            usd = message_cost(msg.get('model'), msg['usage'])
+            self.cost += usd
+            day = day_of(at)
+            self.daily[day] = self.daily.get(day, 0.0) + usd
+            for old in sorted(self.daily)[:-2]:
+                del self.daily[old]
         uses = [b for b in content or [] if isinstance(b, dict) and b.get('type') == 'tool_use']
         for b in uses:
             self.calls += 1
@@ -261,7 +302,8 @@ PROPS = ['crown', 'headphones', 'camera', 'scissors', 'beret', 'beretRed', 'book
 SHIRTS = ['#2f4f8f', '#c0583a', '#5a7a2e', '#8f2f3a', '#4b5a8a', '#3a7a4a', '#7a3fb0', '#1f6f8f',
           '#b08a2e', '#2f7a5a', '#c04a6a', '#8a6a3a', '#a0602a', '#2f6f6a', '#6b2d5c', '#5a5f6a']
 HAIRS = ['#2b1d14', '#1a1a1a', '#6b4a2b', '#c9a227', '#9a9a9a', '#3a2416', '#8a5a2b', '#e05a8a']
-GENERATING = {}  # папка → время старта генерации
+GEN_TIMEOUT = 120  # с: большой офис собирается за 15–30 с; дольше — claude чего-то ждёт
+JOBS = {}  # папка → последняя генерация: status running|done|failed|cancelled, started, ended, error, proc
 
 
 def hash_of(text):
@@ -291,18 +333,65 @@ def humanize(t):
     return clip(key[:1].upper() + key[1:], 13)
 
 
+# Должности по-русски без модели: сначала словосочетание целиком, потом главное слово (последнее).
+PHRASES = {
+    'art-director': 'Арт-директор', 'motion-designer': 'Аниматор', 'sound-designer': 'Звукорежиссёр',
+    'cover-maker': 'Обложечник', 'subs-editor': 'Субтитровщик', 'qa-inspector': 'Контролёр', 'qa': 'Контролёр',
+    'style-critic': 'Стилист', 'selection-critic': 'Отборщик', 'code-reviewer': 'Ревьюер', 'statusline-setup': 'Наладчик',
+}
+WORDS = {
+    'reviewer': 'Ревьюер', 'review': 'Ревьюер', 'builder': 'Сборщик', 'investigator': 'Сыщик', 'rescue': 'Спасатель',
+    'analyst': 'Аналитик', 'director': 'Директор', 'camera': 'Оператор', 'copywriter': 'Копирайтер', 'maker': 'Мастер',
+    'editor': 'Редактор', 'interviewer': 'Интервьюер', 'inspector': 'Инспектор', 'librarian': 'Библиотекарь',
+    'loader': 'Загрузчик', 'designer': 'Дизайнер', 'packager': 'Упаковщик', 'scout': 'Скаут', 'scriptwriter': 'Сценарист',
+    'critic': 'Критик', 'writer': 'Автор', 'planner': 'Планировщик', 'plan': 'Архитектор', 'architect': 'Архитектор',
+    'tester': 'Тестировщик', 'researcher': 'Исследователь', 'explorer': 'Разведчик', 'explore': 'Разведчик',
+    'coder': 'Программист', 'developer': 'Разработчик', 'auditor': 'Аудитор', 'fixer': 'Наладчик', 'helper': 'Помощник',
+    'assistant': 'Помощник', 'manager': 'Менеджер', 'translator': 'Переводчик', 'summarizer': 'Конспектор',
+    'debugger': 'Отладчик', 'documenter': 'Документатор', 'guide': 'Гид', 'deployer': 'Выкладчик', 'optimizer': 'Оптимизатор',
+    'refactorer': 'Рефакторщик', 'migrator': 'Мигратор', 'monitor': 'Наблюдатель', 'operator': 'Оператор',
+}
+# Отделы по ходу работы: найти → придумать → сделать → проверить → выручить
+KINDS = [
+    ('РАЗВЕДКА', ['investigat', 'scout', 'explor', 'research', 'search', 'analyst', 'librarian', 'finder', 'locator', 'monitor']),
+    ('ПЛАН', ['plan', 'architect', 'script', 'copywrit', 'writer', 'interview', 'strateg', 'product']),
+    ('ПРОИЗВОДСТВО', ['build', 'editor', 'maker', 'design', 'director', 'camera', 'motion', 'sound', 'loader', 'packag',
+                      'render', 'cover', 'subs', 'coder', 'develop', 'refactor', 'migrat', 'translat', 'document', 'operator']),
+    ('КАЧЕСТВО', ['review', 'critic', 'inspector', 'qa', 'test', 'audit', 'verif', 'lint', 'check']),
+    ('ПОДДЕРЖКА', ['rescue', 'debug', 'fix', 'deploy', 'setup', 'support', 'ops', 'help', 'guide']),
+]
+LATIN = re.compile('[A-Za-z]')
+
+
+def ru_name(t):
+    key = t.split(':')[-1].lower()
+    if key in PHRASES:
+        return PHRASES[key]
+    head = re.split(r'[-_ ]+', key)[-1]
+    return WORDS.get(head) or humanize(t)
+
+
+def kind_of(t, desc=''):
+    key = t.split(':')[-1].lower()
+    for text in (key, desc.lower()):
+        for zone, words in KINDS:
+            if any(w in text for w in words):
+                return zone
+    return 'ПРОЧИЕ'
+
+
 def auto_office(folder, roster):
-    """Офис без сохранённой раскладки: отделы по плагинам, имена из названий."""
+    """Офис без модели: отделы по ходу работы, должности по-русски из названий агентов."""
+    order = [k for k, _ in KINDS] + ['ПРОЧИЕ']
     zones = {}
-    for t in roster:
+    for t, desc in roster.items():
         if t in BUILTIN:
             continue
-        ns = t.split(':')[0].upper() if ':' in t else 'СВОИ АГЕНТЫ'
-        zones.setdefault(ns, []).append(dress({'type': t, 'name': humanize(t)}))
+        zones.setdefault(kind_of(t, desc or ''), []).append(dress({'type': t, 'name': ru_name(t)}))
     boss = dress({'type': 'main', 'name': 'Главный', 'prop': 'crown', 'shirt': '#3b3f8f'})
     rows = [{'name': 'ГЛАВНЫЙ', 'desks': [boss]}] if not zones else []
-    for i, (name, desks) in enumerate(sorted(zones.items())):
-        rows.append({'name': name, 'desks': ([boss] if i == 0 else []) + desks})
+    for i, name in enumerate(n for n in order if n in zones):
+        rows.append({'name': name, 'desks': ([boss] if i == 0 else []) + zones[name]})
     return {'folder': folder, 'title': 'ОФИС · ' + os.path.basename(folder).upper(), 'zones': rows, 'guests': {}}
 
 
@@ -334,18 +423,20 @@ SCHEMA = {
 }
 
 PROMPT = """Сделай пиксельный офис для команды ИИ-агентов проекта «{name}» ({folder}).
-У главной сессии (руководителя) свой стол, остальные агенты — сотрудники.
+У главной сессии (руководителя) свой кабинет, остальные агенты — сотрудники по этажам-отделам.
 
 Агенты (тип — описание):
 {agents}
 
 Правила:
+- Всё по-русски, без латиницы: вывеска, отделы, должности (вместо QA — «Контролёр»).
 - title: вывеска офиса заглавными, 1–3 слова, по сути проекта.
-- boss: должность руководителя по-русски (например «Продюсер», «Тимлид»), предмет из списка.
-- zones: 1–4 отдела по смыслу работы, у каждого короткое название заглавными; в отделе до 5 столов, лучше 3–5.
-- Каждый агент, кроме универсальных ({builtin}), — ровно за одним столом; тип копируй дословно.
-- Универсальные агенты — в guests.
-- name: должность по-русски, до 12 знаков, не имя человека («Ревьюер», «Сыщик», «Монтажёр»).
+- boss: должность руководителя («Продюсер», «Тимлид», «Главред»), предмет из списка.
+- zones: 2–5 отделов по ходу работы — от поиска и подготовки к производству, проверке и выпуску; порядок отделов — этот же.
+  Название отдела — одно-два слова заглавными («РАЗВЕДКА», «МОНТАЖ», «КАЧЕСТВО»). В отделе 1–8 столов; не дроби отделы ради числа.
+- Каждый агент, кроме универсальных ({builtin}), — ровно за одним столом в zones; тип копируй дословно. В guests их не клади.
+- guests — только универсальные агенты из списка выше, если они есть.
+- name: должность по-русски, до 13 знаков, понятная без описания («Монтажёр», «Сценарист», «Ревьюер», «Сыщик»), не имя человека.
 - prop: предмет на столе, подходящий к работе, из списка в схеме."""
 
 
@@ -358,37 +449,128 @@ def find_claude():
     return None
 
 
-def generate_office(folder, roster):
-    """Раскладка по смыслу — одним вызовом claude -p; не вышло — автораскладка."""
-    office = None
+class GenError(Exception):
+    pass
+
+
+def ask_claude(folder, roster, job):
+    """Раскладка по смыслу — одним вызовом claude -p. Процесс лежит в job: его можно убить."""
     exe = find_claude()
+    if not exe:
+        raise GenError('не нашёл claude: нужен установленный Claude Code')
     agents = '\n'.join('- %s — %s' % (t, clip(d, 220)) for t, d in sorted(roster.items()))
     prompt = PROMPT.format(name=os.path.basename(folder), folder=folder, agents=agents or '(только универсальные)',
                            builtin=', '.join(sorted(BUILTIN)))
-    if exe:
-        try:
-            out = subprocess.run(
-                [exe, '-p', '--model', 'sonnet', '--tools', '', '--no-session-persistence', '--setting-sources', '',
-                 '--output-format', 'json', '--json-schema', json.dumps(SCHEMA),
-                 '--system-prompt', 'Ты раскладываешь агентов по пиксельному офису. Отвечай только JSON по схеме.'],
-                input=prompt, capture_output=True, text=True, timeout=180, cwd=DATA if os.path.isdir(DATA) else HERE,
-                env=dict(os.environ, PATH=os.path.dirname(exe) + ':' + os.environ.get('PATH', '/usr/bin:/bin')))
-            office = json.loads(out.stdout).get('structured_output')
-        except (subprocess.SubprocessError, ValueError, OSError) as e:
-            sys.stderr.write('генерация офиса: %s\n' % e)
+    try:
+        proc = subprocess.Popen(
+            [exe, '-p', '--model', 'sonnet', '--tools', '', '--no-session-persistence', '--setting-sources', '',
+             '--output-format', 'json', '--json-schema', json.dumps(SCHEMA),
+             '--system-prompt', 'Ты раскладываешь агентов по пиксельному офису. Отвечай только JSON по схеме.'],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            cwd=DATA if os.path.isdir(DATA) else HERE,
+            env=dict(os.environ, PATH=os.path.dirname(exe) + ':' + os.environ.get('PATH', '/usr/bin:/bin')))
+    except OSError as e:
+        raise GenError('claude не запустился: %s' % e)
+    job['proc'] = proc
+    try:
+        out, err = proc.communicate(prompt, timeout=GEN_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        raise GenError('claude не ответил за %d с. Обычно он ждёт входа: запустите claude в терминале и войдите '
+                       '(/login), а если macOS спросит доступ к связке ключей — разрешите' % GEN_TIMEOUT)
+    if job.get('cancel'):
+        return None
+    try:
+        answer = json.loads(out)
+    except ValueError:
+        raise GenError('claude ответил не JSON: %s' % clip(err or out or 'пусто', 160))
+    if answer.get('is_error'):
+        raise GenError('claude: %s' % clip(answer.get('result') or 'ошибка без описания', 160))
+    office = answer.get('structured_output')
     if not office or not office.get('zones'):
-        result = auto_office(folder, roster)
-        result['generated'] = 'auto'
-    else:
-        result = tidy(folder, roster, office)
-    os.makedirs(os.path.dirname(office_path(folder)), exist_ok=True)
-    with open(office_path(folder), 'w') as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-    return result
+        raise GenError('claude вернул офис без отделов')
+    return office
+
+
+def backup_path(folder):
+    return office_path(folder)[:-5] + '.prev.json'
+
+
+def run_office(folder, roster, job):
+    """Фоновая генерация: при успехе прежний офис уходит в .prev.json, при неудаче остаётся как был."""
+    try:
+        office = ask_claude(folder, roster, job)
+        if office is not None:
+            result = tidy(folder, roster, office)
+            path = office_path(folder)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            if os.path.exists(path):
+                os.replace(path, backup_path(folder))
+            with open(path, 'w') as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+        job['status'] = 'cancelled' if job.get('cancel') else 'done'
+    except GenError as e:
+        job['status'], job['error'] = 'failed', str(e)
+    except Exception as e:  # генерация в потоке: ошибка не должна оставить «running» навсегда
+        job['status'], job['error'] = 'failed', 'сбой: %s' % e
+    finally:
+        sys.stderr.write('генерация офиса %s: %s %s\n' % (folder, job['status'], job.get('error', '')))
+        job['ended'] = time.time()
+
+
+def start_office(folder, roster):
+    """Запустить генерацию; None — уже идёт."""
+    job = JOBS.get(folder)
+    if job and job['status'] == 'running':
+        return None
+    job = JOBS[folder] = {'status': 'running', 'started': time.time(), 'ended': 0, 'error': ''}
+    threading.Thread(target=run_office, args=(folder, roster, job), daemon=True).start()
+    return job
+
+
+def cancel_office(folder):
+    job = JOBS.get(folder)
+    if not job or job['status'] != 'running':
+        return False
+    job['cancel'] = True
+    proc = job.get('proc')
+    if proc and proc.poll() is None:
+        proc.kill()
+    return True
+
+
+def undo_office(folder):
+    """Вернуть офис, который был до последней генерации."""
+    prev = backup_path(folder)
+    if not os.path.exists(prev):
+        return False
+    os.replace(prev, office_path(folder))
+    job = JOBS.get(folder)
+    if job and job['status'] == 'done':
+        job['status'] = 'undone'
+    return True
+
+
+def job_view(folder):
+    job = JOBS.get(folder) or {}
+    return {'status': job.get('status', ''), 'started': int(job.get('started', 0) * 1000),
+            'ended': int(job.get('ended', 0) * 1000), 'error': job.get('error', ''),
+            'canUndo': os.path.exists(backup_path(folder)), 'timeout': GEN_TIMEOUT}
 
 
 def tidy(folder, roster, raw):
-    """Ответ модели — в файл офиса: чужие типы выкинуть, забытых посадить, руководителя — первым."""
+    """Ответ модели — в файл офиса: чужие типы выкинуть, забытых посадить, руководителя — первым.
+    Должности и отделы — только по-русски: латиницу заменяем словарём."""
+    def russian(name):
+        name = ' '.join(str(name or '').split())
+        return name if name and not LATIN.search(name) else ''
+
+    # русское имя, которое модель дала агенту, где бы его ни посадила
+    given = {}
+    for d in [d for z in raw['zones'] for d in z.get('desks') or []] + list(raw.get('guests') or []):
+        given.setdefault(d.get('type'), russian(d.get('name')))
+    title = lambda t: clip(given.get(t) or ru_name(t), 13)
     seen, zones = set(), []
     for z in raw['zones']:
         desks = []
@@ -396,24 +578,201 @@ def tidy(folder, roster, raw):
             t = d.get('type')
             if t in roster and t not in BUILTIN and t not in seen:
                 seen.add(t)
-                desks.append(dress({'type': t, 'name': clip(d.get('name') or humanize(t), 13), 'prop': d.get('prop')}))
+                desks.append(dress({'type': t, 'name': title(t), 'prop': d.get('prop')}))
         if desks:
-            zones.append({'name': clip(z.get('name') or 'ОТДЕЛ', 24).upper(), 'desks': desks})
-    rest = [dress({'type': t, 'name': humanize(t)}) for t in roster if t not in BUILTIN and t not in seen]
+            kinds = [kind_of(d['type'], roster.get(d['type']) or '') for d in desks]
+            name = russian(z.get('name')) or max(set(kinds), key=kinds.count)
+            zones.append({'name': clip(name, 24).upper(), 'desks': desks})
+    rest = [dress({'type': t, 'name': title(t)}) for t in roster if t not in BUILTIN and t not in seen]
     if rest:
         zones.append({'name': 'ПРОЧИЕ', 'desks': rest})
-    boss = dress({'type': 'main', 'name': clip(raw['boss'].get('name') or 'Главный', 13), 'prop': raw['boss'].get('prop'),
+    boss = dress({'type': 'main', 'name': clip(russian(raw['boss'].get('name')) or 'Главный', 13), 'prop': raw['boss'].get('prop'),
                   'shirt': '#3b3f8f'})
     if not zones:
         zones = [{'name': 'ГЛАВНЫЙ', 'desks': []}]
     first = zones[0]['desks']
     # руководитель — в середине полного ряда, иначе первым
     first.insert(2 if len(first) == 4 else 0, boss)
-    guests = {g['type']: {'name': clip(g.get('name') or humanize(g['type']), 13), 'prop': g.get('prop') if g.get('prop') in PROPS else 'cap'}
-              for g in raw.get('guests') or [] if g.get('type') in roster}
-    return {'folder': folder, 'title': clip(raw.get('title') or os.path.basename(folder), 28).upper(),
+    guests = {g['type']: {'name': title(g['type']), 'prop': g.get('prop') if g.get('prop') in PROPS else 'cap'}
+              for g in raw.get('guests') or [] if g.get('type') in roster and g.get('type') in BUILTIN}
+    return {'folder': folder, 'title': clip(russian(raw.get('title')) or os.path.basename(folder), 28).upper(),
             'zones': zones, 'guests': guests, 'generated': 'claude'}
 
+
+# ── Статистика: траты по часам из всех журналов ─────────────────────────────
+HEAT_DAYS = 35  # сколько дней отдавать почасово, для карты «когда тратим»
+
+
+def blank_day(day):
+    return {'day': day, 'usd': 0.0, 'models': {}, 'projects': {}, 'parts': [0.0, 0.0, 0.0, 0.0], 'tokens': 0,
+            'tokParts': [0, 0, 0, 0], 'tokModels': {}, 'tokProjects': {}, 'sessions': 0, 'started': 0}
+
+
+class Ledger:
+    """Сводка трат по часам, моделям и папкам. Лежит на диске: Claude Code
+    чистит журналы через месяц, а история трат остаётся."""
+    IDS = 64  # ответ модели пишется кусками подряд — помним последние id файла
+    VERSION = 2  # 2: токены по статьям в ячейке
+
+    def __init__(self, path):
+        self.path = path
+        self.files = {}  # журнал → {offset, ids, days, main}
+        # 'ГГГГ-ММ-ДДTЧЧ' → {папка: {модель: [$ вход, выход, чтение кэша, запись в кэш, токены, те же статьи в токенах]}}
+        self.hours = {}
+        self.dirty = False
+        self.saved_at = 0
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            files, hours = data['files'], data['hours']
+        except (OSError, ValueError, KeyError, TypeError):
+            return
+        # старая сводка без токенов по статьям: пока журналы на месте, читаем их заново,
+        # иначе оставляем как есть — у той истории будет только общее число токенов
+        if data.get('v') != self.VERSION and all(os.path.exists(f) for f in files):
+            self.dirty = True
+            return
+        for projects in hours.values():
+            for models in projects.values():
+                for cell in models.values():
+                    cell.extend([0] * (9 - len(cell)))
+        self.files, self.hours = files, hours
+
+    def scan(self, root=None):
+        root = root or PROJECTS
+        for proj in os.listdir(root):
+            pdir = os.path.join(root, proj)
+            if not os.path.isdir(pdir):
+                continue
+            for name in os.listdir(pdir):
+                if name.endswith('.jsonl'):
+                    self.feed(os.path.join(pdir, name), True)
+                    continue
+                sub = os.path.join(pdir, name, 'subagents')
+                if os.path.isdir(sub):
+                    for agent in os.listdir(sub):
+                        if agent.endswith('.jsonl'):
+                            self.feed(os.path.join(sub, agent), False)
+        return self
+
+    def feed(self, path, main):
+        rec = self.files.setdefault(path, {'offset': 0, 'ids': [], 'days': [], 'main': main})
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return
+        if size < rec['offset']:
+            rec['offset'] = 0  # журнал переписан заново
+        if size == rec['offset']:
+            return
+        with open(path, 'rb') as f:
+            f.seek(rec['offset'])
+            data = f.read(size - rec['offset'])
+        cut = data.rfind(b'\n')
+        if cut < 0:
+            return  # строка ещё дописывается
+        rec['offset'] += cut + 1
+        for raw in data[:cut].split(b'\n'):
+            if b'"usage"' in raw:  # дешёвый отсев: json разбираем только у ответов модели
+                self.take(rec, raw)
+        self.dirty = True
+
+    def take(self, rec, raw):
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            return
+        msg = d.get('message') if d.get('type') == 'assistant' else None
+        usage = msg.get('usage') if isinstance(msg, dict) else None
+        at = ms(d.get('timestamp'))
+        if not usage or not at:
+            return
+        mid = msg.get('id')
+        if mid:
+            if mid in rec['ids']:
+                return
+            rec['ids'].append(mid)
+            del rec['ids'][:-self.IDS]
+        model = msg.get('model') or '?'
+        parts, toks = cost_parts(model, usage), token_parts(usage)
+        tokens = sum(toks)
+        if not tokens:
+            return
+        hour = time.strftime('%Y-%m-%dT%H', time.localtime(at / 1000))
+        project = os.path.basename(home_of(d.get('cwd'))) or '?'
+        cell = self.hours.setdefault(hour, {}).setdefault(project, {}).setdefault(model, [0.0, 0.0, 0.0, 0.0, 0, 0, 0, 0, 0])
+        for i, n in enumerate(parts + [tokens] + toks):
+            cell[i] += n
+        if rec['main'] and hour[:10] not in rec['days']:
+            rec['days'].append(hour[:10])
+
+    def save(self, every=0):
+        if not self.dirty or time.time() - self.saved_at < every:
+            return
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        tmp = self.path + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump({'v': self.VERSION, 'files': self.files, 'hours': self.hours}, f, separators=(',', ':'))
+        os.replace(tmp, self.path)
+        self.dirty, self.saved_at = False, time.time()
+
+    def report(self, now=None):
+        """Дни подряд от первой записи до сегодня; почасово — последние HEAT_DAYS дней."""
+        from datetime import date, timedelta
+        now = now or time.time()
+        since_24 = time.strftime('%Y-%m-%dT%H', time.localtime(now - 23 * 3600))
+        heat_from = day_of((now - HEAT_DAYS * 86400) * 1000)
+        days, hours, last24 = {}, [], 0.0
+        for hour, projects in sorted(self.hours.items()):
+            row = days.setdefault(hour[:10], blank_day(hour[:10]))
+            spent = 0.0
+            for project, models in projects.items():
+                for model, cell in models.items():
+                    usd = sum(cell[:4])
+                    spent += usd
+                    row['models'][model] = row['models'].get(model, 0.0) + usd
+                    row['projects'][project] = row['projects'].get(project, 0.0) + usd
+                    row['parts'] = [a + b for a, b in zip(row['parts'], cell[:4])]
+                    row['tokens'] += cell[4]
+                    row['tokParts'] = [a + b for a, b in zip(row['tokParts'], cell[5:9])]
+                    row['tokModels'][model] = row['tokModels'].get(model, 0) + cell[4]
+                    row['tokProjects'][project] = row['tokProjects'].get(project, 0) + cell[4]
+            row['usd'] += spent
+            if hour >= since_24:
+                last24 += spent
+            if hour[:10] >= heat_from and spent:
+                hours.append([hour[:10], int(hour[11:]), round(spent, 4)])
+        for rec in self.files.values():
+            for day in rec['days'] if rec['main'] else []:
+                days.setdefault(day, blank_day(day))['sessions'] += 1
+            if rec['main'] and rec['days']:
+                days[min(rec['days'])]['started'] += 1
+        out = []
+        if days:
+            d, end = date.fromisoformat(min(days)), date.fromisoformat(day_of(now * 1000))
+            while d <= end:
+                out.append(days.get(d.isoformat()) or blank_day(d.isoformat()))
+                d += timedelta(days=1)
+        for row in out:
+            row['usd'] = round(row['usd'], 4)
+            row['parts'] = [round(x, 4) for x in row['parts']]
+            for k in ('models', 'projects'):
+                row[k] = {name: round(usd, 4) for name, usd in row[k].items()}
+        return {'since': out[0]['day'] if out else '', 'last24': round(last24, 4), 'days': out, 'hours': hours}
+
+
+LEDGER = None
+STATS_LOCK = threading.Lock()  # статистика копится отдельно от офиса: первый проход долгий
+
+
+def stats():
+    global LEDGER
+    with STATS_LOCK:
+        if LEDGER is None:
+            LEDGER = Ledger(os.path.join(DATA, 'stats.json'))
+        LEDGER.scan()
+        LEDGER.save(every=60)
+        return LEDGER.report()
 
 
 TAILS = {}
@@ -481,6 +840,7 @@ def agents_of(pdir, sid, now_ms):
             'endedAt': 0 if working else t.last,
             'calls': t.calls,
             'cost': round(t.cost, 4),
+            'today': round(today_cost(t), 4),
             'model': t.model,
             'tool': t.tool,
             'at': t.activity_at or t.last,
@@ -508,6 +868,7 @@ def sessions():
             'working': working,
             'agents': len(agents),
             'cost': round(t.cost + sum(a['cost'] for a in agents), 2),
+            'today': round(today_cost(t) + sum(a['today'] for a in agents), 2),
             'folder': t.home,
             'hasOffice': bool(t.home) and os.path.exists(office_path(t.home)),
         })
@@ -518,7 +879,8 @@ def office_for(t):
     saved = load_office(t.home) if t.home else None
     office = saved or auto_office(t.home or '?', t.roster)
     office['saved'] = bool(saved)
-    office['generating'] = t.home in GENERATING
+    office['job'] = job_view(t.home) if t.home else None
+    office['generating'] = bool(office['job']) and office['job']['status'] == 'running'
     return office
 
 
@@ -580,25 +942,24 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_POST(self):
+        # /api/office — собрать заново, /api/office/cancel — отменить, /api/office/undo — вернуть прежний
         url = urlparse(self.path)
-        if url.path != '/api/office':
+        action = {'/api/office': 'start', '/api/office/cancel': 'cancel', '/api/office/undo': 'undo'}.get(url.path)
+        if not action:
             return self.send_json({'error': 'нет такого адреса'}, 404)
         sid = parse_qs(url.query).get('s', [''])[0]
         with LOCK:
             t = find_tail(sid)
             if not t or not t.home:
                 return self.send_json({'error': 'у сессии не нашлась папка'}, 404)
-            if t.home in GENERATING:
-                return self.send_json({'error': 'офис уже генерируется'}, 409)
             folder, roster = t.home, dict(t.roster)
-            GENERATING[folder] = time.time()
-        try:
-            office = generate_office(folder, roster)  # десятки секунд: без замка
-        except Exception as e:
-            return self.send_json({'error': str(e)}, 500)
-        finally:
-            GENERATING.pop(folder, None)
-        return self.send_json(office)
+        if action == 'start' and not start_office(folder, roster):
+            return self.send_json({'error': 'офис уже собирается'}, 409)
+        if action == 'cancel' and not cancel_office(folder):
+            return self.send_json({'error': 'отменять нечего'}, 409)
+        if action == 'undo' and not undo_office(folder):
+            return self.send_json({'error': 'прежнего офиса нет'}, 409)
+        return self.send_json(job_view(folder), 202 if action == 'start' else 200)
 
     def do_GET(self):
         url = urlparse(self.path)
@@ -607,6 +968,8 @@ class Handler(SimpleHTTPRequestHandler):
                 with LOCK:
                     body = sessions()
                 return self.send_json(body)
+            if url.path == '/api/stats':
+                return self.send_json(stats())
             if url.path == '/api/state':
                 with LOCK:
                     st = state(parse_qs(url.query).get('s', [''])[0])
@@ -623,8 +986,18 @@ def main():
     ap.add_argument('--port', type=int, default=8767)
     ap.add_argument('--host', default='127.0.0.1')
     ap.add_argument('--data', default=DATA, help='где хранить офисы папок')
+    ap.add_argument('--watch-parent', action='store_true', help='выйти, когда умрёт родительский процесс')
     args = ap.parse_args()
     DATA = os.path.expanduser(args.data)
+    if args.watch_parent:
+        ppid = os.getppid()
+
+        def watch():
+            while parent_alive(ppid):
+                time.sleep(2)
+            os._exit(0)
+        threading.Thread(target=watch, daemon=True).start()
+    threading.Thread(target=stats, daemon=True).start()  # первый проход по журналам — заранее
     print('Agent Office: http://%s:%d' % (args.host, args.port), flush=True)
     ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
 
