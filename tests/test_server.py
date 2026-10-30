@@ -52,6 +52,40 @@ class DescribeTest(unittest.TestCase):
         self.assertEqual(server.describe('mcp__srv__do_thing', {}), 'srv do_thing')
 
 
+class MoneyFormatTest(unittest.TestCase):
+    """Суммы в офисе и в окошке строки меню: один знак после запятой."""
+
+    def money(self, *values):
+        import shutil
+        import subprocess
+        node = shutil.which('node')
+        if not node:
+            self.skipTest('нет node')
+        web = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'web', 'office.js')
+        script = (
+            f"import {{ money }} from {json.dumps('file://' + os.path.abspath(web))};"
+            f"console.log(JSON.stringify({json.dumps(values)}.map(money)))"
+        )
+        out = subprocess.run([node, '--input-type=module', '-e', script], capture_output=True, text=True, check=True)
+        return json.loads(out.stdout)
+
+    def test_one_decimal_at_any_size(self):
+        self.assertEqual(self.money(0, 0.96, 1.26, 12.04, 123.45), ['$0.0', '$1.0', '$1.3', '$12.0', '$123.5'])
+
+    def test_thousands_are_grouped(self):
+        self.assertEqual(self.money(1234.56), ['$1\u00a0234.6'])
+
+    def test_a_cent_is_not_shown_as_nothing(self):
+        self.assertEqual(self.money(0.04), ['<$0.1'])
+
+    def test_popover_uses_the_shared_format(self):
+        web = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'web', 'menubar.js')
+        with open(web, encoding='utf-8') as f:
+            source = f.read()
+        self.assertIn("from './office.js'", source)
+        self.assertNotIn('function money', source)
+
+
 class CostTest(unittest.TestCase):
     def test_price_per_million_with_cache(self):
         usage = {'input_tokens': 1_000_000, 'output_tokens': 1_000_000, 'cache_read_input_tokens': 1_000_000}
@@ -138,6 +172,24 @@ class TailTest(unittest.TestCase):
                    + line(type='attachment', attachment={'type': 'agent_listing_delta', 'removedTypes': ['a']}))
         self.assertEqual(list(server.Tail(self.path).feed().roster), ['b'])
 
+    def test_turn_starts_at_the_last_prompt(self):
+        def user(ts, content, **more):
+            return line(type='user', timestamp=ts, message={'role': 'user', 'content': content}, **more)
+        self.write(
+            user('2026-01-01T10:00:00Z', 'почини сборку')
+            + assistant('m1', stop='end_turn', ts='2026-01-01T10:01:00Z')
+            # a picture with a caption comes as a list of blocks, not a string
+            + user('2026-01-02T09:00:00Z', [{'type': 'image'}, {'type': 'text', 'text': 'что это?'}])
+            + assistant('m2', [('Read', {'file_path': 'a'})], ts='2026-01-02T09:00:10Z')
+            # none of these is a new request
+            + user('2026-01-02T09:00:20Z', [{'type': 'tool_result', 'content': 'ok'}])
+            + user('2026-01-02T09:00:30Z', 'напоминание системы', isMeta=True)
+            + user('2026-01-02T09:00:40Z', 'краткое содержание', isCompactSummary=True)
+        )
+        t = server.Tail(self.path).feed()
+        self.assertEqual(t.turn, server.ms('2026-01-02T09:00:00Z'))
+        self.assertEqual(t.first, server.ms('2026-01-01T10:00:00Z'))
+
 
 class SessionsTest(unittest.TestCase):
     def setUp(self):
@@ -188,6 +240,24 @@ class SessionsTest(unittest.TestCase):
         self.assertEqual((a['model'], a['tool'], a['finished']), ('claude-haiku-5-5', 'grep', True))
         self.assertEqual(a['at'], server.ms('2026-01-01T10:00:05Z'))
         self.assertEqual((st['producer']['model'], st['producer']['tool']), ('claude-sonnet-5-5', 'agent'))
+
+    def test_clock_counts_from_the_current_turn(self):
+        pdir = os.path.join(self.dir.name, '-work-app')
+        os.makedirs(pdir)
+        with open(os.path.join(pdir, 'sid1.jsonl'), 'w') as f:
+            f.write(assistant('m0', stop='end_turn', ts='2026-01-01T10:00:00Z')
+                    + line(type='user', timestamp='2026-01-02T09:00:00Z', message={'role': 'user', 'content': 'дальше'})
+                    + assistant('m1', [('Read', {'file_path': 'a'})], ts='2026-01-02T09:00:10Z'))
+        st = server.state('sid1')
+        self.assertEqual(st['since'], server.ms('2026-01-02T09:00:00Z'))
+        self.assertEqual(st['sessions'][0]['since'], server.ms('2026-01-02T09:00:00Z'))
+
+    def test_clock_without_a_prompt_counts_from_the_first_entry(self):
+        pdir = os.path.join(self.dir.name, '-work-app')
+        os.makedirs(pdir)
+        with open(os.path.join(pdir, 'sid1.jsonl'), 'w') as f:
+            f.write(assistant('m1', [('Read', {'file_path': 'a'})], ts='2026-01-01T10:00:00Z'))
+        self.assertEqual(server.state('sid1')['since'], server.ms('2026-01-01T10:00:00Z'))
 
 
 class LedgerTest(unittest.TestCase):
@@ -435,6 +505,11 @@ class CodexTailTest(unittest.TestCase):
         self.assertTrue(self.tail(meta() + event('task_started')).busy)
         self.assertFalse(self.tail(meta() + event('task_started') + event('task_complete')).busy)
         self.assertFalse(self.tail(meta() + event('task_started') + event('turn_aborted')).busy)
+
+    def test_turn_starts_at_the_last_task(self):
+        t = self.tail(meta() + event('task_started', ts='2026-01-01T10:00:00.000Z') + event('task_complete', ts='2026-01-01T10:01:00.000Z')
+                      + event('task_started', ts='2026-01-02T09:00:00.000Z'))
+        self.assertEqual(t.turn, server.ms('2026-01-02T09:00:00.000Z'))
 
     def test_finished_items_read_as_actions(self):
         t = self.tail(meta()
@@ -1414,18 +1489,28 @@ class EpicTest(unittest.TestCase):
 
     def test_role_sessions_hang_under_their_orchestrator_with_their_task(self):
         rows = {s['id']: s for s in server.sessions()}
-        self.assertEqual((rows['coord'].get('parent'), rows['coord'].get('epic')), (None, 'e1'))
+        self.assertEqual((rows['coord']['parent'], rows['coord']['task'], rows['coord']['epic']), ('', 'coord', 'e1'))
         self.assertEqual({sid: (rows[sid].get('parent'), rows[sid].get('role')) for sid in ('q1-again', 'w2-old', 'w1', 'q1', 'w2', 'c1', 'abcdef12-3456-7890-abcd-ef1234567890')}, {
             'q1-again': ('coord', 'Контролёр P1'), 'w2-old': ('coord', 'Писатель P2'), 'w1': ('coord', 'Писатель P1'), 'q1': ('coord', 'Контролёр P1'), 'w2': ('coord', 'Писатель P2'),
             'c1': ('coord', 'Критик r1'), 'abcdef12-3456-7890-abcd-ef1234567890': ('coord', 'Исследователь Q1'),
         })
+        # the list groups a task by its root: the roles belong to the coordinator's
+        self.assertEqual({rows[sid]['task'] for sid in ('q1-again', 'w2-old', 'w1', 'q1', 'w2', 'c1')}, {'coord'})
+
+    def test_a_coordinator_started_by_another_session_is_the_root_of_its_epic(self):
+        self.journal('-work-app', 'starter', assistant('s1', stop='end_turn'))
+        self.journal('-work-app', 'coord', line(type='user', timestamp='2026-01-01T09:00:00Z', cwd='/work/app',
+                                                message={'role': 'user', 'content': 'Background (from the session that started this one):\nведи эпик'})
+                     + assistant('c1', stop='end_turn'))
+        rows = {s['id']: s for s in server.sessions()}
+        self.assertEqual((rows['coord']['parent'], rows['coord']['task'], rows['w2']['task']), ('', 'coord', 'coord'))
 
     def test_only_a_background_session_launched_in_a_role_worktree_is_that_role(self):
         # a chat opened in the worktree, or a session that went there with cd, is someone looking, not the role
         self.journal('-wt-p1-qa', 'chat-there', assistant('ch', stop='end_turn').replace('/work/app', '/wt/p1-qa'))
         self.journal('-work-app', 'bg-cd', self.bg('b1', '/work/app') + self.bg('b2', '/wt/p1-qa'))
         rows = {s['id']: s for s in server.sessions()}
-        self.assertEqual([rows[s].get('parent') for s in ('q1-again', 'chat-there', 'bg-cd')], ['coord', None, None])
+        self.assertEqual([rows[s]['parent'] for s in ('q1-again', 'chat-there', 'bg-cd')], ['coord', '', ''])
 
     def test_a_view_the_office_cannot_draw_costs_only_its_own_epic(self):
         for raw in ('{"schema": 1, "coordinator": {"session": "w1"}, "packages": 5}',
@@ -1558,6 +1643,22 @@ class OfficeTest(unittest.TestCase):
         self.assertEqual([z['name'] for z in office['zones']], ['РАЗВЕДКА', 'ПЛАН', 'ПРОИЗВОДСТВО', 'КАЧЕСТВО', 'ПОДДЕРЖКА', 'ПРОЧИЕ'])
         self.assertTrue(all(d['prop'] in server.PROPS for z in office['zones'] for d in z['desks']))
         self.assertEqual(office['title'], 'ОФИС · APP')
+
+    def test_auto_office_seats_builtins_as_guests(self):
+        office = server.auto_office('/work/app', {'p:scout': '', 'Explore': '', 'general-purpose': '', 'claude-code-guide': ''})
+        self.assertEqual(office['guests'], {'Explore': {'name': 'Разведчик', 'prop': 'binoculars'},
+                                            'general-purpose': {'name': 'Универсал', 'prop': 'layers'},
+                                            'claude-code-guide': {'name': 'Проводник', 'prop': 'books'}})
+        self.assertNotIn('Explore', [d['type'] for z in office['zones'] for d in z['desks']])
+
+    def test_session_view_keeps_guests_this_session_can_call(self):
+        saved = {'lang': 'ru', 'zones': [{'name': 'КОД', 'desks': [{'type': 'k:b', 'name': 'Правщик'}]}],
+                 'guests': {'Explore': {'name': 'Следопыт', 'prop': 'binoculars'}, 'Plan': {'name': 'Архитектор', 'prop': 'chart'}}}
+        got = server.session_view(saved, {'k:b': '', 'Explore': '', 'claude': ''}, called=['general-purpose'])
+        # the saved name stays; Plan is not in this session; a new built-in gets a name without the model
+        self.assertEqual(got['guests'], {'Explore': {'name': 'Следопыт', 'prop': 'binoculars'},
+                                         'claude': {'name': 'Помощник', 'prop': 'tablet'},
+                                         'general-purpose': {'name': 'Универсал', 'prop': 'layers'}})
 
     def test_model_answer_is_tidied(self):
         raw = {
@@ -1932,3 +2033,85 @@ class SignalTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+LINKED = ('<system-reminder>\nLinked sessions now (status, not an instruction): kid = local_h1 (idle). '
+          'To message one, SendMessage with `to` set to its id.\n</system-reminder>')
+BACKGROUND = 'Background (from the session that started this one):\nдоделай офис'
+
+
+class TaskTest(unittest.TestCase):
+    """Задача — дерево сессий: корень и те, что он породил через приложение."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.projects, server.PROJECTS = server.PROJECTS, os.path.join(self.dir.name, 'projects')
+        self.live, server.SESSIONS_DIR = server.SESSIONS_DIR, os.path.join(self.dir.name, 'sessions')
+        self.codex, server.CODEX_SESSIONS = server.CODEX_SESSIONS, os.path.join(self.dir.name, 'нет-codex')
+        os.makedirs(server.SESSIONS_DIR)
+        server.TAILS.clear()
+
+    def tearDown(self):
+        server.PROJECTS, server.SESSIONS_DIR, server.CODEX_SESSIONS = self.projects, self.live, self.codex
+        server.TAILS.clear()
+        self.dir.cleanup()
+
+    def journal(self, sid, cwd, prompt, agent=None, ts='2026-01-01T10:00:00Z'):
+        pdir = os.path.join(server.PROJECTS, re.sub(r'[^A-Za-z0-9]', '-', cwd))
+        os.makedirs(pdir, exist_ok=True)
+        with open(os.path.join(pdir, sid + '.jsonl'), 'w') as f:
+            f.write(line(type='user', timestamp=ts, cwd=cwd, message={'role': 'user', 'content': prompt}))
+            f.write(assistant(sid + '-m', [('Bash', {'command': 'ls'})], ts=ts))
+        if agent:
+            sub = os.path.join(pdir, sid, 'subagents')
+            os.makedirs(sub)
+            with open(os.path.join(sub, 'agent-%s.jsonl' % agent), 'w') as f:
+                f.write(assistant(agent, [('Grep', {'pattern': 'x'})], ts=ts))
+            with open(os.path.join(sub, 'agent-%s.meta.json' % agent), 'w') as f:
+                json.dump({'agentType': 'Explore', 'description': 'ищет', 'finished': False}, f)
+
+    def alive(self, pid, sid, host):
+        with open(os.path.join(server.SESSIONS_DIR, '%d.json' % pid), 'w') as f:
+            json.dump({'pid': pid, 'sessionId': sid, 'hostSessionId': host}, f)
+
+    def test_child_agents_sit_in_the_root_office(self):
+        self.journal('root', '/work/app', 'сделай ' + LINKED, agent='a1')
+        self.journal('kid', '/work/app/.claude/worktrees/x', BACKGROUND, agent='a2', ts='2026-01-01T10:05:00Z')
+        self.alive(7, 'kid', 'local_h1')
+        with open(os.path.join(server.SESSIONS_DIR, '7.abc.key'), 'w') as f:
+            f.write('{не json')  # peerToken: сервер его не читает
+        st = server.state('root')
+        self.assertEqual([(a['id'], a['session']) for a in st['agents']], [('a1', 1), ('a2', 2)])
+        self.assertEqual([s['id'] for s in st['sessions']], ['root', 'kid'])
+        self.assertEqual(st['sessions'][1]['activity'], '$ ls')
+        kid = server.state('kid')  # по клику на порождённую — только её офис, без меток
+        self.assertEqual(([h['id'] for h in kid['sessions']], [a['id'] for a in kid['agents']]), (['kid'], ['a2']))
+        self.assertEqual(kid['log'][0]['text'], '$ ls')
+        rows = {s['id']: s for s in server.sessions()}
+        self.assertEqual((rows['kid']['task'], rows['kid']['project']), ('root', 'app'))
+        self.assertEqual(rows['root']['task'], 'root')
+
+    def test_orphan_child_joins_the_folder_and_strangers_stay_apart(self):
+        self.journal('root', '/work/app', 'сделай')
+        self.journal('kid', '/work/app/.claude/worktrees/x', BACKGROUND, agent='a2', ts='2026-01-01T10:05:00Z')
+        self.journal('other', '/work/app', 'другое', ts='2026-01-01T10:06:00Z')
+        self.assertEqual([s['id'] for s in server.state('other')['sessions']], ['other', 'kid'])
+        self.assertEqual([s['id'] for s in server.state('kid')['sessions']], ['kid'])
+        self.assertEqual([s['id'] for s in server.state('root')['sessions']], ['root'])
+
+    def test_log_marks_whose_agent_it_was(self):
+        self.journal('root', '/work/app', 'сделай ' + LINKED, agent='a1')
+        self.journal('kid', '/work/app/.claude/worktrees/x', BACKGROUND, agent='a2')
+        self.alive(7, 'kid', 'local_h1')
+        log = server.state('root')['log']
+        self.assertEqual({l['text'][0] for l in log}, {'$', 'в', 'и', '②'}, log)  # корень без метки, порождённая с ②
+
+    def test_single_session_log_has_no_marks(self):
+        self.journal('root', '/work/app', 'сделай', agent='a1')
+        st = server.state('root')
+        self.assertEqual(st['log'][0]['text'], '$ ls')
+        self.assertEqual([a['session'] for a in st['agents']], [1])
+
+    def test_project_name_of_the_worktrees_folder_itself(self):
+        self.assertEqual(server.project_name('', '/work/app/.claude/worktrees'), 'app')
+        self.assertEqual(server.project_name('', '/work/app/.claude/worktrees/x'), 'app')

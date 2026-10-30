@@ -12,6 +12,7 @@ export type Agent = {
   tool: string
   at: number
   finished: boolean
+  session: number   // номер сессии задачи: 1 — корень
   // an epic role: what its Claude Code job file says (working, idle, done, stopped)
   job?: string
 }
@@ -19,10 +20,13 @@ export type Agent = {
 export type LogLine = { at: number; who: string; text: string }
 
 export type Producer = { isBusy: boolean; activity: string; at: number; calls: number; cost: number; model: string; tool: string; waitingFor?: string; owner?: boolean }
+// руководитель одной сессии задачи; первый — корень, остальные порождены приложением
+export type Head = Producer & { id: string; title: string; isLive: boolean; branch: string; since: number }
 
 export type Studio = {
   agents: Agent[]
   producer: Producer
+  sessions: Head[]
   cost: number
   log: LogLine[]
   since: number

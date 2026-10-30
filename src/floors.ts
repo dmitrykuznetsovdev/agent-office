@@ -3,14 +3,14 @@
 // Drawn on a canvas every frame; text goes to an overlay canvas so it stays sharp.
 // Agents move only inside their own cell, along their floor's corridor and in the lift.
 
-import type { Agent, OfficeDesk, Studio } from './types'
+import type { Agent, Head, OfficeDesk, Studio } from './types'
 import { GUESTS, deskName, deskOf, money } from './office.js'
 
 // ── data → people ──────────────────────────────────────────────────────────
 type Grade = 'intern' | 'middle' | 'senior' | 'lead'
 type Look = { id: string; skin: string; hair: string; shirt: string; pants: string; cap: string; crown: boolean }
-// waiting: a desk whose agent this session has not called yet — its owner sits and waits
-type Person = { key: string; name: string; grade: Grade; model: string; look: Look; boss: boolean; agent?: Agent; desk?: boolean; waiting?: boolean }
+// waiting: a desk whose agent this session has not called yet — it stands empty with its name plate
+type Person = { key: string; name: string; grade: Grade; model: string; look: Look; boss: boolean; agent?: Agent; head?: Head; desk?: boolean; waiting?: boolean }
 type Cell = { key: string; person?: Person; name: string }
 type FloorDef = { name: string; cells: Cell[]; free?: boolean; home: number; note?: string; strip?: boolean; track?: Array<[string, string]> | null }
 
@@ -18,6 +18,9 @@ const SKIN = ['#f1c27d', '#e0ac69', '#c68642', '#ffdbac', '#8d5524']
 const HAIRS = ['#2b1d14', '#1a1a1a', '#6b4a2b', '#c9a227', '#9a9a9a', '#8a5a2b', '#3a2416', '#e05a8a']
 const CAPS = ['#d06a2a', '#2f7a5a', '#c03040', '#3a6ab0']
 const INK = '#1a1a22', GOLD = '#f0c040'
+const MARKS = '①②③④⑤⑥⑦⑧⑨'
+// in a task of several sessions, people from a started session wear its number; the root's own go unmarked, as in the server's log
+const markOf = (st: Studio, n: number) => n > 1 && (st.sessions?.length ?? 1) > 1 ? MARKS[Math.min(n, MARKS.length) - 1] + ' ' : ''
 
 // the model is the grade: Haiku in a cap, Sonnet in a hoodie, Opus in a suit, Fable in a dark suit with glasses;
 // Codex models take the same grades by their tier
@@ -52,18 +55,27 @@ const AWAY = 30 * 60e3, DONE = 15e3, THINK = 60e3, COFFEE = 3 * 60e3
 
 // Floors from the folder's office: its zones, then the free-lance floor for built-in agents.
 // A floor never folds: every desk keeps its cell. A desk's owner is the newest agent of its type;
-// one who went home leaves an empty chair with a sign, one never called sits and waits.
+// one who went home leaves an empty chair with a sign, one never called leaves the desk empty.
 // Extra copies of a type working at once get extra cells; built-in agents get cells of their own.
 const FREE_HOME = 4  // free-lancers gone home that still keep a cell; the rest are only counted
 
-function building(st: Studio, now: number): { boss: Person; floors: FloorDef[] } {
+type Built = { boss: Person; heads: Person[]; floors: FloorDef[] }
+
+function building(st: Studio, now: number): Built {
   const office = st.office
   const mainDesk = deskOf(office, 'main')
-  const [bg, bm] = gradeOf(st.producer.model)
-  const boss: Person = { key: 'boss', name: deskName('main', office), grade: bg, model: bm, boss: true, look: lookOf('boss', mainDesk, '#3b3f8f', true) }
+  const heads = st.sessions ?? []
+  // the root's head is the boss; the heads of the sessions it started sit beside in the same room
+  const chief = (h: Head | undefined, i: number): Person => {
+    const [g, m] = gradeOf(h?.model ?? st.producer.model)
+    const key = i === 0 ? 'boss' : 'head:' + h!.id
+    return { key, name: markOf(st, i + 1) + deskName('main', office), grade: g, model: m, boss: true, head: h, look: lookOf(key, i === 0 ? mainDesk : undefined, '#3b3f8f', i === 0) }
+  }
+  const boss = chief(heads[0], 0)
   const floors: FloorDef[] = office.zones
     .map(z => ({ name: z.name, note: z.note, strip: z.strip, track: z.track, home: 0, cells: z.strip ? [] : z.desks.filter(d => d.type !== 'main').map(d => ({ key: d.type, name: d.short ?? d.name } as Cell)) }))
-  const free: FloorDef = { name: 'ФРИЛАНС', cells: [], free: true, home: 0 }
+  // built-in agents have no desk but keep a cell on the free-lance floor, waiting like a desk's owner
+  const free: FloorDef = { name: 'ФРИЛАНС', cells: Object.entries(office.guests).map(([t, g]) => ({ key: t, name: g.name } as Cell)), free: true, home: 0 }
   const gone = (a: Agent) => !a.isWorking && now - a.endedAt >= AWAY
   // at work first, then home, newest first: a desk goes to whoever is here
   const order = [...st.agents].sort((x, y) => Number(gone(x)) - Number(gone(y)) || y.startedAt - x.startedAt)
@@ -72,12 +84,13 @@ function building(st: Studio, now: number): { boss: Person; floors: FloorDef[] }
     const desk = deskOf(office, a.type)
     const own = desk && desk.type !== 'main' ? desk : undefined
     const [grade, model] = gradeOf(a.model)
-    const name = deskName(a.type, office)
-    // a desk's owner looks the same every time they are called
-    const person: Person = { key: a.id, name, grade, model, boss: false, agent: a, desk: !!own, look: lookOf(own ? own.type : a.id, own, GUESTS[a.type]?.shirt ?? '#5a6a8a') }
+    const name = markOf(st, a.session ?? 1) + deskName(a.type, office)
     const fi = own ? office.zones.findIndex(z => z.desks.includes(own)) : -1
     const floor = fi >= 0 ? floors[fi]! : free
-    const seat = own ? floor.cells.find(c => c.key === own.type) : undefined
+    const seat = floor.cells.find(c => c.key === (own ? own.type : a.type))
+    // the owner of a desk or of a guest cell looks the same every time they are called
+    const home = own ? own.type : seat ? a.type : undefined
+    const person: Person = { key: a.id, name, grade, model, boss: false, agent: a, desk: !!home, look: lookOf(home ?? a.id, own, GUESTS[a.type]?.shirt ?? '#5a6a8a') }
     if (seat && !seat.person) { seat.person = person; if (gone(a)) floor.home++; continue }
     // a folded floor draws no desks: its people are only counted
     if (floor.strip) { floor.home++; continue }
@@ -97,16 +110,26 @@ function building(st: Studio, now: number): { boss: Person; floors: FloorDef[] }
   for (const fl of floors) for (const cell of fl.cells) {
     if (cell.person) continue
     const desk = deskOf(office, cell.key)
-    cell.person = { key: 'wait:' + cell.key, name: cell.name, grade: 'middle', model: '', boss: false, desk: true, waiting: true, look: lookOf(cell.key, desk, '#5a6a8a') }
+    cell.person = { key: 'wait:' + cell.key, name: cell.name, grade: 'middle', model: '', boss: false, desk: true, waiting: true, look: lookOf(cell.key, desk, GUESTS[cell.key]?.shirt ?? '#5a6a8a') }
   }
   if (free.cells.length || free.home) floors.push(free)
-  return { boss, floors: floors.filter(f => f.cells.length || f.home || f.strip) }
+  return { boss, heads: heads.slice(1).map((h, i) => chief(h, i + 1)), floors: floors.filter(f => f.cells.length || f.home || f.strip) }
 }
 
 // ── what a person is doing right now ───────────────────────────────────────
 type Place = 'desk' | 'cooler' | 'couch' | 'gone'
 type Pose = 'sit' | 'type' | 'think' | 'drink' | 'phone' | 'sleep' | 'walk' | 'standDrink'
-type Doing = { place: Place; pose: Pose; icon: string; text: string; work: boolean }
+type Doing = { place: Place; pose: Pose; icon: string; text: string; work: boolean; time?: string }
+const TIME_COLOR = '#bfe3ff'   // the clock and its figure: apart from the status text and the model's colour
+
+// how long, with units: a bare 1:05 could be minutes or hours
+function span(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000))
+  if (s < 60) return `${s}с`
+  if (s < 3600) return `${Math.floor(s / 60)}м`
+  return `${Math.floor(s / 3600)}ч ${String(Math.floor(s / 60) % 60).padStart(2, '0')}м`
+}
+const clockOf = (at: number) => new Date(at).toTimeString().slice(0, 5)
 
 const ICON: Record<string, string> = { read: 'read', edit: 'edit', write: 'write', grep: 'grep', bash: 'bash', web: 'web', agent: 'phone', skill: 'skill', other: 'tool' }
 
@@ -117,32 +140,37 @@ function busy(tool: string, text: string): Doing {
 
 function doing(p: Person, st: Studio, now: number): Doing {
   if (p.boss) {
-    const pr = st.producer
-    if (pr.isBusy && now - pr.at < THINK) return busy(pr.tool, pr.activity)
-    if (pr.isBusy) return { place: 'desk', pose: 'think', icon: 'think', text: 'думает', work: true }
+    const pr = p.head ?? st.producer
+    // the clock of the current request: it runs while the head is busy
+    const since = p.head?.since ?? st.since
+    const timed = (d: Doing): Doing => ({ ...d, time: since ? span(now - since) : undefined })
+    if (pr.isBusy && now - pr.at < THINK) return timed(busy(pr.tool, pr.activity))
+    if (pr.isBusy) return timed({ place: 'desk', pose: 'think', icon: 'think', text: 'думает', work: true })
     // a coordinator of an epic is not idle while its roles work in their own sessions, or while the owner owes an answer
-    if (pr.owner) return { place: 'desk', pose: 'phone', icon: 'phone', text: 'нужен владелец', work: false }
-    if (pr.waitingFor) return { place: 'desk', pose: 'phone', icon: 'phone', text: 'ждёт: ' + pr.waitingFor, work: false }
+    if (st.producer.owner) return { place: 'desk', pose: 'phone', icon: 'phone', text: 'нужен владелец', work: false }
+    if (st.producer.waitingFor) return { place: 'desk', pose: 'phone', icon: 'phone', text: 'ждёт: ' + st.producer.waitingFor, work: false }
     return { place: 'desk', pose: 'drink', icon: 'coffee', text: 'ждёт задачу', work: false }
   }
   if (p.waiting) return { place: 'desk', pose: 'sit', icon: '', text: 'ждёт вызова', work: false }
   const a = p.agent!
-  const home = 'дома с ' + new Date(a.endedAt || a.at || a.startedAt).toTimeString().slice(0, 5)
+  // an agent's clock: how long it has worked; once done, how long it took; gone home, since when
+  const home: Doing = { place: 'gone', pose: 'sit', icon: 'home', text: 'дома с', work: false, time: clockOf(a.endedAt || a.at || a.startedAt) }
+  const took = span((a.endedAt || a.at) - a.startedAt), sofar = span(now - a.startedAt)
   // an epic role's job file outranks the silence in its journal: a long test is still work
-  if (a.job === 'working') return busy(a.tool, a.activity || a.desc)
-  if (a.job === 'idle') return { place: 'desk', pose: 'sit', icon: 'think', text: 'ждёт', work: false }
+  if (a.job === 'working') return { ...busy(a.tool, a.activity || a.desc), time: sofar }
+  if (a.job === 'idle') return { place: 'desk', pose: 'sit', icon: 'think', text: 'ждёт', work: false, time: sofar }
   if (a.finished) {
     const since = now - a.endedAt
-    if (since < DONE) return { place: 'desk', pose: 'sit', icon: 'done', text: 'сдал работу', work: false }
-    if (since < AWAY) return { place: 'couch', pose: 'sit', icon: 'rest', text: 'в лаунже', work: false }
-    return { place: 'gone', pose: 'sit', icon: 'home', text: home, work: false }
+    if (since < DONE) return { place: 'desk', pose: 'sit', icon: 'done', text: 'сдал работу', work: false, time: took }
+    if (since < AWAY) return { place: 'couch', pose: 'sit', icon: 'rest', text: 'в лаунже', work: false, time: took }
+    return home
   }
   const idle = now - (a.at || a.startedAt)
-  if (a.isWorking && idle < THINK) return busy(a.tool, a.activity || a.desc)
-  if (a.isWorking && idle < COFFEE) return { place: 'desk', pose: 'think', icon: 'think', text: 'думает', work: true }
-  if (a.isWorking) return { place: 'cooler', pose: 'standDrink', icon: 'coffee', text: 'у кулера', work: false }
-  if (now - a.endedAt < AWAY) return { place: 'desk', pose: 'sleep', icon: 'sleep', text: 'спит', work: false }
-  return { place: 'gone', pose: 'sit', icon: 'home', text: home, work: false }
+  if (a.isWorking && idle < THINK) return { ...busy(a.tool, a.activity || a.desc), time: sofar }
+  if (a.isWorking && idle < COFFEE) return { place: 'desk', pose: 'think', icon: 'think', text: 'думает', work: true, time: sofar }
+  if (a.isWorking) return { place: 'cooler', pose: 'standDrink', icon: 'coffee', text: 'у кулера', work: false, time: sofar }
+  if (now - a.endedAt < AWAY) return { place: 'desk', pose: 'sleep', icon: 'sleep', text: 'спит', work: false, time: took }
+  return home
 }
 
 // ── trips: corridor → lift → lobby, and back ───────────────────────────────
@@ -366,6 +394,7 @@ function drawIcon(c: C2, b: Bub, icon: string, x: number, y: number, t: number) 
 
 // action glyphs 5×5 in the info line, a banknote and a coin
 const GLYPH: Record<string, string[]> = {
+  clock: ['.###.', '#.#.#', '#.##.', '#...#', '.###.'],
   read: ['#####', '#...#', '#.#.#', '#...#', '#####'], edit: ['...##', '..##.', '.##..', '##...', '#....'],
   write: ['####.', '#..#.', '#..##', '#.###', '####.'], grep: ['.##..', '#..#.', '#..#.', '.###.', '....#'],
   bash: ['#....', '.#...', '#....', '.....', '..###'], web: ['.###.', '#.#.#', '#####', '#.#.#', '.###.'],
@@ -375,12 +404,13 @@ const GLYPH: Record<string, string[]> = {
   sleep: ['####.', '..#..', '.#...', '####.', '.....'], walk: ['..#..', '.###.', '#.#.#', '..#..', '.#.#.'],
   lift: ['#####', '#.#.#', '#.#.#', '#.#.#', '#####'], home: ['..#..', '.###.', '#####', '.#.#.', '.#.#.'], rest: ['..##.', '..#.#', '..#..', '###..', '##...'],
 }
-const ICON_COLOR: Record<string, string> = { home: '#e0a070', read: '#7fdcff', edit: '#ffd060', write: '#8af0a0', grep: '#ffa070', bash: '#60ff90', web: '#9ab8ff', phone: '#ff8ac8', skill: '#ffd060', tool: '#d8d8f0', think: '#d8d8f0', coffee: '#e0b080', done: '#8af0a0', sleep: '#a0a8d0', walk: '#d8d8f0', lift: '#d8d8f0', rest: '#c8a0ff' }
-function glyph(c: C2, name: string, x: number, y: number) {
+const ICON_COLOR: Record<string, string> = { clock: '#bfe3ff', home: '#e0a070', read: '#7fdcff', edit: '#ffd060', write: '#8af0a0', grep: '#ffa070', bash: '#60ff90', web: '#9ab8ff', phone: '#ff8ac8', skill: '#ffd060', tool: '#d8d8f0', think: '#d8d8f0', coffee: '#e0b080', done: '#8af0a0', sleep: '#a0a8d0', walk: '#d8d8f0', lift: '#d8d8f0', rest: '#c8a0ff' }
+const DIM = 'rgba(235,235,250,0.45)'   // icons and figures of someone not at work
+function glyph(c: C2, name: string, x: number, y: number, color = ICON_COLOR[name]!) {
   const g = GLYPH[name]
   if (!g) return
   R(c, x - 1, y - 1, 7, 7, 'rgba(10,10,20,0.55)')
-  g.forEach((row, j) => { for (let i = 0; i < 5; i++) if (row[i] === '#') R(c, x + i, y + j, 1, 1, ICON_COLOR[name]!) })
+  g.forEach((row, j) => { for (let i = 0; i < 5; i++) if (row[i] === '#') R(c, x + i, y + j, 1, 1, color) })
 }
 function banknote(c: C2, x: number, y: number) { R(c, x, y, 7, 5, '#1f6a32'); R(c, x + 1, y + 1, 5, 3, '#4cb860'); R(c, x + 3, y + 1, 1, 3, '#1f6a32'); R(c, x + 2, y + 2, 3, 1, '#1f6a32') }
 function coin(c: C2, x: number, y: number) { R(c, x + 1, y, 2, 4, '#c08a10'); R(c, x, y + 1, 4, 2, '#c08a10'); R(c, x + 1, y + 1, 2, 2, GOLD) }
@@ -490,17 +520,25 @@ function sky(c: C2, w: number, h: number, tm: string, t: number) {
 const FL = { pad: 6, shaft: 19, plaque: 54, cw: 48, rowH: 61, info: 6, roof: 24, ground: 10, minCols: 8, maxCols: 12, strip: 23 }
 type Geo = { x: number; top: number; sx: number; sy: number; wide?: boolean }
 type FloorGeo = { def: FloorDef; y: number; h: number; rows: number }
-type Layout = { key: string; f: Fig; cols: number; x0: number; width: number; height: number; floors: FloorGeo[]; cells: Map<string, Geo>; boss: Geo; lobby: number; couchX: number; couchW: number; seats: number }
+type Layout = { key: string; f: Fig; cols: number; x0: number; width: number; height: number; roof: number; floors: FloorGeo[]; cells: Map<string, Geo>; boss: Geo; lobby: number; couchX: number; couchW: number; seats: number }
 
-function layout(b: { floors: FloorDef[] }, room: Room, key: string): Layout {
+function layout(b: { heads: Person[]; floors: FloorDef[] }, room: Room, key: string): Layout {
   const f = FIGS[room.fig]!
   const cols = Math.max(FL.minCols, Math.min(FL.maxCols, ...b.floors.map(fl => fl.cells.length)))
   const x0 = FL.pad + FL.shaft + FL.plaque, width = x0 + cols * FL.cw + FL.pad
-  let y = FL.roof
+  // a task of several sessions gets a line under the roof saying which one is at work now
+  const roof = FL.roof + (b.heads.length ? 7 : 0)
+  let y = roof
   const bx = x0 + Math.floor((cols - 2) / 2) * FL.cw
   const boss: Geo = { x: bx, top: y + FL.info, sx: bx + 14, sy: y + FL.info + 46, wide: true }
+  const cells = new Map<string, Geo>()
+  // the heads of started sessions: right of the boss, then left, as many as the room holds
+  b.heads.forEach((h, i) => {
+    const k = Math.floor(i / 2) + 1, x = i % 2 === 0 ? bx + 2 * FL.cw + (k - 1) * FL.cw : bx - k * FL.cw
+    if (x >= x0 && x + FL.cw <= x0 + cols * FL.cw) cells.set(h.key, { x, top: y + FL.info, sx: x + 12, sy: y + FL.info + 46 })
+  })
   y += FL.rowH
-  const floors: FloorGeo[] = [], cells = new Map<string, Geo>()
+  const floors: FloorGeo[] = []
   for (const def of b.floors) {
     // a floor whose free-lancers all went home still keeps one row of empty desks; a folded one is a band
     const rows = def.strip ? 0 : Math.max(1, Math.ceil(def.cells.length / cols))
@@ -514,7 +552,7 @@ function layout(b: { floors: FloorDef[] }, room: Room, key: string): Layout {
   }
   const lobby = y + FL.info
   const couchX = x0 + 60, couchW = width - FL.pad - 12 - couchX
-  return { key, f, cols, x0, width, height: lobby - FL.info + FL.rowH + FL.ground, floors, cells, boss, lobby, couchX, couchW, seats: Math.max(1, Math.floor((couchW - 4) / 22)) }
+  return { key, f, cols, x0, width, height: lobby - FL.info + FL.rowH + FL.ground, roof, floors, cells, boss, lobby, couchX, couchW, seats: Math.max(1, Math.floor((couchW - 4) / 22)) }
 }
 
 // ── the view ───────────────────────────────────────────────────────────────
@@ -528,7 +566,7 @@ export function mountFloors(scene: HTMLCanvasElement, overlay: HTMLCanvasElement
   let st: Studio | null = null
   let style = { office: 'cozy', time: 'clock' }
   let L: Layout | null = null
-  let built: { boss: Person; floors: FloorDef[] } | null = null
+  let built: Built | null = null
   const mem = new Map<string, Memory>()
   const seats = { couch: [] as Array<string | null>, cooler: [null, null] as Array<string | null> }
   const flights: Flight[] = []
@@ -543,7 +581,7 @@ export function mountFloors(scene: HTMLCanvasElement, overlay: HTMLCanvasElement
     if (!st) return
     built = building(st, now)
     const room = OFFICES[style.office] ?? OFFICES.cozy!
-    const key = style.office + '|' + built.floors.map(f => f.name + ':' + f.cells.map(c => c.key + (c.person ? '+' : '')).join(',')).join('/')
+    const key = style.office + '|' + built.heads.map(h => h.key).join(',') + '|' + built.floors.map(f => f.name + ':' + f.cells.map(c => c.key + (c.person ? '+' : '')).join(',')).join('/')
     if (L && L.key === key) return
     L = layout(built, room, key)
     if (seats.couch.length !== L.seats) seats.couch = Array.from({ length: L.seats }, (_, i) => seats.couch[i] ?? null)
@@ -593,20 +631,31 @@ export function mountFloors(scene: HTMLCanvasElement, overlay: HTMLCanvasElement
     const c = ctx
     c.clearRect(0, 0, width, height)
     sky(c, width, height, tm, t)
-    R(c, FL.pad - 3, FL.roof - 5, width - 2 * FL.pad + 6, height - FL.roof - FL.ground + 5, room.facade)
-    R(c, FL.pad - 4, FL.roof - 6, width - 2 * FL.pad + 8, 2, shade(room.facade, 0.7))
+    R(c, FL.pad - 3, L.roof - 5, width - 2 * FL.pad + 6, height - L.roof - FL.ground + 5, room.facade)
+    R(c, FL.pad - 4, L.roof - 6, width - 2 * FL.pad + 8, 2, shade(room.facade, 0.7))
     box(c, x0 + 20, 4, L.cols * FL.cw - 40, 13, '#14152a', GOLD)
     for (let i = 0; i < 3; i++) banknote(c, x0 + 24 + i, 9 - i)
     R(c, 0, height - FL.ground, width, FL.ground, '#3a3a46'); R(c, 0, height - FL.ground, width, 1, '#55556a')
 
     // who is doing what
-    const everyone: Person[] = [built.boss, ...built.floors.flatMap(fl => fl.cells.flatMap(cell => cell.person ? [cell.person] : []))]
+    const everyone: Person[] = [built.boss, ...built.heads, ...built.floors.flatMap(fl => fl.cells.flatMap(cell => cell.person ? [cell.person] : []))]
     const now_ = new Map<string, Doing>(), memo = new Map<string, Memory>()
     for (const p of everyone) { const d = doing(p, st, now); now_.set(p.key, d); memo.set(p.key, track(p, d, now, t)) }
     // «в работе» как на сервере и в списке сессий: незавершённые агенты и занятый руководитель
-    const working = st.agents.filter(a => a.isWorking).length + (st.producer.isBusy ? 1 : 0)
+    const heads = st.sessions ?? []
+    const working = st.agents.filter(a => a.isWorking).length + heads.filter(h => h.isBusy).length
     labels.push({ x: width / 2, y: 7.5, text: st.office.title || 'AGENT OFFICE', px: 5, color: st.office.accent ?? GOLD, display: true, stroke: false })
-    labels.push({ x: width / 2, y: 18, text: `в работе ${working} · агентов ${st.agents.length} · итого ${money(st.cost)}`, px: 4.2, color: '#ffffff', w: 600 })
+    labels.push({ x: width / 2, y: 18, text: `в работе ${working} · агентов ${st.agents.length}`, px: 4.2, color: '#ffffff', w: 600 })
+    // the session's total at the right edge, after a banknote
+    const total = money(st.cost)
+    banknote(c, xR - 3 - total.length * 2.6 - 9, 18.3)
+    labels.push({ x: xR - 2, y: 18, text: total, px: 4.2, color: GOLD, align: 'right', w: 600 })
+    if (heads.length > 1) {
+      // which session is at work now: the busy one that wrote last, else the one that wrote last
+      const latest = (hs: Head[]) => hs.reduce((a, b) => (b.at > a.at ? b : a))
+      const cur = latest(heads.filter(h => h.isBusy).length ? heads.filter(h => h.isBusy) : heads)
+      labels.push({ x: width / 2, y: 24.5, text: `сейчас: ${markOf(st, heads.indexOf(cur) + 1)}${cur.title} · сессий ${heads.length}`, px: 3.6, color: 'rgba(235,235,250,0.85)', maxw: width - 2 * FL.pad - 8 })
+    }
 
     // the producer's office: panorama window, carpet, board
     const doorTops: number[] = [], P = L.boss.top
@@ -669,9 +718,9 @@ export function mountFloors(scene: HTMLCanvasElement, overlay: HTMLCanvasElement
     box(c, xL + 4, lobby + 11, 14, 5, '#1b1d2e', GOLD)
     labels.push({ x: xL + 11, y: lobby + 11.6, text: 'ХОЛЛ', px: 3, color: GOLD, w: 600, stroke: false })
     // lift shaft and the pneumatic tube
-    R(c, FL.pad, FL.roof - 2, FL.shaft, lobby + 46 - FL.roof + 2, '#0e0e16')
-    R(c, FL.pad + 7, FL.roof - 2, 1, lobby + 46 - FL.roof + 2, '#24242e')
-    R(c, FL.pad + 15, FL.roof - 2, 3, lobby + 46 - FL.roof + 2, '#2a4a5a'); R(c, FL.pad + 16, FL.roof - 2, 1, lobby + 46 - FL.roof + 2, '#3a6a7a')
+    R(c, FL.pad, L.roof - 2, FL.shaft, lobby + 46 - L.roof + 2, '#0e0e16')
+    R(c, FL.pad + 7, L.roof - 2, 1, lobby + 46 - L.roof + 2, '#24242e')
+    R(c, FL.pad + 15, L.roof - 2, 3, lobby + 46 - L.roof + 2, '#2a4a5a'); R(c, FL.pad + 16, L.roof - 2, 1, lobby + 46 - L.roof + 2, '#3a6a7a')
 
     // trips: corridor → cabin → lobby and back; positions follow the phases
     const cx = L.couchX, cw = L.couchW, SHAFT_X = xL + 10, CORR = 6
@@ -721,6 +770,9 @@ export function mountFloors(scene: HTMLCanvasElement, overlay: HTMLCanvasElement
     drawCooler(c, room, x0 + 22, lobby + 46)
     drawCouch(c, room, cx, lobby + 46, cw)
     let lounging = 0, atCooler = 0, overflow = 0
+    // a name under everyone in the lounge, on two staggered lines so neighbours do not collide; free-lancers are tagged
+    const tag = (p: Person, x: number, row: number, align: CanvasTextAlign) =>
+      labels.push({ x, y: lobby + 47.2 + row * 4.2, text: p.desk ? p.name : p.name + ' · фриланс', px: 3.4, color: p.desk ? '#ffffff' : '#d8dcff', align, maxw: 43 })
     for (const p of everyone) {
       const m = memo.get(p.key)!
       if (m.trip && t - m.trip.t0 < WALK) continue
@@ -728,21 +780,23 @@ export function mountFloors(scene: HTMLCanvasElement, overlay: HTMLCanvasElement
         atCooler++
         if (m.seat < 0) { overflow++; continue }
         blit(c, sprite(f, 'standDrink', 0, p.grade, p.look, false), x0 + 38 + m.seat * 9, lobby + 46, true, true)
+        tag(p, x0 + 44, m.seat, 'right')
       } else if (m.place === 'couch') {
         lounging++
         if (m.seat < 0) { overflow++; continue }
         blit(c, sprite(f, 'sit', 0, p.grade, p.look, false), cx + 6 + m.seat * 22, lobby + 48 - f.shin, false, false)
+        tag(p, cx + 13 + m.seat * 22, m.seat % 2, 'center')
       }
     }
     if (atCooler) bubbles.push({ icon: 'coffee', x: x0 + 42, y: lobby + 21 })
     if (lounging) bubbles.push({ icon: 'rest', x: cx + cw / 2, y: lobby + 21 })
     labels.push({ x: x0 + 2, y: lobby - FL.info + 2, text: `ЛАУНЖ · отдыхают ${lounging}${atCooler ? ' · у кулера ' + atCooler : ''}`, px: 3.9, color: 'rgba(255,255,255,0.9)', w: 600, align: 'left' })
-    labels.push(overflow
-      ? { x: cx + cw, y: lobby + 47.2, text: `+${overflow} мест не хватило`, px: 3.7, color: '#ffffff', align: 'right' }
-      : { x: cx + cw / 2, y: lobby + 47.2, text: 'кулер и диван', px: 3.7, color: 'rgba(230,230,245,0.6)' })
+    if (overflow) labels.push({ x: cx + cw, y: lobby + 47.2, text: `+${overflow} мест не хватило`, px: 3.7, color: '#ffffff', align: 'right' })
+    else if (!lounging && !atCooler) labels.push({ x: cx + cw / 2, y: lobby + 47.2, text: 'кулер и диван', px: 3.7, color: 'rgba(230,230,245,0.6)' })
 
     // desks: the boss on top, then every cell
     const desks: Array<[Person | undefined, Geo, string]> = [[built.boss, L.boss, built.boss.name]]
+    for (const h of built.heads) { const g = L.cells.get(h.key); if (g) desks.push([h, g, h.name]) }
     for (const fl of L.floors) for (const cell of fl.def.cells) { const g = L.cells.get(cell.key); if (g) desks.push([cell.person, g, cell.name]) }
     for (const [p, geo, name] of desks) {
       const d = p ? now_.get(p.key)! : undefined, m = p ? memo.get(p.key)! : undefined
@@ -751,25 +805,45 @@ export function mountFloors(scene: HTMLCanvasElement, overlay: HTMLCanvasElement
       const hip = geo.sy - f.shin
       drawChair(c, room, f, geo.sx, geo.sy)
       const person = () => blit(c, sprite(f, d!.pose, d!.pose === 'type' ? Math.floor(t * 5) % 2 : 0, p!.grade, p!.look, work && d!.icon !== 'think'), geo.sx, hip, false, false)
-      if (atDesk && d!.pose !== 'sleep') person()
+      // a desk never called stays empty: the chair and the name plate wait, nobody sits
+      const seated = atDesk && !p!.waiting
+      if (seated && d!.pose !== 'sleep') person()
       const scr = drawDesk(c, room, f, geo.sx, geo.sy, !!geo.wide, work, d?.icon ?? '', atDesk && d!.icon === 'coffee', geo === L.boss ? arrived : 0, t)
-      if (atDesk && d!.pose === 'sleep') person()
+      if (seated && d!.pose === 'sleep') person()
       if (d?.place === 'gone' && !(m?.trip && t - m.trip.t0 < WALK)) homeSign(c, geo.sx + f.thigh + 1, geo.sy - f.shin - deskH(f))
       if (work) lights.push({ kind: 'screen', x: scr.mx, y: scr.my, bash: d!.icon === 'bash' })
-      if (atDesk) lights.push({ kind: 'lamp', x: geo.sx + 16, y: geo.top + 30 })
+      if (seated) lights.push({ kind: 'lamp', x: geo.sx + 16, y: geo.top + 30 })
       if (atDesk && d!.icon) bubbles.push({ icon: d!.icon, x: geo.sx + 2, y: geo.top + 21 })
       const cwid = geo.wide ? FL.cw * 2 : FL.cw, iy = geo.top - FL.info
       if (p && d) {
         const moving = m?.trip && t - m.trip.t0 < WALK
         const icon = moving ? (tripPhase(m!.trip!.from === 'desk', (t - m!.trip!.t0) / WALK).name === 'ride' ? 'lift' : 'walk') : d.place === 'couch' ? 'rest' : d.icon
         const text = moving ? (m!.trip!.to === 'desk' ? 'идёт к столу' : m!.trip!.to === 'gone' ? 'уходит домой' : 'идёт в холл') : d.text
-        if (icon) glyph(c, icon, geo.x + 2, iy + 1.5)
-        labels.push({ x: geo.x + 9, y: iy + 1, text, px: 3.6, color: work ? ICON_COLOR[d.icon] ?? '#ffffff' : 'rgba(235,235,250,0.62)', align: 'left', w: work ? 600 : 400, maxw: cwid - 10 })
+        // icons and figures glow only while at work
+        if (icon) glyph(c, icon, geo.x + 2, iy + 1.5, work ? undefined : DIM)
+        // one who waits to be called has nothing to report: the empty desk says it
+        if (!p.waiting) labels.push({ x: geo.x + 9, y: iy + 1, text, px: 3.6, color: work ? ICON_COLOR[d.icon] ?? '#ffffff' : 'rgba(235,235,250,0.62)', align: 'left', w: work ? 600 : 400, maxw: cwid - 10 })
         if (!p.waiting) {
-          labels.push({ x: geo.x + 2, y: iy + 7.3, text: p.model, px: 3.4, color: atDesk && d.pose !== 'sleep' ? MODEL_COLOR[p.grade] : 'rgba(235,235,250,0.45)', align: 'left', w: 600 })
-          const cost = p.boss ? st.producer.cost : p.agent!.cost
-          banknote(c, geo.x + cwid - 9, iy + 7.6)
-          labels.push({ x: geo.x + cwid - 10, y: iy + 7.3, text: money(cost), px: 3.4, color: GOLD, align: 'right', w: 600 })
+          // second line: the clock and its time at the left, the banknote and the money at the right;
+          // the model's name only where the cell is wide — a narrow desk shows it by the outfit
+          const px = geo.wide ? 3.4 : 3.1
+          let lx = geo.x + 2
+          // fixed slots, not measured text: the icon and its figure keep the same gap at any scale
+          if (d.time && !moving) {
+            glyph(c, 'clock', lx, iy + 7.8, work ? TIME_COLOR : DIM)
+            labels.push({ x: lx + 7, y: iy + 7.5, text: d.time, px, color: work ? TIME_COLOR : DIM, align: 'left', w: 600 })
+            lx += 25
+          }
+          const cost = money(p.boss ? (p.head ?? st.producer).cost : p.agent!.cost)
+          if (geo.wide) {
+            // a wide cell reads left to right: clock, model, banknote and the money
+            labels.push({ x: lx, y: iy + 7.3, text: p.model, px, color: atDesk && d.pose !== 'sleep' ? MODEL_COLOR[p.grade] : DIM, align: 'left', w: 600, maxw: 20 })
+            lx += 24
+          } else {
+            lx = geo.x + cwid - 24
+          }
+          banknote(c, lx, iy + 7.6)
+          labels.push({ x: lx + 9, y: iy + 7.5, text: cost, px, color: GOLD, align: 'left', w: 600 })
         }
         // salary drips in: while working, coins fly from the screen to the banknote
         if (work) {
