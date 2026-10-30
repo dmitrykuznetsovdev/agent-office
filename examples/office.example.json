@@ -1,8 +1,11 @@
 {
+  "v": 2,
+  "lang": "ru",
   "folder": "/path/to/your/project",
   "title": "МАСТЕРСКАЯ",
   "zones": [
     {
+      "id": "разведка",
       "name": "РАЗВЕДКА",
       "desks": [
         {
@@ -15,15 +18,17 @@
         },
         {
           "type": "my-plugin:investigator",
-          "name": "Сыщик",
+          "name": "Исследователь кода",
           "prop": "magnifier",
           "shirt": "#2f6f6a",
           "hair": "#2b1d14",
-          "skin": 2
+          "skin": 2,
+          "short": "Сыщик"
         }
       ]
     },
     {
+      "id": "разработка",
       "name": "РАЗРАБОТКА",
       "desks": [
         {
@@ -40,11 +45,13 @@
           "prop": "tablet",
           "shirt": "#7a3fb0",
           "hair": "#e05a8a",
-          "skin": 3
+          "skin": 3,
+          "locked": true
         }
       ]
     },
     {
+      "id": "качество",
       "name": "КАЧЕСТВО",
       "desks": [
         {

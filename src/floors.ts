@@ -4,7 +4,7 @@
 // Agents move only inside their own cell, along their floor's corridor and in the lift.
 
 import type { Agent, OfficeDesk, Studio } from './types'
-import { GUESTS, deskOf, money, roleName } from './office.js'
+import { GUESTS, deskName, deskOf, money } from './office.js'
 
 // ── data → people ──────────────────────────────────────────────────────────
 type Grade = 'intern' | 'middle' | 'senior' | 'lead'
@@ -60,9 +60,9 @@ function building(st: Studio, now: number): { boss: Person; floors: FloorDef[] }
   const office = st.office
   const mainDesk = deskOf(office, 'main')
   const [bg, bm] = gradeOf(st.producer.model)
-  const boss: Person = { key: 'boss', name: roleName('main', office), grade: bg, model: bm, boss: true, look: lookOf('boss', mainDesk, '#3b3f8f', true) }
+  const boss: Person = { key: 'boss', name: deskName('main', office), grade: bg, model: bm, boss: true, look: lookOf('boss', mainDesk, '#3b3f8f', true) }
   const floors: FloorDef[] = office.zones
-    .map(z => ({ name: z.name, home: 0, cells: z.desks.filter(d => d.type !== 'main').map(d => ({ key: d.type, name: d.name } as Cell)) }))
+    .map(z => ({ name: z.name, home: 0, cells: z.desks.filter(d => d.type !== 'main').map(d => ({ key: d.type, name: d.short ?? d.name } as Cell)) }))
   const free: FloorDef = { name: 'ФРИЛАНС', cells: [], free: true, home: 0 }
   const gone = (a: Agent) => !a.isWorking && now - a.endedAt >= AWAY
   // at work first, then home, newest first: a desk goes to whoever is here
@@ -72,7 +72,7 @@ function building(st: Studio, now: number): { boss: Person; floors: FloorDef[] }
     const desk = deskOf(office, a.type)
     const own = desk && desk.type !== 'main' ? desk : undefined
     const [grade, model] = gradeOf(a.model)
-    const name = roleName(a.type, office)
+    const name = deskName(a.type, office)
     // a desk's owner looks the same every time they are called
     const person: Person = { key: a.id, name, grade, model, boss: false, agent: a, desk: !!own, look: lookOf(own ? own.type : a.id, own, GUESTS[a.type]?.shirt ?? '#5a6a8a') }
     const fi = own ? office.zones.findIndex(z => z.desks.includes(own)) : -1

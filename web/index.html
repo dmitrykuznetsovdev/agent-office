@@ -309,6 +309,7 @@ async function pollSessions() {
 // Пересобрать можно сразу — прежний офис сервер сохраняет, его можно вернуть.
 const clockOf = ms => { const s = Math.max(0, Math.round(ms / 1000)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}` }
 const RECENT = 15 * 60e3   // итог генерации висит столько, пока его не закрыли
+const STAGES = { queue: 'жду, пока соберётся другой офис', start: 'запускаю claude', answer: 'claude раздаёт должности и столы' }
 let ticking = 0
 
 function seenKey(o) { return 'office.seen.' + o.folder }
@@ -331,16 +332,20 @@ function drawBanner(o) {
   const close = '<button class="mini" data-act="seen" title="Скрыть">×</button>'
   let html = ''
   if (running) {
-    html = `<span class="spin"></span>Собираю офис для ${esc(place)}: claude раздаёт должности и столы · ${clockOf(Date.now() - job.started)} <span class="dim">из ${clockOf(job.timeout * 1000)}</span>`
+    html = `<span class="spin"></span>Собираю офис для ${esc(place)}: ${STAGES[job.stage] ?? STAGES.answer} · ${clockOf(Date.now() - job.started)} <span class="dim">из ${clockOf(job.timeout * 1000)}</span>`
   } else if (fresh && job.status === 'failed') {
     html = `<b class="bad">Не собралось.</b> ${esc(job.error)}. Офис остался прежним. ${close}`
   } else if (fresh && job.status === 'cancelled') {
     html = `Отменено, офис остался прежним. ${close}`
   } else if (fresh && job.status === 'done') {
-    html = `<b class="good">Офис пересобран</b> за ${clockOf(job.ended - job.started)}.` +
+    const sum = job.summary ?? {}
+    const did = [sum.moved && `пересели: ${sum.moved}`, sum.renamed && `новые должности: ${sum.renamed}`, sum.added && `новые столы: ${sum.added}`].filter(Boolean).join(', ')
+    html = (job.mode === 'add' ? `<b class="good">В штате пополнение:</b> ${esc(job.added.join(', '))}.` : `<b class="good">Офис пересобран</b> за ${clockOf(job.ended - job.started)}${did ? ': ' + did : ', всё осталось на местах'}.`) +
       (job.canUndo ? ' <button class="mini" data-act="undo">Вернуть прежний</button>' : '') + ` ${close}`
   } else if (fresh && job.status === 'undone') {
     html = `Вернул прежний офис. ${close}`
+  } else if (o.hidden) {
+    html = `<span class="dim">Эта сессия видит не весь штат: столов вне её состава — ${o.hidden}.</span>`
   } else if (!o.saved) {
     html = `Для ${esc(place)} офиса ещё нет: столы расставлены по плагинам, должности из названий агентов.`
   }

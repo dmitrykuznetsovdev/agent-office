@@ -31,6 +31,12 @@ export function roleName(type: string, office?: Office): string {
   return key.length > 12 ? key.slice(0, 11) + '…' : key
 }
 
+// The label on a desk: the short form where the full title does not fit.
+export function deskName(type: string, office?: Office): string {
+  const desk = office && deskOf(office, type === 'producer' ? 'main' : type)
+  return desk?.short ?? roleName(type, office)
+}
+
 export function money(usd: number): string {
   return '$' + (usd < 10 ? usd.toFixed(2) : usd < 100 ? usd.toFixed(1) : Math.round(usd).toString())
 }

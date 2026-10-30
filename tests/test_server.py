@@ -1,6 +1,7 @@
 import datetime
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -680,18 +681,39 @@ class LedgerCodexTest(unittest.TestCase):
 FAKE_OK = '''#!/usr/bin/env python3
 import json, sys
 sys.stdin.read()
-print(json.dumps({"is_error": False, "structured_output": {
+print(json.dumps({"type": "result", "is_error": False, "structured_output": {
     "title": "Новый", "boss": {"name": "Тимлид", "prop": "crown"},
     "zones": [{"name": "код", "desks": [{"type": "kit:builder", "name": "Сборщик", "prop": "box"}]}], "guests": []}}))
 '''
 FAKE_LOGGED_OUT = '''#!/usr/bin/env python3
 import json, sys
 sys.stdin.read()
-print(json.dumps({"is_error": True, "result": "Not logged in · Please run /login"}))
+print(json.dumps({"type": "result", "is_error": True, "result": "Not logged in · Please run /login"}))
 sys.exit(1)
 '''
 FAKE_STUCK = '''#!/usr/bin/env python3
 import time
+time.sleep(30)
+'''
+
+
+FAKE_ORPHAN = '''#!/bin/sh
+sleep 30 &
+echo $! > "$0.child"
+wait
+'''
+FAKE_NO_NETWORK = '''#!/usr/bin/env python3
+import json, sys, time
+sys.stdin.read()
+print(json.dumps({"type": "system", "subtype": "init"}), flush=True)
+print(json.dumps({"type": "system", "subtype": "api_retry", "error": "unknown"}), flush=True)
+print(json.dumps({"type": "system", "subtype": "api_retry", "error": "unknown"}), flush=True)
+time.sleep(30)
+'''
+FAKE_SILENT = '''#!/usr/bin/env python3
+import json, sys, time
+sys.stdin.read()
+print(json.dumps({"type": "system", "subtype": "init"}), flush=True)
 time.sleep(30)
 '''
 
@@ -703,14 +725,20 @@ class GenerationTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
         self.data, server.DATA = server.DATA, self.dir.name
-        self.find, self.timeout = server.find_claude, server.GEN_TIMEOUT
+        self.find, self.timeout, self.quiet = server.find_claude, server.GEN_TIMEOUT, server.GEN_QUIET
+        self.config, server.CLAUDE_DIR = server.CLAUDE_DIR, self.dir.name
+        self.logs, server.PROJECTS = server.PROJECTS, os.path.join(self.dir.name, 'нет')
         server.JOBS.clear()
 
     def tearDown(self):
-        for job in server.JOBS.values():
-            if job.get('proc') and job['proc'].poll() is None:
-                job['proc'].kill()
-        server.DATA, server.find_claude, server.GEN_TIMEOUT = self.data, self.find, self.timeout
+        server.stop_jobs()
+        for job in list(server.JOBS.values()):
+            for _ in range(100):
+                if job['status'] != 'running':
+                    break
+                time.sleep(0.02)
+        server.DATA, server.find_claude, server.GEN_TIMEOUT, server.GEN_QUIET = self.data, self.find, self.timeout, self.quiet
+        server.CLAUDE_DIR, server.PROJECTS = self.config, self.logs
         self.dir.cleanup()
 
     def fake(self, body):
@@ -780,6 +808,510 @@ class GenerationTest(unittest.TestCase):
         self.fake(FAKE_STUCK)
         server.start_office(self.folder, self.roster)
         self.assertIsNone(server.start_office(self.folder, self.roster))
+
+    def child_of_fake(self):
+        path = server.find_claude() + '.child'
+        for _ in range(100):
+            if os.path.exists(path) and open(path).read().strip():
+                return int(open(path).read())
+            time.sleep(0.02)
+        self.fail('fake claude did not start its child')
+
+    def alive(self, pid):
+        for _ in range(100):
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                return False
+            time.sleep(0.02)
+        return True
+
+    def test_cancel_takes_the_children_of_claude_too(self):
+        self.fake(FAKE_ORPHAN)
+        server.start_office(self.folder, self.roster)
+        child = self.child_of_fake()
+        self.assertTrue(server.cancel_office(self.folder))
+        self.assertEqual(self.wait()['status'], 'cancelled')
+        self.assertFalse(self.alive(child))
+
+    def test_timeout_does_not_wait_for_the_children_of_claude(self):
+        self.fake(FAKE_ORPHAN)
+        server.GEN_TIMEOUT = 0.3
+        server.start_office(self.folder, self.roster)
+        child = self.child_of_fake()
+        self.assertEqual(self.wait()['status'], 'failed')
+        self.assertFalse(self.alive(child))
+
+    def test_retries_against_the_api_fail_at_once_and_name_the_network(self):
+        self.fake(FAKE_NO_NETWORK)
+        server.start_office(self.folder, self.roster)
+        view = self.wait()
+        self.assertEqual(view['status'], 'failed')
+        self.assertIn('прокси', view['error'])
+
+    def test_silence_after_the_start_is_a_network_failure_too(self):
+        self.fake(FAKE_SILENT)
+        server.GEN_QUIET = 0.3
+        server.start_office(self.folder, self.roster)
+        view = self.wait()
+        self.assertEqual(view['status'], 'failed')
+        self.assertIn('прокси', view['error'])
+
+    def test_stage_tells_what_generation_waits_for(self):
+        self.fake(FAKE_SILENT)
+        server.start_office(self.folder, self.roster)
+        for _ in range(100):
+            if server.job_view(self.folder)['stage'] == 'answer':
+                return
+            time.sleep(0.02)
+        self.fail('stage never moved to answer')
+
+    def test_generations_go_one_at_a_time(self):
+        self.fake(FAKE_STUCK)
+        server.start_office(self.folder, self.roster)
+        server.start_office('/work/other', self.roster)
+        time.sleep(0.2)
+        self.assertEqual(server.job_view('/work/other')['stage'], 'queue')
+        server.cancel_office('/work/other')
+        for _ in range(100):
+            if server.job_view('/work/other')['status'] == 'cancelled':
+                return
+            time.sleep(0.02)
+        self.fail('queued generation was not cancelled')
+
+    def test_stopping_the_server_stops_claude(self):
+        self.fake(FAKE_ORPHAN)
+        server.start_office(self.folder, self.roster)
+        child = self.child_of_fake()
+        server.stop_jobs()
+        self.assertFalse(self.alive(child))
+
+    def test_failed_write_keeps_the_office(self):
+        self.saved('СТАРЫЙ')
+        real, server.json.dump = server.json.dump, lambda *a, **kw: 1 / 0
+        try:
+            with self.assertRaises(ZeroDivisionError):
+                server.write_office(self.folder, {'title': 'НОВЫЙ'})
+        finally:
+            server.json.dump = real
+        self.assertEqual(server.load_office(self.folder)['title'], 'СТАРЫЙ')
+
+
+AGENT_MD = '''---
+name: %s
+description: %s
+model: opus
+---
+
+# %s
+
+Находит лучшие куски выпуска и передаёт их Сценаристу.
+'''
+
+
+class Team:
+    """Папка конфигурации Claude Code с плагинами и агентами."""
+
+    def __init__(self, root):
+        self.root = root
+        self.claude = os.path.join(root, 'claude')
+        self.projects = os.path.join(self.claude, 'projects')
+        self.folder = os.path.join(root, 'work', 'app')
+        os.makedirs(self.projects)
+        os.makedirs(os.path.join(self.folder, '.claude'))
+        self.installed, self.enabled = {}, {}
+        self.saved = server.CLAUDE_DIR, server.PROJECTS, server.DATA
+        server.CLAUDE_DIR, server.PROJECTS, server.DATA = self.claude, self.projects, os.path.join(root, 'data')
+        self.flush()
+
+    def close(self):
+        server.CLAUDE_DIR, server.PROJECTS, server.DATA = self.saved
+
+    def flush(self):
+        os.makedirs(os.path.join(self.claude, 'plugins'), exist_ok=True)
+        with open(os.path.join(self.claude, 'plugins', 'installed_plugins.json'), 'w') as f:
+            json.dump({'plugins': self.installed}, f)
+        with open(os.path.join(self.claude, 'settings.json'), 'w') as f:
+            json.dump({'enabledPlugins': self.enabled}, f)
+
+    def plugin(self, name, agents, scope='user', enabled=True, skill=''):
+        path = os.path.join(self.root, 'plugins', name)
+        os.makedirs(os.path.join(path, 'agents'))
+        for key, (role, desc) in agents.items():
+            with open(os.path.join(path, 'agents', key + '.md'), 'w') as f:
+                f.write(AGENT_MD % (key, desc, role))
+        if skill:
+            os.makedirs(os.path.join(path, 'skills', 'lead'))
+            with open(os.path.join(path, 'skills', 'lead', 'SKILL.md'), 'w') as f:
+                f.write(skill)
+        entry = {'scope': scope, 'installPath': path}
+        if scope == 'project':
+            entry['projectPath'] = self.folder
+        self.installed[name + '@market'] = [entry]
+        self.enabled[name + '@market'] = enabled
+        self.flush()
+
+    def session(self, sid, roster, age=0, cwd=None):
+        pdir = os.path.join(self.projects, re.sub(r'[^A-Za-z0-9]', '-', cwd or self.folder))
+        os.makedirs(pdir, exist_ok=True)
+        path = os.path.join(pdir, sid + '.jsonl')
+        with open(path, 'w') as f:
+            f.write(line(type='attachment', attachment={
+                'type': 'agent_listing_delta', 'addedTypes': list(roster),
+                'addedLines': ['- %s: %s' % (t, d) for t, d in roster.items()]}))
+            f.write(line(type='user', timestamp=iso(time.time() - age), cwd=cwd or self.folder, message={'content': 'привет'}))
+        os.utime(path, (time.time() - age, time.time() - age))
+        return pdir, path
+
+    def called(self, pdir, sid, kinds):
+        sub = os.path.join(pdir, sid, 'subagents')
+        os.makedirs(sub, exist_ok=True)
+        for i, kind in enumerate(kinds):
+            with open(os.path.join(sub, 'agent-%d.jsonl' % i), 'w') as f:
+                f.write(line(type='user', timestamp=iso(1000 + i), cwd=self.folder, message={'content': 'x'}))
+            with open(os.path.join(sub, 'agent-%d.meta.json' % i), 'w') as f:
+                json.dump({'agentType': kind}, f)
+
+
+class TeamCase(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.team = Team(self.dir.name)
+        self.folder = self.team.folder
+        server.TAILS.clear()
+        server.JOBS.clear()
+        server.AUTO_TRIED.clear()
+
+    def tearDown(self):
+        server.stop_jobs()
+        for job in list(server.JOBS.values()):
+            for _ in range(100):
+                if job['status'] != 'running':
+                    break
+                time.sleep(0.02)
+        self.team.close()
+        server.TAILS.clear()
+        self.dir.cleanup()
+
+    def seats(self, office):
+        return {d['type']: z['name'] for z in office['zones'] for d in z['desks']}
+
+
+class AgentFilesTest(TeamCase):
+    def test_plugin_agent_brings_role_stage_and_instructions(self):
+        self.team.plugin('reels', {'scout': ('Скаут', 'Скаут конвейера — план.')}, scope='project')
+        info = server.agent_files(self.folder)['reels:scout']
+        self.assertEqual((info['role'], info['desc'], info['model'], info['scope']), ('Скаут', 'Скаут конвейера — план.', 'opus', 'project'))
+        self.assertIn('Находит лучшие куски', info['prompt'])
+
+    def test_disabled_plugin_has_no_staff(self):
+        self.team.plugin('off', {'scout': ('Скаут', 'x')}, enabled=False)
+        self.assertEqual(server.agent_files(self.folder), {})
+
+    def test_plugin_of_another_project_has_no_staff_here(self):
+        self.team.plugin('alien', {'scout': ('Скаут', 'x')}, scope='project')
+        self.team.installed['alien@market'][0]['projectPath'] = '/work/other'
+        self.team.flush()
+        self.assertEqual(server.agent_files(self.folder), {})
+
+    def test_project_setting_enables_a_plugin(self):
+        self.team.plugin('kit', {'scout': ('Скаут', 'x')}, scope='project', enabled=False)
+        with open(os.path.join(self.folder, '.claude', 'settings.json'), 'w') as f:
+            json.dump({'enabledPlugins': {'kit@market': True}}, f)
+        self.assertIn('kit:scout', server.agent_files(self.folder))
+
+    def test_loose_agents_of_project_and_user(self):
+        for root, name in ((os.path.join(self.folder, '.claude'), 'near'), (self.team.claude, 'far')):
+            os.makedirs(os.path.join(root, 'agents'), exist_ok=True)
+            with open(os.path.join(root, 'agents', name + '.md'), 'w') as f:
+                f.write(AGENT_MD % (name, 'x', name))
+        files = server.agent_files(self.folder)
+        self.assertEqual((files['near']['scope'], files['far']['scope']), ('project', 'user'))
+
+
+class StaffTest(TeamCase):
+    def test_newest_session_of_the_folder_is_the_staff(self):
+        self.team.session('old', {'kit:a': 'старый'}, age=500)
+        self.team.session('new', {'kit:a': 'новый', 'kit:b': ''}, age=5)
+        self.assertEqual(server.newest_roster(self.folder), {'kit:a': 'новый', 'kit:b': ''})
+
+    def test_session_without_a_list_does_not_empty_the_staff(self):
+        self.team.session('old', {'kit:a': ''}, age=500)
+        self.team.session('new', {}, age=5)
+        self.assertEqual(list(server.newest_roster(self.folder)), ['kit:a'])
+
+    def test_worktree_sessions_count(self):
+        self.team.session('wt', {'kit:a': ''}, cwd=self.folder + '/.claude/worktrees/x')
+        self.assertEqual(list(server.newest_roster(self.folder)), ['kit:a'])
+
+    def test_agent_from_a_file_joins_before_any_session_lists_it(self):
+        self.team.plugin('kit', {'b': ('Новый', 'из файла')}, scope='project')
+        roster, files = server.staff_of(self.folder, {'kit:a': 'из журнала'})
+        self.assertEqual(roster, {'kit:a': 'из журнала', 'kit:b': 'из файла'})
+        self.assertIn('kit:b', files)
+
+    def test_usage_counts_calls_and_order(self):
+        pdir, _ = self.team.session('s', {'kit:a': ''})
+        self.team.called(pdir, 's', ['kit:a', 'kit:b', 'kit:a'])
+        counts, pairs = server.usage_of(self.folder)
+        self.assertEqual(counts['kit:a'], 2)
+        self.assertEqual(pairs[('kit:a', 'kit:b')], 1)
+
+
+def raw_office(zones, boss='Тимлид', title='Команда'):
+    return {'title': title, 'boss': {'name': boss, 'prop': 'crown'}, 'guests': [],
+            'zones': [{'name': name, 'desks': desks} for name, desks in zones]}
+
+
+def desk(t, name, short=None, prop='box'):
+    return dict(type=t, name=name, short=short or name, prop=prop)
+
+
+class MeaningTest(TeamCase):
+    def test_role_from_the_agent_file_beats_the_model_and_the_old_name(self):
+        files = {'k:m': {'role': 'Моушн-дизайнер', 'scope': 'project', 'plugin': 'k'}}
+        old = {'zones': [{'name': 'МОНТАЖ', 'desks': [{'type': 'k:m', 'name': 'Моушн', 'prop': 'box'}]}], 'guests': {}}
+        got = server.tidy(self.folder, {'k:m': ''}, raw_office([('Монтаж', [desk('k:m', 'Аниматор', 'Моушн')])]), old, files)
+        d = [d for d in got['zones'][0]['desks'] if d['type'] == 'k:m'][0]
+        self.assertEqual((d['name'], d['short']), ('Моушн-дизайнер', 'Моушн'))
+
+    def test_old_name_stays_when_no_file_names_the_agent(self):
+        old = {'zones': [{'name': 'КОД', 'desks': [{'type': 'k:b', 'name': 'Правщик', 'prop': 'box'}]}], 'guests': {}}
+        got = server.tidy(self.folder, {'k:b': ''}, raw_office([('Код', [desk('k:b', 'Сборщик')])]), old)
+        self.assertIn('Правщик', [d['name'] for d in got['zones'][0]['desks']])
+
+    def test_locked_desk_keeps_its_floor_and_name(self):
+        old = {'zones': [{'id': 'моё', 'name': 'МОЁ', 'desks': [{'type': 'k:b', 'name': 'Мастер', 'prop': 'box', 'locked': True}]}], 'guests': {}}
+        got = server.tidy(self.folder, {'k:b': '', 'k:c': ''}, raw_office([('Код', [desk('k:b', 'Сборщик'), desk('k:c', 'Чистильщик')])]), old)
+        self.assertEqual(self.seats(got)['k:b'], 'МОЁ')
+        self.assertEqual([d['name'] for z in got['zones'] for d in z['desks'] if d['type'] == 'k:b'], ['Мастер'])
+
+    def test_adding_moves_nobody(self):
+        old = {'title': 'ШТАБ', 'zones': [{'id': 'код', 'name': 'КОД', 'desks': [{'type': 'main', 'name': 'Тимлид', 'prop': 'crown'}, {'type': 'k:b', 'name': 'Правщик', 'prop': 'box'}]}], 'guests': {}}
+        raw = raw_office([('Проверка', [desk('k:b', 'Другой'), desk('k:r', 'Ревьюер')])], boss='Босс', title='НОВОЕ')
+        got = server.tidy(self.folder, {'k:b': '', 'k:r': ''}, raw, old, mode='add')
+        self.assertEqual(self.seats(got), {'main': 'КОД', 'k:b': 'КОД', 'k:r': 'ПРОВЕРКА'})
+        self.assertEqual(got['title'], 'ШТАБ')
+        self.assertEqual([d['name'] for d in got['zones'][0]['desks']], ['Тимлид', 'Правщик'])
+
+    def test_common_tools_sit_apart_from_the_team_of_the_project(self):
+        files = {'p:a': {'role': 'Скаут', 'scope': 'project', 'plugin': 'p'}, 'c:b': {'role': '', 'scope': 'user', 'plugin': 'c'}}
+        got = server.tidy(self.folder, {'p:a': '', 'c:b': ''}, raw_office([('Работа', [desk('p:a', 'Скаут'), desk('c:b', 'Сборщик')])]), None, files)
+        self.assertEqual(self.seats(got)['c:b'], 'ПОДДЕРЖКА')
+        self.assertEqual(got['zones'][-1]['name'], 'ПОДДЕРЖКА')
+
+    def test_without_a_team_common_tools_are_the_team(self):
+        files = {'c:b': {'role': '', 'scope': 'user', 'plugin': 'c'}}
+        got = server.tidy(self.folder, {'c:b': ''}, raw_office([('Работа', [desk('c:b', 'Сборщик')])]), None, files)
+        self.assertEqual(self.seats(got)['c:b'], 'РАБОТА')
+
+    def test_lead_skill_names_the_boss(self):
+        table = 'Вызывает `scout`, `editor`, `critic`.'
+        self.team.plugin('p', {'scout': ('Скаут', ''), 'editor': ('Монтажёр', ''), 'critic': ('Критик', '')}, scope='project', skill='# Продюсер\n\n' + table)
+        lead = server.find_lead(self.folder, server.agent_files(self.folder))
+        self.assertEqual(lead['role'], 'Продюсер')
+        self.assertIn(table, lead['text'])
+        got = server.tidy(self.folder, {'p:scout': ''}, raw_office([('Работа', [desk('p:scout', 'Скаут')])]), None, server.agent_files(self.folder), lead=lead)
+        self.assertEqual(got['zones'][0]['desks'][0]['name'], 'Продюсер')
+
+    def test_language_of_the_office_decides_what_is_a_foreign_name(self):
+        got = server.tidy(self.folder, {'k:b': ''}, raw_office([('Build', [desk('k:b', 'Builder')])], boss='Lead', title='Crew'), {'lang': 'en', 'zones': [], 'guests': {}})
+        self.assertEqual((got['lang'], got['title'], got['zones'][0]['name']), ('en', 'CREW', 'BUILD'))
+        self.assertEqual([d['name'] for d in got['zones'][0]['desks']], ['Lead', 'Builder'])
+
+    def test_foreign_title_from_the_model_keeps_the_old_sign(self):
+        got = server.tidy(self.folder, {'k:b': ''}, raw_office([('Код', [desk('k:b', 'Сборщик')])], title='Smart TV'), {'title': 'ТЕЛЕВИЗОР', 'zones': [], 'guests': {}})
+        self.assertEqual(got['title'], 'ТЕЛЕВИЗОР')
+
+    def test_changes_are_counted(self):
+        old = {'zones': [{'name': 'А', 'desks': [{'type': 'x', 'name': 'Икс'}, {'type': 'y', 'name': 'Игрек'}]}]}
+        new = {'zones': [{'name': 'А', 'desks': [{'type': 'x', 'name': 'Икс 2'}]}, {'name': 'Б', 'desks': [{'type': 'y', 'name': 'Игрек'}, {'type': 'z', 'name': 'Зет'}]}]}
+        self.assertEqual(server.changes(old, new), {'moved': 1, 'renamed': 1, 'added': 1})
+
+    def test_old_file_gets_ids_and_language_on_reading(self):
+        os.makedirs(os.path.dirname(server.office_path(self.folder)))
+        with open(server.office_path(self.folder), 'w') as f:
+            json.dump({'folder': self.folder, 'title': 'Т', 'zones': [{'name': 'РАЗВЕДКА', 'desks': []}], 'guests': {}}, f)
+        office = server.load_office(self.folder)
+        self.assertEqual((office['v'], office['lang'], office['zones'][0]['id']), (2, 'ru', 'разведка'))
+
+    def test_manifest_of_the_project_decides(self):
+        with open(os.path.join(self.folder, '.claude', 'office.json'), 'w') as f:
+            json.dump({'title': 'Студия', 'boss': {'name': 'Шеф'}, 'zones': [{'name': 'Съёмка', 'desks': [{'type': 'k:c', 'name': 'Оператор'}]}]}, f)
+        old = server.apply_manifest(None, self.folder)
+        got = server.tidy(self.folder, {'k:c': '', 'k:d': ''}, raw_office([('Прочее', [desk('k:c', 'Камера'), desk('k:d', 'Дизайнер')])]), old)
+        self.assertEqual(got['zones'][0]['name'], 'СЪЁМКА')
+        self.assertEqual(got['title'], 'СТУДИЯ')
+        self.assertEqual([d['name'] for d in got['zones'][0]['desks']], ['Шеф', 'Оператор'])
+
+    def test_prompt_carries_instructions_usage_and_current_office(self):
+        self.team.plugin('p', {'scout': ('Скаут', 'план.')}, scope='project')
+        pdir, _ = self.team.session('s', {'p:scout': 'план.'})
+        self.team.called(pdir, 's', ['p:scout'])
+        with open(os.path.join(self.folder, 'CLAUDE.md'), 'w') as f:
+            f.write('Заметка про кошек.\nАгенты работают конвейером: сначала скаут.\n')
+        roster, files = server.staff_of(self.folder, {'p:scout': 'план.'})
+        old = {'title': 'ШТАБ', 'zones': [{'id': 'поиск', 'name': 'ПОИСК', 'desks': [{'type': 'p:scout', 'name': 'Скаут', 'prop': 'box'}]}], 'guests': {}}
+        text = server.office_prompt(self.folder, roster, files, old, 'full')
+        self.assertIn('Находит лучшие куски', text)
+        self.assertIn('вызовов: 1', text)
+        self.assertIn('Агенты работают конвейером', text)
+        self.assertNotIn('кошек', text)
+        self.assertIn('ПОИСК', text)
+
+    def test_prompt_for_adding_names_only_the_newcomers(self):
+        old = {'title': 'ШТАБ', 'pending': ['k:n'], 'zones': [], 'guests': {}}
+        text = server.office_prompt(self.folder, {'k:n': ''}, {}, old, 'add')
+        self.assertIn('Новые агенты: k:n', text)
+
+
+class AutoStaffTest(TeamCase):
+    def setUp(self):
+        super().setUp()
+        self.find, self.generated = server.find_claude, []
+        self.start = server.start_office
+        server.start_office = lambda folder, roster, mode='full': self.generated.append((folder, mode)) or {}
+
+    def tearDown(self):
+        server.find_claude, server.start_office = self.find, self.start
+        super().tearDown()
+
+    def saved(self, **more):
+        server.write_office(self.folder, dict({'folder': self.folder, 'title': 'ШТАБ', 'v': 2, 'lang': 'ru', 'guests': {}, 'zones': [
+            {'id': 'код', 'name': 'КОД', 'desks': [{'type': 'main', 'name': 'Тимлид', 'prop': 'crown'}, {'type': 'p:a', 'name': 'Скаут', 'prop': 'box'}]}]}, **more))
+
+    def test_new_agent_gets_a_desk_at_once_and_a_generation(self):
+        self.saved()
+        self.team.session('s', {'p:a': '', 'p:reviewer': 'проверяет'})
+        server.watch_staff()
+        office = server.load_office(self.folder)
+        self.assertEqual(self.seats(office)['p:reviewer'], 'КОД')  # next to the colleagues from the same plugin
+        self.assertEqual(office['pending'], ['p:reviewer'])
+        self.assertEqual(self.generated, [(self.folder, 'add')])
+
+    def test_agent_dropped_in_as_a_file_is_noticed_without_a_session(self):
+        self.saved()
+        self.team.session('s', {'p:a': ''})
+        self.team.plugin('p', {'a': ('Скаут', ''), 'fresh': ('Новичок', 'x')}, scope='project')
+        server.watch_staff()
+        self.assertEqual(self.seats(server.load_office(self.folder))['p:fresh'], 'КОД')
+
+    def test_nothing_new_nothing_spent(self):
+        self.saved()
+        self.team.session('s', {'p:a': '', 'Explore': ''})
+        server.watch_staff()
+        self.assertEqual(self.generated, [])
+
+    def test_folder_without_an_office_is_not_generated_on_its_own(self):
+        self.team.session('s', {'p:a': ''})
+        server.watch_staff()
+        self.assertEqual(self.generated, [])
+        self.assertIsNone(server.load_office(self.folder))
+
+    def test_failed_generation_is_not_repeated_every_pass(self):
+        self.saved()
+        self.team.session('s', {'p:a': '', 'p:b': ''})
+        server.watch_staff()
+        server.watch_staff()
+        server.watch_staff()
+        self.assertEqual(len(self.generated), 1)
+
+    def test_office_can_opt_out(self):
+        self.saved(auto=False)
+        self.team.session('s', {'p:a': '', 'p:b': ''})
+        server.watch_staff()
+        self.assertEqual(self.generated, [])
+        self.assertNotIn('p:b', self.seats(server.load_office(self.folder)))
+
+    def test_old_session_does_not_touch_a_bigger_office(self):
+        self.saved()
+        self.team.session('old', {'kit:x': ''}, age=4000)
+        self.team.session('new', {'p:a': ''}, age=5)
+        server.watch_staff()
+        self.assertNotIn('kit:x', self.seats(server.load_office(self.folder)))
+
+
+class SessionViewTest(TeamCase):
+    def office(self):
+        server.write_office(self.folder, {'folder': self.folder, 'title': 'ШТАБ', 'v': 2, 'lang': 'ru', 'guests': {}, 'zones': [
+            {'id': 'а', 'name': 'А', 'desks': [{'type': 'main', 'name': 'Босс', 'prop': 'crown'}, {'type': 'k:a', 'name': 'Первый', 'prop': 'box'}]},
+            {'id': 'б', 'name': 'Б', 'desks': [{'type': 'k:b', 'name': 'Второй', 'prop': 'box'}]}]})
+
+    def test_session_shows_only_who_it_can_call(self):
+        self.office()
+        _, path = self.team.session('s', {'k:a': ''})
+        got = server.office_for(server.tail(path))
+        self.assertEqual(self.seats(got), {'main': 'А', 'k:a': 'А'})
+        self.assertEqual(got['hidden'], 1)
+
+    def test_agent_that_really_worked_keeps_the_desk(self):
+        self.office()
+        _, path = self.team.session('s', {'k:a': ''})
+        self.assertIn('k:b', self.seats(server.office_for(server.tail(path), ['k:b'])))
+
+    def test_session_without_a_list_shows_the_whole_office(self):
+        self.office()
+        _, path = self.team.session('s', {})
+        self.assertEqual(len(self.seats(server.office_for(server.tail(path)))), 3)
+
+
+class ClaudeEnvTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.env = dict(os.environ)
+        self.scutil = server.system_proxy
+        for key in list(os.environ):
+            if key.lower().endswith('_proxy'):
+                del os.environ[key]
+        server.system_proxy = lambda: {}
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self.env)
+        server.system_proxy = self.scutil
+        self.dir.cleanup()
+
+    def shell(self, body):
+        path = os.path.join(self.dir.name, 'sh')
+        with open(path, 'w') as f:
+            f.write('#!/bin/sh\n' + body)
+        os.chmod(path, 0o755)
+        os.environ['SHELL'] = path
+
+    def test_proxy_comes_from_the_users_shell(self):
+        self.shell('echo HTTPS_PROXY=http://proxy.test:1\necho OTHER=1\n')
+        env = server.claude_env('/bin/claude')
+        self.assertEqual(env['HTTPS_PROXY'], 'http://proxy.test:1')
+        self.assertNotIn('OTHER', env)
+        self.assertTrue(env['PATH'].startswith('/bin:'))
+
+    def test_proxy_already_set_wins(self):
+        os.environ['HTTPS_PROXY'] = 'http://own.test:2'
+        self.shell('echo HTTPS_PROXY=http://proxy.test:1\n')
+        self.assertEqual(server.claude_env('/bin/claude')['HTTPS_PROXY'], 'http://own.test:2')
+
+    def test_system_proxy_when_the_shell_has_none(self):
+        self.shell('echo OTHER=1\n')
+        server.system_proxy = lambda: {'HTTPS_PROXY': 'http://system.test:3'}
+        self.assertEqual(server.claude_env('/bin/claude')['HTTPS_PROXY'], 'http://system.test:3')
+
+    def test_broken_shell_is_not_fatal(self):
+        os.environ['SHELL'] = os.path.join(self.dir.name, 'нет')
+        self.assertNotIn('HTTPS_PROXY', server.claude_env('/bin/claude'))
+
+    def test_scutil_answer_is_read(self):
+        text = """<dictionary> {
+  HTTPEnable : 1
+  HTTPPort : 7890
+  HTTPProxy : 127.0.0.1
+  HTTPSEnable : 1
+  HTTPSPort : 7891
+  HTTPSProxy : 127.0.0.1
+}"""
+        self.assertEqual(server.read_scutil(text), {'HTTP_PROXY': 'http://127.0.0.1:7890', 'HTTPS_PROXY': 'http://127.0.0.1:7891'})
+
+    def test_scutil_without_proxy_gives_nothing(self):
+        self.assertEqual(server.read_scutil('<dictionary> {\n  HTTPEnable : 0\n}'), {})
 
 
 class WatchParentTest(unittest.TestCase):

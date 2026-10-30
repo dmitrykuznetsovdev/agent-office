@@ -11,13 +11,14 @@
   /api/stats?p=codex        траты по дням, моделям и папкам за всё время, почасово — за 5 недель;
                             p — один провайдер: claude или codex
   /api/state?s=<id>         офис одной сессии (руководитель, агенты, журнал)
-  POST /api/office?s=<id>   сгенерировать офис для папки сессии
+  POST /api/office?s=<id>   пересобрать офис папки сессии (новых агентов сервер сажает сам)
 """
 import glob
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -498,6 +499,17 @@ SHIRTS = ['#2f4f8f', '#c0583a', '#5a7a2e', '#8f2f3a', '#4b5a8a', '#3a7a4a', '#7a
           '#b08a2e', '#2f7a5a', '#c04a6a', '#8a6a3a', '#a0602a', '#2f6f6a', '#6b2d5c', '#5a5f6a']
 HAIRS = ['#2b1d14', '#1a1a1a', '#6b4a2b', '#c9a227', '#9a9a9a', '#3a2416', '#8a5a2b', '#e05a8a']
 GEN_TIMEOUT = 120  # с: большой офис собирается за 15–30 с; дольше — claude чего-то ждёт
+GEN_QUIET = 45     # с: после старта модель молчит дольше — до API не дошли
+GEN_RETRIES = 2    # столько повторов запроса подряд — связи нет, дальше не ждём
+GEN_SLOT = threading.Lock()  # генерации идут по одной
+GEN_BUDGET = '0.5'  # $ на одну генерацию: обычно хватает 4–8 центов
+NO_NETWORK = 'нет связи с API: проверьте интернет и прокси'
+STAFF_EVERY = 30   # с между проверками штата папок
+OFFICE_V = 2       # 2: у отделов id, у офиса язык, у столов short и locked
+LANG = 'ru'        # язык новых офисов; подписи живут в name и short, раскладка от языка не зависит
+SIGNS = {'ru': {'boss': 'Главный', 'other': 'ПРОЧИЕ', 'support': 'ПОДДЕРЖКА', 'language': 'по-русски, без латиницы (вместо QA — «Контролёр»)'},
+         'en': {'boss': 'Lead', 'other': 'OTHER', 'support': 'SUPPORT', 'language': 'in English'}}
+AUTO_TRIED = {}    # папка → новички, для которых генерация уже запускалась
 JOBS = {}  # папка → последняя генерация: status running|done|failed|cancelled, started, ended, error, proc
 
 
@@ -556,7 +568,7 @@ KINDS = [
     ('КАЧЕСТВО', ['review', 'critic', 'inspector', 'qa', 'test', 'audit', 'verif', 'lint', 'check', 'guardian']),
     ('ПОДДЕРЖКА', ['rescue', 'debug', 'fix', 'deploy', 'setup', 'support', 'ops', 'help', 'guide']),
 ]
-LATIN = re.compile('[A-Za-z]')
+FOREIGN = {'ru': re.compile('[A-Za-z]'), 'en': re.compile('[А-Яа-яЁё]')}
 
 
 def ru_name(t):
@@ -576,6 +588,20 @@ def kind_of(t, desc=''):
     return 'ПРОЧИЕ'
 
 
+def in_lang(text, lang):
+    """Подпись, если она на языке офиса; иначе пусто."""
+    text = ' '.join(str(text or '').split())
+    return text if text and not FOREIGN[lang].search(text) else ''
+
+
+def local_name(t, lang):
+    return ru_name(t) if lang == 'ru' else humanize(t)
+
+
+def zone_id(name):
+    return re.sub(r'\W+', '-', str(name).strip().lower()).strip('-')
+
+
 def auto_office(folder, roster, shirt='#3b3f8f'):
     """Офис без модели: отделы по ходу работы, должности по-русски из названий агентов."""
     order = [k for k, _ in KINDS] + ['ПРОЧИЕ']
@@ -585,18 +611,225 @@ def auto_office(folder, roster, shirt='#3b3f8f'):
             continue
         zones.setdefault(kind_of(t, desc or ''), []).append(dress({'type': t, 'name': ru_name(t)}))
     boss = dress({'type': 'main', 'name': 'Главный', 'prop': 'crown', 'shirt': shirt})
-    rows = [{'name': 'ГЛАВНЫЙ', 'desks': [boss]}] if not zones else []
+    rows = [{'id': 'главный', 'name': 'ГЛАВНЫЙ', 'desks': [boss]}] if not zones else []
     for i, name in enumerate(n for n in order if n in zones):
-        rows.append({'name': name, 'desks': ([boss] if i == 0 else []) + zones[name]})
-    return {'folder': folder, 'title': 'ОФИС · ' + os.path.basename(folder).upper(), 'zones': rows, 'guests': {}}
+        rows.append({'id': zone_id(name), 'name': name, 'desks': ([boss] if i == 0 else []) + zones[name]})
+    return {'v': OFFICE_V, 'lang': LANG, 'folder': folder, 'title': 'ОФИС · ' + os.path.basename(folder).upper(), 'zones': rows, 'guests': {}}
+
+
+def upgrade(office):
+    """Файл старого формата. На диск новый вид ляжет при следующей записи."""
+    office['v'] = OFFICE_V
+    office.setdefault('lang', LANG)
+    for z in office.get('zones') or []:
+        z.setdefault('id', zone_id(z.get('name', '')))
+    return office
 
 
 def load_office(folder):
     try:
         with open(office_path(folder)) as f:
-            return json.load(f)
+            return upgrade(json.load(f))
     except (OSError, ValueError):
         return None
+
+
+# ── Штат папки: кто в команде на самом деле ────────────────────────────────
+def read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def enabled_plugins(folder):
+    """Включённые плагины: настройки пользователя, проекта и локальные поверх."""
+    on = {}
+    for path in (os.path.join(CLAUDE_DIR, 'settings.json'), os.path.join(folder, '.claude', 'settings.json'),
+                 os.path.join(folder, '.claude', 'settings.local.json')):
+        on.update(read_json(path).get('enabledPlugins') or {})
+    return on
+
+
+def plugin_dirs(folder):
+    """Плагины, которые работают в этой папке: [(имя, путь, scope)]."""
+    on = enabled_plugins(folder)
+    out = []
+    for key, entries in (read_json(os.path.join(CLAUDE_DIR, 'plugins', 'installed_plugins.json')).get('plugins') or {}).items():
+        for e in entries:
+            own = e.get('scope') == 'user' or e.get('projectPath') == folder
+            if own and on.get(key) and e.get('installPath'):
+                out.append((key.split('@')[0], e['installPath'], 'user' if e.get('scope') == 'user' else 'project'))
+    return out
+
+
+def read_agent(path, scope, plugin=''):
+    """Файл агента: роль из заголовка, описание, инструкция."""
+    try:
+        with open(path) as f:
+            text = f.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+    m = re.match(r'---\n(.*?)\n---\n?', text, re.S)
+    head = dict(re.findall(r'^(\w+):\s*(.*)$', m.group(1), re.M)) if m else {}
+    body = text[m.end():] if m else text
+    role = re.search(r'^# (.+)$', body, re.M)
+    key = head.get('name') or os.path.basename(path)[:-3]
+    return {'type': plugin + ':' + key if plugin else key, 'role': role.group(1).strip() if role else '',
+            'desc': head.get('description', '').strip('"\''), 'model': head.get('model', ''), 'prompt': ' '.join(body.split()),
+            'scope': scope, 'plugin': plugin}
+
+
+def agent_files(folder):
+    """Агенты, описанные файлами: {тип: сведения}. Работают и до первой сессии, где они появятся в журнале."""
+    found = {}
+    sources = [(path, plugin, scope) for plugin, path, scope in plugin_dirs(folder)]
+    sources += [(CLAUDE_DIR, '', 'user'), (os.path.join(folder, '.claude'), '', 'project')]
+    for root, plugin, scope in sources:
+        for path in sorted(glob.glob(os.path.join(root, 'agents', '*.md'))):
+            info = read_agent(path, scope, plugin)
+            if info:
+                found[info['type']] = info
+    return found
+
+
+def journal_dirs(folder):
+    """Папки журналов проекта и его рабочих копий."""
+    code = re.sub(r'[^A-Za-z0-9]', '-', folder)
+    return glob.glob(os.path.join(PROJECTS, code)) + glob.glob(os.path.join(PROJECTS, code + '--claude-worktrees-*'))
+
+
+def roster_in(path):
+    t = Tail(path)
+    with open(path, 'rb') as f:
+        for raw in f:
+            if b'agent_listing_delta' in raw:
+                try:
+                    t.take(json.loads(raw))
+                except (ValueError, AttributeError):
+                    continue
+    return t.roster
+
+
+def newest_roster(folder):
+    """Состав из самой свежей сессии папки: старая сессия не откатит штат назад."""
+    paths = [p for d in journal_dirs(folder) for p in glob.glob(os.path.join(d, '*.jsonl'))]
+    for path in sorted(paths, key=os.path.getmtime, reverse=True):
+        roster = roster_in(path)
+        if roster:
+            return roster
+    return {}
+
+
+def staff_of(folder, roster):
+    """Штат: состав сессии и файлы агентов. Описание из файла полнее, чем из журнала."""
+    files = agent_files(folder)
+    merged = dict(roster)
+    for t, info in files.items():
+        merged[t] = merged.get(t) or info['desc']
+    return merged, files
+
+
+def usage_of(folder):
+    """Сколько раз звали каждого агента и кого за кем: журналы чистятся, поэтому это только подсказка."""
+    counts, pairs = {}, {}
+    for d in journal_dirs(folder):
+        for sub in glob.glob(os.path.join(d, '*', 'subagents')):
+            metas = sorted(glob.glob(os.path.join(sub, 'agent-*.meta.json')), key=lambda p: (os.path.getmtime(p), p))
+            seq = [read_json(p).get('agentType') or 'general-purpose' for p in metas]
+            for t in seq:
+                counts[t] = counts.get(t, 0) + 1
+            for a, b in zip(seq, seq[1:]):
+                if a != b:
+                    pairs[(a, b)] = pairs.get((a, b), 0) + 1
+    return counts, pairs
+
+
+def find_lead(folder, files):
+    """Кто ведёт команду: скил проекта, который зовёт больше всего её агентов."""
+    keys = {t.split(':')[-1] for t, i in files.items() if i['scope'] == 'project'}
+    roots = [p for _, p, scope in plugin_dirs(folder) if scope == 'project'] + [os.path.join(folder, '.claude')]
+    best, score = None, 2
+    for root in roots:
+        for path in glob.glob(os.path.join(root, 'skills', '*', 'SKILL.md')):
+            try:
+                with open(path) as f:
+                    text = f.read()
+            except (OSError, UnicodeDecodeError):
+                continue
+            n = sum('`%s`' % k in text or ':%s' % k in text for k in keys)
+            if n > score:
+                role = re.search(r'^# (.+)$', text, re.M)
+                best, score = {'role': role.group(1).strip() if role else '', 'text': text}, n
+    return best
+
+
+def project_notes(folder, roster):
+    """Строки CLAUDE.md про агентов: как устроена команда, словами автора."""
+    try:
+        with open(os.path.join(folder, 'CLAUDE.md')) as f:
+            text = f.read()
+    except (OSError, UnicodeDecodeError):
+        return ''
+    keys = [t.split(':')[-1] for t in roster if t not in BUILTIN]
+    wanted = re.compile('агент|agent|конвейер|pipeline|оркестр', re.I)
+    rows = [row for row in text.splitlines() if wanted.search(row) or any(k in row for k in keys)]
+    return '\n'.join(rows)[:3000]
+
+
+def apply_manifest(old, folder):
+    """Манифест проекта .claude/office.json — те же закреплённые столы, только в репозитории."""
+    man = read_json(os.path.join(folder, '.claude', 'office.json'))
+    if not man:
+        return old
+    office = dict(old or {'guests': {}, 'zones': []})
+    pinned, zones = set(), []
+    for z in man.get('zones') or []:
+        desks = [dict(d, locked=True) for d in z.get('desks') or []]
+        pinned.update(d.get('type') for d in desks)
+        zones.append({'id': z.get('id') or zone_id(z.get('name', '')), 'name': str(z.get('name', '')).upper(), 'desks': desks})
+    for z in office['zones']:
+        desks = [d for d in z.get('desks') or [] if d['type'] not in pinned]
+        if desks:
+            zones.append(dict(z, desks=desks))
+    office['zones'] = zones
+    if man.get('title'):
+        office.update(title=man['title'], titleLocked=True)
+    if man.get('boss'):
+        office['bossLocked'] = man['boss']
+    return office
+
+
+def seat(office, t, desc, files):
+    """Посадить новичка без модели: к коллегам по плагину, иначе в отдел по роду работы."""
+    lang, zones = office.get('lang', LANG), office['zones']
+    info = files.get(t) or {}
+    plugin = t.split(':')[0] if ':' in t else ''
+
+    def sits_with(z):
+        return sum(d['type'].split(':')[0] == plugin for d in z['desks'] if ':' in d['type'])
+
+    def by_id(zid, name):
+        for z in zones:
+            if z.get('id') == zid:
+                return z
+        zones.append({'id': zid, 'name': name, 'desks': []})
+        return zones[-1]
+
+    team = any(i['scope'] == 'project' for i in files.values())
+    if team and info.get('scope') == 'user':
+        zone = by_id(zone_id(SIGNS[lang]['support']), SIGNS[lang]['support'])
+    else:
+        near = max(zones, key=sits_with, default=None) if plugin else None
+        kind = kind_of(t, desc or '')
+        same = [z for z in zones if z.get('id') == zone_id(kind)]
+        zone = near if near and sits_with(near) else same[0] if same else by_id(zone_id(SIGNS[lang]['other']), SIGNS[lang]['other'])
+    name = in_lang(info.get('role'), lang) or local_name(t, lang)
+    desk = dress({'type': t, 'name': clip(name, 24)})
+    if len(desk['name']) > 13:
+        desk['short'] = local_name(t, lang) if len(local_name(t, lang)) <= 13 else clip(name, 13)
+    zone['desks'].append(desk)
 
 
 SCHEMA = {
@@ -606,10 +839,10 @@ SCHEMA = {
         'boss': {'type': 'object', 'properties': {'name': {'type': 'string'}, 'prop': {'type': 'string', 'enum': PROPS}},
                  'required': ['name', 'prop']},
         'zones': {'type': 'array', 'items': {'type': 'object', 'properties': {
-            'name': {'type': 'string'},
+            'id': {'type': 'string'}, 'name': {'type': 'string'},
             'desks': {'type': 'array', 'items': {'type': 'object', 'properties': {
-                'type': {'type': 'string'}, 'name': {'type': 'string'}, 'prop': {'type': 'string', 'enum': PROPS}},
-                'required': ['type', 'name', 'prop']}}},
+                'type': {'type': 'string'}, 'name': {'type': 'string'}, 'short': {'type': 'string'}, 'prop': {'type': 'string', 'enum': PROPS}},
+                'required': ['type', 'name', 'short', 'prop']}}},
             'required': ['name', 'desks']}},
         'guests': {'type': 'array', 'items': {'type': 'object', 'properties': {
             'type': {'type': 'string'}, 'name': {'type': 'string'}, 'prop': {'type': 'string', 'enum': PROPS}},
@@ -618,22 +851,69 @@ SCHEMA = {
     'required': ['title', 'boss', 'zones', 'guests'],
 }
 
-PROMPT = """Сделай пиксельный офис для команды ИИ-агентов проекта «{name}» ({folder}).
+PROMPT = """Разложи команду ИИ-агентов проекта «{name}» ({folder}) по этажам пиксельного офиса так, как она работает на самом деле.
 У главной сессии (руководителя) свой кабинет, остальные агенты — сотрудники по этажам-отделам.
 
-Агенты (тип — описание):
+Агенты:
 {agents}
 
+Как устроена работа:
+{context}
+
+Текущий офис:
+{current}
+
+{task}
+
 Правила:
-- Всё по-русски, без латиницы: вывеска, отделы, должности (вместо QA — «Контролёр»).
+- Всё {language}: вывеска, отделы, должности.
+- Смысл бери из инструкций агентов и описания работы выше, а не из их названий: этап в описании агента важнее похожего слова в типе.
 - title: вывеска офиса заглавными, 1–3 слова, по сути проекта.
 - boss: должность руководителя («Продюсер», «Тимлид», «Главред»), предмет из списка.
-- zones: 2–5 отделов по ходу работы — от поиска и подготовки к производству, проверке и выпуску; порядок отделов — этот же.
-  Название отдела — одно-два слова заглавными («РАЗВЕДКА», «МОНТАЖ», «КАЧЕСТВО»). В отделе 1–8 столов; не дроби отделы ради числа.
+- zones: 2–5 отделов в порядке, в котором работа реально идёт от начала к выпуску. Агент сидит там, где делает основную работу. У отдела, который остался из текущего офиса, сохрани id.
+  Название отдела — одно-два слова заглавными. В отделе 1–8 столов; не дроби отделы ради числа.
+- Общие инструменты (источник — «общий инструмент») не смешивай с командой проекта.
 - Каждый агент, кроме универсальных ({builtin}), — ровно за одним столом в zones; тип копируй дословно. В guests их не клади.
 - guests — только универсальные агенты из списка выше, если они есть.
-- name: должность по-русски, до 13 знаков, понятная без описания («Монтажёр», «Сценарист», «Ревьюер», «Сыщик»), не имя человека.
+- name: полная должность, понятная без описания, не имя человека. Если у агента указана роль — она и есть должность.
+- short: подпись на столе, до 13 знаков. Если name короче, повтори его.
 - prop: предмет на столе, подходящий к работе, из списка в схеме."""
+TASK_FULL = """Задача: пересобери офис по смыслу. Названия, которые уже подходят, не меняй без причины. Закреплённые столы (locked) останутся на местах."""
+TASK_ADD = """Задача: штат пополнился. Новые агенты: {new}. Найди им места в текущем офисе. Остальных не перечисляй: их места не меняются."""
+
+
+def agent_card(t, desc, info, calls):
+    """Агент для модели: кто он, откуда и что ему поручено."""
+    source = {'project': 'команда проекта', 'user': 'общий инструмент'}.get(info.get('scope'), 'неизвестен')
+    rows = ['### ' + t, 'роль: %s; модель: %s; источник: %s; вызовов: %d' % (info.get('role') or '—', info.get('model') or '—', source, calls)]
+    if desc:
+        rows.append('описание: ' + clip(desc, 400))
+    if info.get('prompt'):
+        rows.append('инструкция: ' + clip(info['prompt'], 900))
+    return '\n'.join(rows)
+
+
+def office_prompt(folder, roster, files, old, mode):
+    counts, pairs = usage_of(folder)
+    agents = '\n\n'.join(agent_card(t, d, files.get(t) or {}, counts.get(t, 0)) for t, d in sorted(roster.items()))
+    context = []
+    lead = find_lead(folder, files)
+    if lead:
+        context.append('Скил руководителя:\n' + lead['text'][:3000])
+    notes = project_notes(folder, roster)
+    if notes:
+        context.append('Из CLAUDE.md проекта:\n' + notes)
+    top = sorted(pairs.items(), key=lambda kv: -kv[1])[:12]
+    if top:
+        context.append('Кого за кем звали:\n' + '\n'.join('%s → %s (%d)' % (a, b, n) for (a, b), n in top))
+    current = {'title': (old or {}).get('title'), 'zones': [
+        {'id': z.get('id'), 'name': z.get('name'), 'desks': [{k: d[k] for k in ('type', 'name', 'locked') if k in d} for d in z.get('desks') or []]}
+        for z in (old or {}).get('zones') or []]} if old else 'офиса ещё нет'
+    new = ', '.join((old or {}).get('pending') or [])
+    return PROMPT.format(name=os.path.basename(folder), folder=folder, agents=agents or '(только универсальные)',
+                         context='\n\n'.join(context) or 'описания нет, суди по агентам',
+                         current=json.dumps(current, ensure_ascii=False), task=TASK_ADD.format(new=new) if mode == 'add' else TASK_FULL,
+                         language=SIGNS[(old or {}).get('lang', LANG)]['language'], builtin=', '.join(sorted(BUILTIN)))
 
 
 def find_claude():
@@ -649,38 +929,127 @@ class GenError(Exception):
     pass
 
 
-def ask_claude(folder, roster, job):
+def read_scutil(text):
+    """Ответ scutil --proxy → переменные окружения."""
+    keys = dict(re.findall(r'^\s*(\w+) : (.+)$', text, re.M))
+    return {var: 'http://%s:%s' % (keys[kind + 'Proxy'], keys.get(kind + 'Port', '80'))
+            for kind, var in (('HTTP', 'HTTP_PROXY'), ('HTTPS', 'HTTPS_PROXY'))
+            if keys.get(kind + 'Enable') == '1' and keys.get(kind + 'Proxy')}
+
+
+def system_proxy():
+    try:
+        return read_scutil(subprocess.run(['/usr/sbin/scutil', '--proxy'], capture_output=True, text=True, timeout=5).stdout)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+
+
+def shell_proxy():
+    """Прокси из оболочки пользователя: launchd не читает её файлы, а claude без прокси может не достать до API."""
+    try:
+        out = subprocess.run([os.environ.get('SHELL') or '/bin/zsh', '-c', 'env'], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    pairs = (row.split('=', 1) for row in out.splitlines() if '=' in row)
+    return {k: v for k, v in pairs if k.lower().endswith('_proxy')}
+
+
+def claude_env(exe):
+    """Окружение claude: сервер под launchd получает его почти пустым, а системный прокси Node не видит."""
+    env = dict(os.environ, PATH=os.path.dirname(exe) + ':' + os.environ.get('PATH', '/usr/bin:/bin'))
+    if not any(k.lower() in ('https_proxy', 'all_proxy') for k in env):
+        env.update(shell_proxy() or system_proxy())
+    return env
+
+
+def kill_job(job):
+    """Убить claude вместе с его детьми: они держат трубы открытыми."""
+    proc = job.get('proc')
+    if proc:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def read_stream(proc, prompt, job, got):
+    """События claude по мере поступления: job знает, чего он ждёт, got — итог и последние строки."""
+    try:
+        proc.stdin.write(prompt)
+        proc.stdin.close()
+    except (OSError, ValueError):
+        return
+    try:
+        for raw in proc.stdout:
+            got['tail'] = raw
+            try:
+                e = json.loads(raw)
+            except ValueError:
+                continue
+            if e.get('type') == 'system' and e.get('subtype') == 'api_retry':
+                job['retries'] = job.get('retries', 0) + 1
+                continue
+            job['heard'] = time.time()
+            if e.get('type') == 'system' and e.get('subtype') == 'init':
+                job['stage'] = 'answer'
+            elif e.get('type') == 'result':
+                got['answer'] = e
+    except (OSError, ValueError):
+        pass
+
+
+def wait_for(proc, prompt, job):
+    """Дождаться ответа, но не дольше лимитов; итог — словарь с answer, причина отказа — в why."""
+    got = {'tail': '', 'why': ''}
+    reader = threading.Thread(target=read_stream, args=(proc, prompt, job, got), daemon=True)
+    began = job['heard'] = time.time()
+    reader.start()
+    while reader.is_alive() and not job.get('cancel'):
+        now = time.time()
+        if job.get('retries', 0) >= GEN_RETRIES or (job.get('stage') == 'answer' and now - job['heard'] > GEN_QUIET):
+            got['why'] = NO_NETWORK
+        elif now - began > GEN_TIMEOUT:
+            got['why'] = ('claude не успел за %d с' % GEN_TIMEOUT if job.get('stage') == 'answer' else
+                          'claude не запустился за %d с. Обычно он ждёт входа: запустите claude в терминале и войдите '
+                          '(/login), а если macOS спросит доступ к связке ключей — разрешите' % GEN_TIMEOUT)
+        if got['why']:
+            break
+        reader.join(0.1)
+    kill_job(job)
+    reader.join(2)  # труба могла остаться у того, кто сбежал из группы: ждать его незачем
+    try:
+        proc.wait(2)
+        proc.stdout.close()
+    except (subprocess.SubprocessError, OSError, ValueError):
+        pass
+    return got
+
+
+def ask_claude(folder, roster, files, old, mode, job):
     """Раскладка по смыслу — одним вызовом claude -p. Процесс лежит в job: его можно убить."""
     exe = find_claude()
     if not exe:
         raise GenError('не нашёл claude: нужен установленный Claude Code')
-    agents = '\n'.join('- %s — %s' % (t, clip(d, 220)) for t, d in sorted(roster.items()))
-    prompt = PROMPT.format(name=os.path.basename(folder), folder=folder, agents=agents or '(только универсальные)',
-                           builtin=', '.join(sorted(BUILTIN)))
+    prompt = office_prompt(folder, roster, files, old, mode)
     try:
-        proc = subprocess.Popen(
+        job['proc'] = subprocess.Popen(
             [exe, '-p', '--model', 'sonnet', '--tools', '', '--no-session-persistence', '--setting-sources', '',
-             '--output-format', 'json', '--json-schema', json.dumps(SCHEMA),
+             '--max-budget-usd', GEN_BUDGET, '--output-format', 'stream-json', '--verbose', '--include-partial-messages',
+             '--json-schema', json.dumps(SCHEMA),
              '--system-prompt', 'Ты раскладываешь агентов по пиксельному офису. Отвечай только JSON по схеме.'],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            cwd=DATA if os.path.isdir(DATA) else HERE,
-            env=dict(os.environ, PATH=os.path.dirname(exe) + ':' + os.environ.get('PATH', '/usr/bin:/bin')))
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True,
+            cwd=DATA if os.path.isdir(DATA) else HERE, env=claude_env(exe))
     except OSError as e:
         raise GenError('claude не запустился: %s' % e)
-    job['proc'] = proc
-    try:
-        out, err = proc.communicate(prompt, timeout=GEN_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.communicate()
-        raise GenError('claude не ответил за %d с. Обычно он ждёт входа: запустите claude в терминале и войдите '
-                       '(/login), а если macOS спросит доступ к связке ключей — разрешите' % GEN_TIMEOUT)
+    got = wait_for(job['proc'], prompt, job)
     if job.get('cancel'):
         return None
-    try:
-        answer = json.loads(out)
-    except ValueError:
-        raise GenError('claude ответил не JSON: %s' % clip(err or out or 'пусто', 160))
+    if got['why']:
+        raise GenError(got['why'])
+    answer = got.get('answer')
+    if not answer:
+        raise GenError('claude завершился без ответа: %s' % clip(got['tail'] or 'пусто', 160))
+    job['cost'] = answer.get('total_cost_usd')
     if answer.get('is_error'):
         raise GenError('claude: %s' % clip(answer.get('result') or 'ошибка без описания', 160))
     office = answer.get('structured_output')
@@ -693,35 +1062,67 @@ def backup_path(folder):
     return office_path(folder)[:-5] + '.prev.json'
 
 
-def run_office(folder, roster, job):
-    """Фоновая генерация: при успехе прежний офис уходит в .prev.json, при неудаче остаётся как был."""
+def write_office(folder, office):
+    """Новый файл — целиком, потом замена: прежний офис уходит в .prev.json, сбой его не задевает."""
+    path = office_path(folder)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(office, f, ensure_ascii=False, indent=2)
+    if os.path.exists(path):
+        shutil.copy2(path, backup_path(folder))
+    os.replace(tmp, path)
+
+
+def changes(old, new):
+    """Что поменялось для людей: перемещено, переименовано, добавлено."""
+    def seats(office):
+        return {d['type']: (z.get('name'), d.get('name')) for z in (office or {}).get('zones') or [] for d in z.get('desks') or []}
+    before, after = seats(old), seats(new)
+    both = [t for t in after if t in before]
+    return {'moved': sum(before[t][0] != after[t][0] for t in both), 'renamed': sum(before[t][1] != after[t][1] for t in both),
+            'added': len(after) - len(both)}
+
+
+def run_office(folder, roster, job, mode='full'):
+    """Фоновая генерация: при неудаче офис остаётся как был."""
+    slot = False
     try:
-        office = ask_claude(folder, roster, job)
-        if office is not None:
-            result = tidy(folder, roster, office)
-            path = office_path(folder)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            if os.path.exists(path):
-                os.replace(path, backup_path(folder))
-            with open(path, 'w') as f:
-                json.dump(result, f, ensure_ascii=False, indent=2)
+        while not slot and not job.get('cancel'):
+            slot = GEN_SLOT.acquire(timeout=0.1)
+        if slot:
+            job.update(stage='start', started=time.time())
+            roster, files = staff_of(folder, roster)
+            saved = load_office(folder)
+            old = apply_manifest(saved, folder)
+            office = ask_claude(folder, roster, files, old, mode, job)
+            if office is not None:
+                result = tidy(folder, roster, office, old, files, mode, find_lead(folder, files))
+                job.update(summary=changes(saved, result), added=names_of(result, (saved or {}).get('pending') or []))
+                write_office(folder, result)
         job['status'] = 'cancelled' if job.get('cancel') else 'done'
     except GenError as e:
         job['status'], job['error'] = 'failed', str(e)
     except Exception as e:  # генерация в потоке: ошибка не должна оставить «running» навсегда
         job['status'], job['error'] = 'failed', 'сбой: %s' % e
     finally:
-        sys.stderr.write('генерация офиса %s: %s %s\n' % (folder, job['status'], job.get('error', '')))
+        if slot:
+            GEN_SLOT.release()
+        sys.stderr.write('генерация офиса %s: %s $%s %s\n' % (folder, job['status'], job.get('cost', '?'), job.get('error', '')))
         job['ended'] = time.time()
 
 
-def start_office(folder, roster):
-    """Запустить генерацию; None — уже идёт."""
+def names_of(office, types):
+    return [d['name'] for z in office['zones'] for d in z['desks'] if d['type'] in types]
+
+
+def start_office(folder, roster, mode='full'):
+    """Запустить генерацию; None — уже идёт. mode: full — пересобрать, add — посадить новичков."""
     job = JOBS.get(folder)
     if job and job['status'] == 'running':
         return None
-    job = JOBS[folder] = {'status': 'running', 'started': time.time(), 'ended': 0, 'error': ''}
-    threading.Thread(target=run_office, args=(folder, roster, job), daemon=True).start()
+    job = JOBS[folder] = {'status': 'running', 'stage': 'queue', 'mode': mode, 'started': time.time(), 'ended': 0, 'error': ''}
+    threading.Thread(target=run_office, args=(folder, roster, job, mode), daemon=True).start()
     return job
 
 
@@ -730,10 +1131,16 @@ def cancel_office(folder):
     if not job or job['status'] != 'running':
         return False
     job['cancel'] = True
-    proc = job.get('proc')
-    if proc and proc.poll() is None:
-        proc.kill()
+    kill_job(job)
     return True
+
+
+def stop_jobs():
+    """Сервер закрывается: claude не должен пережить его и потратить деньги впустую."""
+    for job in list(JOBS.values()):
+        if job['status'] == 'running':
+            job['cancel'] = True
+            kill_job(job)
 
 
 def undo_office(folder):
@@ -750,49 +1157,162 @@ def undo_office(folder):
 
 def job_view(folder):
     job = JOBS.get(folder) or {}
-    return {'status': job.get('status', ''), 'started': int(job.get('started', 0) * 1000),
+    return {'status': job.get('status', ''), 'stage': job.get('stage', ''), 'started': int(job.get('started', 0) * 1000),
             'ended': int(job.get('ended', 0) * 1000), 'error': job.get('error', ''),
-            'canUndo': os.path.exists(backup_path(folder)), 'timeout': GEN_TIMEOUT}
+            'canUndo': os.path.exists(backup_path(folder)), 'timeout': GEN_TIMEOUT, 'mode': job.get('mode', ''),
+            'summary': job.get('summary'), 'added': job.get('added') or []}
 
 
-def tidy(folder, roster, raw):
+def recent_rosters():
+    """Папки недавних сессий и состав самой свежей из них."""
+    rosters = {}
+    for mtime, sid, pdir, path in session_files():
+        t = tail(path)
+        if t.home and t.roster and t.home not in rosters:
+            rosters[t.home] = dict(t.roster)
+    return rosters
+
+
+def watch_staff():
+    """Новичок садится за стол сразу, без модели; затем одна генерация уточняет его место и должность."""
+    with LOCK:
+        rosters = recent_rosters()
+    for folder, roster in rosters.items():
+        office = load_office(folder)
+        running = JOBS.get(folder, {}).get('status') == 'running'
+        if not office or office.get('auto') is False or running:
+            continue  # офиса нет — автораскладка и так видит всех, тратить деньги без спроса не на что
+        roster, files = staff_of(folder, roster)
+        seated = {d['type'] for z in office['zones'] for d in z['desks']}
+        new = [t for t in roster if t not in BUILTIN and t not in seated]
+        if new:
+            for t in new:
+                seat(office, t, roster[t], files)
+            office['pending'] = sorted(set(office.get('pending') or []) | set(new))
+            write_office(folder, office)
+        pending = tuple(office.get('pending') or [])
+        if pending and AUTO_TRIED.get(folder) != pending and start_office(folder, roster, 'add') is not None:
+            AUTO_TRIED[folder] = pending
+
+
+def staff_loop():
+    while True:
+        time.sleep(STAFF_EVERY)
+        try:
+            watch_staff()
+        except Exception as e:  # проверка в потоке: сбой не должен её остановить
+            sys.stderr.write('проверка штата: %s\n' % e)
+
+
+def tidy(folder, roster, raw, old=None, files=None, mode='full', lead=None):
     """Ответ модели — в файл офиса: чужие типы выкинуть, забытых посадить, руководителя — первым.
-    Должности и отделы — только по-русски: латиницу заменяем словарём."""
-    def russian(name):
-        name = ' '.join(str(name or '').split())
-        return name if name and not LATIN.search(name) else ''
-
-    # русское имя, которое модель дала агенту, где бы его ни посадила
+    Подпись выбирается по старшинству: закреплённая, из файла агента, прежняя, от модели, словарь.
+    Подписи не на языке офиса отбрасываются. mode add двигает только новичков."""
+    old, files = old or {}, files or {}
+    lang = old.get('lang') or LANG
+    signs = SIGNS[lang]
+    fit = lambda text: in_lang(text, lang)
+    was = {d['type']: d for z in old.get('zones') or [] for d in z.get('desks') or []}
+    fresh = set(old.get('pending') or [])
+    # что модель сказала про агента, где бы его ни посадила
     given = {}
     for d in [d for z in raw['zones'] for d in z.get('desks') or []] + list(raw.get('guests') or []):
-        given.setdefault(d.get('type'), russian(d.get('name')))
-    title = lambda t: clip(given.get(t) or ru_name(t), 13)
-    seen, zones = set(), []
+        given.setdefault(d.get('type'), d)
+
+    def label(t):
+        before, said = was.get(t) or {}, given.get(t) or {}
+        if before.get('locked') and fit(before.get('name')):
+            name = fit(before['name'])
+        else:
+            kept = '' if t in fresh else fit(before.get('name'))
+            name = fit((files.get(t) or {}).get('role')) or kept or fit(said.get('name')) or local_name(t, lang)
+        marks = [name, before.get('short'), said.get('short'), before.get('name'), said.get('name'), local_name(t, lang)]
+        short = next((m for m in map(fit, marks) if m and len(m) <= 13), clip(name, 13))
+        return clip(name, 24), short
+
+    def sit(t, prop=None):
+        before = was.get(t) or {}
+        desk = {k: before[k] for k in ('shirt', 'hair', 'skin', 'locked') if k in before}
+        name, short = label(t)
+        desk.update(type=t, name=name, prop=prop or before.get('prop'))
+        if short != name:
+            desk['short'] = short
+        return dress(desk)
+
+    zones = []
+
+    def zone(zid, name):
+        for z in zones:
+            if z['id'] == zid:
+                return z
+        zones.append({'id': zid, 'name': name, 'desks': []})
+        return zones[-1]
+
+    seen = set()
+    if mode == 'add':
+        for z in old.get('zones') or []:
+            zones.append(dict(z, desks=[d for d in z['desks'] if d['type'] not in fresh]))
+            seen.update(d['type'] for d in zones[-1]['desks'])
+    else:
+        for z in old.get('zones') or []:
+            pins = [d['type'] for d in z.get('desks') or [] if d.get('locked') and d['type'] != 'main']
+            for t in pins:
+                seen.add(t)
+                zone(z['id'], z['name'])['desks'].append(sit(t))
+    known = {z.get('id') for z in old.get('zones') or []}
     for z in raw['zones']:
         desks = []
         for d in z.get('desks') or []:
             t = d.get('type')
             if t in roster and t not in BUILTIN and t not in seen:
                 seen.add(t)
-                desks.append(dress({'type': t, 'name': title(t), 'prop': d.get('prop')}))
+                desks.append(sit(t, d.get('prop')))
         if desks:
             kinds = [kind_of(d['type'], roster.get(d['type']) or '') for d in desks]
-            name = russian(z.get('name')) or max(set(kinds), key=kinds.count)
-            zones.append({'name': clip(name, 24).upper(), 'desks': desks})
-    rest = [dress({'type': t, 'name': title(t)}) for t in roster if t not in BUILTIN and t not in seen]
+            name = fit(z.get('name')) or fit(max(set(kinds), key=kinds.count)) or signs['other']
+            zid = z.get('id') if z.get('id') in known else zone_id(name)
+            zone(zid, clip(name, 24).upper())['desks'].extend(desks)
+    rest = [t for t in roster if t not in BUILTIN and t not in seen]
+    if mode == 'add':
+        # модель забыла новичка: он остаётся там, куда его посадили сразу
+        for z, source in zip(zones, old.get('zones') or []):
+            z['desks'] += [d for d in source['desks'] if d['type'] in rest]
+        rest = [t for t in rest if t not in was]
     if rest:
-        zones.append({'name': 'ПРОЧИЕ', 'desks': rest})
-    boss = dress({'type': 'main', 'name': clip(russian(raw['boss'].get('name')) or 'Главный', 13), 'prop': raw['boss'].get('prop'),
-                  'shirt': '#3b3f8f'})
+        zone(zone_id(signs['other']), signs['other'])['desks'] += [sit(t) for t in rest]
+    if mode != 'add' and any(i['scope'] == 'project' for i in files.values()):
+        tools = [d for z in zones for d in z['desks'] if (files.get(d['type']) or {}).get('scope') == 'user' and not d.get('locked')]
+        if tools:
+            for z in zones:
+                z['desks'] = [d for d in z['desks'] if d not in tools]
+            zone(zone_id(signs['support']), signs['support'])['desks'] += tools
+    zones[:] = [z for z in zones if z['desks']]
     if not zones:
-        zones = [{'name': 'ГЛАВНЫЙ', 'desks': []}]
-    first = zones[0]['desks']
-    # руководитель — в середине полного ряда, иначе первым
-    first.insert(2 if len(first) == 4 else 0, boss)
-    guests = {g['type']: {'name': title(g['type']), 'prop': g.get('prop') if g.get('prop') in PROPS else 'cap'}
-              for g in raw.get('guests') or [] if g.get('type') in roster and g.get('type') in BUILTIN}
-    return {'folder': folder, 'title': clip(russian(raw.get('title')) or os.path.basename(folder), 28).upper(),
-            'zones': zones, 'guests': guests, 'generated': 'claude'}
+        zones.append({'id': 'главный', 'name': 'ГЛАВНЫЙ', 'desks': []})
+    if mode == 'add':
+        title = old.get('title')
+    else:
+        first = zones[0]['desks']
+        pin = old.get('bossLocked') or {}
+        before = was.get('main') or {}
+        choices = [before.get('name') if before.get('locked') else '', pin.get('name'), (lead or {}).get('role'), before.get('name'),
+                   raw['boss'].get('name')]
+        boss = dress({'type': 'main', 'name': clip(next(filter(None, map(fit, choices)), signs['boss']), 13),
+                      'prop': pin.get('prop') or raw['boss'].get('prop'), 'shirt': '#3b3f8f', **({'locked': True} if before.get('locked') else {})})
+        # руководитель — в середине полного ряда, иначе первым
+        first.insert(2 if len(first) == 4 else 0, boss)
+        title = old.get('title') if old.get('titleLocked') else fit(raw.get('title')) or old.get('title') or os.path.basename(folder)
+    if mode == 'add':
+        guests = old.get('guests') or {}
+    else:
+        guests = {}
+        for g in raw.get('guests') or []:
+            t = g.get('type')
+            if t in roster and t in BUILTIN:
+                name = fit((old.get('guests') or {}).get(t, {}).get('name')) or fit(g.get('name')) or local_name(t, lang)
+                guests[t] = {'name': clip(name, 13), 'prop': g.get('prop') if g.get('prop') in PROPS else 'cap'}
+    keep = {k: old[k] for k in ('auto', 'titleLocked', 'bossLocked') if k in old}
+    return dict(keep, v=OFFICE_V, lang=lang, folder=folder, title=clip(title, 28).upper(), zones=zones, guests=guests, generated='claude')
 
 
 # ── Статистика: траты по часам из всех журналов ─────────────────────────────
@@ -1265,9 +1785,21 @@ def codex_office(t, agents):
     return office
 
 
-def office_for(t):
+def session_view(office, roster, called):
+    """Штат один на папку, а показываем столы тех, кого эта сессия может позвать или уже звала."""
+    if not roster:
+        return office
+    keep = set(roster) | set(called) | {'main'}
+    zones = [dict(z, desks=[d for d in z['desks'] if d['type'] in keep]) for z in office['zones']]
+    total = sum(len(z['desks']) for z in office['zones'])
+    office['zones'] = [z for z in zones if z['desks']]
+    office['hidden'] = total - sum(len(z['desks']) for z in office['zones'])
+    return office
+
+
+def office_for(t, called=()):
     saved = load_office(t.home) if t.home else None
-    office = saved or auto_office(t.home or '?', t.roster)
+    office = session_view(saved, t.roster, called) if saved else auto_office(t.home or '?', t.roster)
     office['saved'] = bool(saved)
     office['job'] = job_view(t.home) if t.home else None
     office['generating'] = bool(office['job']) and office['job']['status'] == 'running'
@@ -1307,7 +1839,8 @@ def state(sid):
     for mtime, s, pdir, path in session_files():
         if s == sid:
             t = tail(path)
-            return room(t, agents_of(pdir, sid, now * 1000), t.busy and now - mtime < LIVE_S, office_for(t))
+            agents = agents_of(pdir, sid, now * 1000)
+            return room(t, agents, t.busy and now - mtime < LIVE_S, office_for(t, [a['type'] for a in agents]))
     mains, kids = codex_threads(now)
     t = mains.get(sid)
     if t is None:
@@ -1350,7 +1883,7 @@ class Handler(SimpleHTTPRequestHandler):
             if not t or not t.home:
                 return self.send_json({'error': 'у сессии не нашлась папка'}, 404)
             folder, roster = t.home, dict(t.roster)
-        if action == 'start' and not start_office(folder, roster):
+        if action == 'start' and not start_office(folder, newest_roster(folder) or roster):
             return self.send_json({'error': 'офис уже собирается'}, 409)
         if action == 'cancel' and not cancel_office(folder):
             return self.send_json({'error': 'отменять нечего'}, 409)
@@ -1377,6 +1910,12 @@ class Handler(SimpleHTTPRequestHandler):
         return super().do_GET()
 
 
+def on_term(signum, frame):
+    stop_jobs()
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)  # код выхода тот же: приложение строки меню по нему решает, поднимать ли сервер
+
+
 def main():
     global DATA
     import argparse
@@ -1393,8 +1932,11 @@ def main():
         def watch():
             while parent_alive(ppid):
                 time.sleep(2)
+            stop_jobs()
             os._exit(0)
         threading.Thread(target=watch, daemon=True).start()
+    signal.signal(signal.SIGTERM, on_term)
+    threading.Thread(target=staff_loop, daemon=True).start()
     threading.Thread(target=stats, daemon=True).start()  # первый проход по журналам — заранее
     print('Agent Office: http://%s:%d' % (args.host, args.port), flush=True)
     ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
