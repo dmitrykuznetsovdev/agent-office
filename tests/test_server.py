@@ -1294,6 +1294,8 @@ class EpicTest(unittest.TestCase):
         self.journal('-work-app--wt-p1', 'w1', assistant('w1', stop='end_turn'))
         self.journal('-work-app--wt-p1-qa', 'q1', assistant('q1', stop='end_turn'))
         self.journal('-work-app--wt-p2', 'w2', assistant('w2', [('Bash', {'command': 'npm test'})]))
+        self.journal('-work-app--wt-p2', 'w2-old', assistant('w2o', stop='end_turn'))
+        self.journal('-wt-p1-qa', 'q1-again', assistant('q1a', stop='end_turn').replace('/work/app', '/wt/p1-qa'))
         self.journal('-work-app', 'c1', assistant('c1x', stop='end_turn'))
         self.journal('-work-app', 'abcdef12-3456-7890-abcd-ef1234567890', assistant('r1', [('Read', {'file_path': '/work/app/a.py'})]))
         self.view()
@@ -1332,11 +1334,13 @@ class EpicTest(unittest.TestCase):
                 'critiques': [{'round': 1, 'verdict': 'ACCEPT', 'roles': [{'role': 'critic', 'session': 'c1', 'state': 'done', 'detail': ''}]}],
                 'researchers': [{'question': 'Q1', 'dispatch': 'p2-a2', 'answered': False,
                                  'roles': [{'role': 'researcher', 'session': 'abcdef12', 'state': 'working', 'detail': 'weighing two queues'}]}],
+                'sessions': [{'session': 'w2-old', 'role': 'writer', 'task': 'P2'}, {'session': 'w2', 'role': 'writer', 'task': 'P2'}],
+                'worktrees': [{'path': '/wt/p1-qa', 'role': 'qa', 'task': 'P1'}],
             }))
         os.utime(path, (now, now))
 
     def floors(self, office):
-        return [(z['name'], z.get('note'), bool(z.get('strip')), [d['name'] for d in z['desks'] if d['type'] != 'main']) for z in office['zones']]
+        return [(z['name'], z.get('note'), bool(z.get('strip')), [d.get('short') or d['name'] for d in z['desks'] if d['type'] != 'main']) for z in office['zones']]
 
     def test_floor_per_package_in_manifest_order_spec_and_research_above(self):
         office = server.state('coord')['office']
@@ -1362,9 +1366,23 @@ class EpicTest(unittest.TestCase):
 
     def test_an_open_package_keeps_an_empty_desk_for_its_qa(self):
         p2 = server.state('coord')['office']['zones'][3]
-        qa = [d for d in p2['desks'] if d['name'] == 'Контролёр']
+        qa = [d for d in p2['desks'] if d.get('short') == 'Контролёр']
         self.assertEqual([d['type'] for d in qa], ['e1/P2/qa'])
         self.assertNotIn('e1/P2/qa', [a['type'] for a in server.state('coord')['agents']])
+
+    def test_role_sessions_hang_under_their_orchestrator_with_their_task(self):
+        rows = {s['id']: s for s in server.sessions()}
+        self.assertEqual((rows['coord'].get('parent'), rows['coord'].get('epic')), (None, 'e1'))
+        self.assertEqual({sid: (rows[sid].get('parent'), rows[sid].get('role')) for sid in ('q1-again', 'w2-old', 'w1', 'q1', 'w2', 'c1', 'abcdef12-3456-7890-abcd-ef1234567890')}, {
+            'q1-again': ('coord', 'Контролёр P1'), 'w2-old': ('coord', 'Писатель P2'), 'w1': ('coord', 'Писатель P1'), 'q1': ('coord', 'Контролёр P1'), 'w2': ('coord', 'Писатель P2'),
+            'c1': ('coord', 'Критик r1'), 'abcdef12-3456-7890-abcd-ef1234567890': ('coord', 'Исследователь Q1'),
+        })
+
+    def test_journal_names_the_task_of_each_role_step(self):
+        st = server.state('coord')
+        desks = {d['type']: d for z in st['office']['zones'] for d in z['desks']}
+        self.assertEqual((desks['e1/P2/writer']['name'], desks['e1/P2/writer']['short']), ('Писатель P2', 'Писатель'))
+        self.assertIn('e1/P2/writer', {l['who'] for l in st['log']})
 
     def test_roles_carry_their_job_state(self):
         agents = {a['id']: a for a in server.state('coord')['agents']}

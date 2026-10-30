@@ -95,6 +95,12 @@
   .seg.prov button { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 1px; padding: 5px 4px; line-height: 1.2; }
   .seg.prov small { font: 500 11px Menlo, monospace; opacity: .8; }
   .sess:hover { background: var(--floor); }
+  /* сессия роли эпика висит под своим оркестратором: отступ и уголок от него */
+  .sess.child { margin-left: 26px; width: calc(100% - 26px - 2 * var(--px)); margin-top: -4px; }
+  .sess.child::after { content: ''; position: absolute; left: -16px; top: -6px; height: calc(50% + 6px); width: 12px; border-left: 2px solid var(--rim); border-bottom: 2px solid var(--rim); }
+  .sess .role { color: var(--gold); font: 600 11px Menlo, monospace; margin-right: 6px; }
+  .more { display: block; margin: -4px var(--px) 8px 26px; padding: 4px 10px; background: transparent; box-shadow: none; color: var(--muted); font: 500 12px Menlo, monospace; text-align: left; }
+  .more:hover { color: var(--text); }
   .sess.sel { --c: var(--gold); background: var(--floor); }
   .sess .t { display: flex; gap: 8px; align-items: center; font-weight: 600; }
   .sess .t span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -162,6 +168,7 @@ const titleEl = $('title'), list = $('sessions'), follow = $('follow'), total = 
 const PROVIDERS = { all: 'Все', claude: 'Claude', codex: 'Codex' }
 
 let sessions = []
+const opened = new Set()   // оркестраторы, у которых развёрнуты законченные роли
 let current = location.hash.slice(1)   // выбранная сессия живёт в адресе
 let live = null, lastText = '', lastDraw = 0
 let provider = 'all'
@@ -246,15 +253,29 @@ function drawList() {
     list.innerHTML = `<div class="empty">За сутки сессий${provider === 'all' ? '' : ' ' + PROVIDERS[provider]} не было.</div>`
     return
   }
-  const html = rows.map(s => {
+  // роли эпика — под своим оркестратором, свежие сверху; роль без оркестратора в списке стоит сама по себе
+  const ids = new Set(rows.map(s => s.id))
+  const kids = id => rows.filter(s => s.parent === id)
+  const row = (s, child) => {
     const cls = s.working ? 'busy' : s.isLive ? 'live' : ''
     const work = s.working ? `в работе ${s.working}` : ago(s.at)
     const agents = s.agents ? ` · агентов ${s.agents}` : ''
     const usd = s.cost ? ` · <span class="usd">${money(s.cost)}</span>` : ''
-    return `<button class="sess p-${s.provider}${s.id === current ? ' sel' : ''}" data-id="${s.id}">
+    const n = kids(s.id).length
+    const epic = s.epic ? `<i class="role">эпик ${esc(s.epic)}${n ? ' · ролей ' + n : ''}</i>` : ''
+    const role = child && s.role ? `<i class="role">${esc(s.role)}</i>` : ''
+    return `<button class="sess p-${s.provider}${child ? ' child' : ''}${s.id === current ? ' sel' : ''}" data-id="${s.id}">
       <div class="t"><span class="d ${cls}"></span><span>${esc(s.title)}</span></div>
-      <div class="m"><i class="tag">${PROVIDERS[s.provider]}</i>${esc(s.project)} · ${work}${agents}${usd}</div></button>`
-  }).join('')
+      <div class="m">${epic}${role}<i class="tag">${PROVIDERS[s.provider]}</i>${esc(s.project)} · ${work}${agents}${usd}</div></button>`
+  }
+  // законченные роли свёрнуты в «ещё N»: у долгого эпика их десятки
+  const branch = s => {
+    const all = kids(s.id), open = opened.has(s.id), shown = open ? all : all.filter(k => k.isLive || k.id === current)
+    const more = all.length - shown.length
+    const toggle = more ? `<button class="more" data-more="${s.id}">└ ещё ${more} законченных</button>` : open && all.length ? `<button class="more" data-more="${s.id}">└ свернуть</button>` : ''
+    return row(s, false) + shown.map(k => row(k, true)).join('') + toggle
+  }
+  const html = rows.filter(s => !ids.has(s.parent)).map(branch).join('')
   // не трогать список без перемен: иначе клик попадает в уже заменённую кнопку
   if (html !== list.dataset.html) {
     list.dataset.html = html
@@ -263,6 +284,8 @@ function drawList() {
 }
 
 list.addEventListener('click', e => {
+  const m = e.target.closest('.more')
+  if (m) { opened.has(m.dataset.more) ? opened.delete(m.dataset.more) : opened.add(m.dataset.more); drawList(); return }
   const b = e.target.closest('.sess')
   if (!b) return
   follow.checked = false

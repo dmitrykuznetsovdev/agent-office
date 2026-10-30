@@ -1691,6 +1691,7 @@ def sessions():
     now = time.time()
     out = []
     views = epic_views()
+    children = epic_children(views)
     for mtime, sid, pdir, path in session_files():
         t = tail(path)
         # координатор эпика молчит, пока ждёт роли, но жив, пока его мод переписывает view.json
@@ -1711,6 +1712,11 @@ def sessions():
             'folder': t.home,
             'hasOffice': bool(t.home) and os.path.exists(office_path(t.home)),
         })
+        # an epic's role session hangs under its orchestrator in the list, named by its task
+        if sid in views:
+            out[-1]['epic'] = str(views[sid][0].get('epic', '?'))
+        elif child_of(sid, t.cwd, children):
+            out[-1]['parent'], out[-1]['role'] = child_of(sid, t.cwd, children)
     out += codex_sessions(now)
     out.sort(key=lambda s: s['at'], reverse=True)
     return out
@@ -1873,6 +1879,29 @@ def journal_of(session, files):
     return next((f for f in files if f[1] == session or (len(session) == 8 and f[1].startswith(session))), None)
 
 
+def epic_children(views):
+    """Сессии ролей эпиков: id сессии (или 8 знаков, как пишет мод) → (CLI-сессия оркестратора, роль с задачей),
+    и так же по worktree роли. Этажи дают последнюю попытку, `sessions` вида — все запущенные, с прежними попытками
+    и возобновлёнными писателями; `worktrees` — тех, кого перезапустили в том же checkout и чей id ledger уже забыл."""
+    out, paths = {}, {}
+    for coord, (view, _) in views.items():
+        trees = view.get('worktrees')
+        for w in trees if isinstance(trees, list) else []:
+            if isinstance(w, dict) and isinstance(w.get('path'), str) and w.get('role') in ROLE_NAMES:
+                paths[w['path'].rstrip('/')] = (coord, '%s %s' % (ROLE_NAMES[w['role']], w.get('task', '?')))
+        launched = view.get('sessions')
+        for x in launched if isinstance(launched, list) else []:
+            if isinstance(x, dict) and isinstance(x.get('session'), str) and x.get('role') in ROLE_NAMES:
+                out[x['session']] = (coord, '%s %s' % (ROLE_NAMES[x['role']], x.get('task', '?')))
+        out.update({role['session']: (coord, who) for _, _, seats, _ in epic_floors(view) for _, _, who, role in seats if role})
+    return out, paths
+
+
+def child_of(sid, cwd, children):
+    by_id, by_path = children
+    return by_id.get(sid) or by_id.get(sid[:8]) or (by_path.get(cwd.rstrip('/')) if cwd else None)
+
+
 def epic_floors(view):
     """Этажи эпика сверху вниз: спека, исследования, пакет за пакетом.
     Этаж — (имя, примечание, [(тип стола, должность, кто, роль или None — пустой стол)], дорожка [[подпись, passed|next|rejected|ahead]] или None)."""
@@ -1919,12 +1948,13 @@ def epic_room(t, agents, busy, view, files):
     for i, (name, note, seats, track) in enumerate(epic_floors(view)):
         desks, here = [], []
         for kind, desk, who, role in seats:
+            # the journal names the task (Писатель P2), the desk keeps the short title
             if role is None:
-                desks.append(dress({'type': kind, 'name': desk, 'prop': ROLE_PROPS['qa']}))
+                desks.append(dress({'type': kind, 'name': who, 'short': desk, 'prop': ROLE_PROPS['qa']}))
                 continue
             f = journal_of(role['session'], files)
             if f:
-                desks.append(dress({'type': kind, 'name': desk, 'prop': ROLE_PROPS[role['role']]}))
+                desks.append(dress({'type': kind, 'name': who, 'short': desk, 'prop': ROLE_PROPS[role['role']]}))
                 here.append((role_agent(kind, desk, role, f), who))
         zones.append({'id': 'epic-%d' % i, 'name': name, 'note': note, 'strip': not any(a['isWorking'] for a, _ in here), 'desks': desks, 'track': track})
         seated += here
