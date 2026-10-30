@@ -1893,7 +1893,7 @@ def epic_children(views):
         for x in launched if isinstance(launched, list) else []:
             if isinstance(x, dict) and isinstance(x.get('session'), str) and x.get('role') in ROLE_NAMES:
                 out[x['session']] = (coord, '%s %s' % (ROLE_NAMES[x['role']], x.get('task', '?')))
-        out.update({role['session']: (coord, who) for _, _, seats, _ in epic_floors(view) for _, _, who, role in seats if role})
+        out.update({role['session']: (coord, who) for _, _, seats, *_ in epic_floors(view) for _, _, who, role in seats if role})
     return out, paths
 
 
@@ -1904,7 +1904,8 @@ def child_of(sid, cwd, children):
 
 def epic_floors(view):
     """Этажи эпика сверху вниз: спека, исследования, пакет за пакетом.
-    Этаж — (имя, примечание, [(тип стола, должность, кто, роль или None — пустой стол)], дорожка [[подпись, passed|next|rejected|ahead]] или None)."""
+    Этаж — (имя, примечание, [(тип стола, должность, кто, роль или None — пустой стол)], дорожка [[подпись, passed|next|rejected|ahead]] или None,
+    идёт ли там работа: спека до ACCEPT, открытый вопрос, открытый пакет)."""
     epic, floors = str(view.get('epic', '?')), []
     items = lambda key: [x for x in view.get(key) or [] if isinstance(x, dict)]
     roles = lambda x: [r for r in x.get('roles') or [] if isinstance(r, dict) and isinstance(r.get('session'), str) and r.get('role') in ROLE_NAMES]
@@ -1912,19 +1913,19 @@ def epic_floors(view):
     if crit:
         floors.append(('СПЕКА', ' · '.join('r%s %s' % (c.get('round'), c.get('verdict') or '…') for c in crit),
                        [('%s/spec/r%s' % (epic, c.get('round')), 'Критик r%s' % c.get('round'), 'Критик r%s' % c.get('round'), r) for c in crit for r in roles(c)],
-                       [['r%s' % c.get('round'), VERDICTS.get(c.get('verdict'), 'next')] for c in crit]))
+                       [['r%s' % c.get('round'), VERDICTS.get(c.get('verdict'), 'next')] for c in crit], crit[-1].get('verdict') != 'ACCEPT'))
     res = items('researchers')
     if res:
         floors.append(('ИССЛЕДОВАНИЯ', ' · '.join(str(r.get('question')) for r in res if not r.get('answered')),
                        [('%s/research/%s' % (epic, q.get('question')), 'Исследователь %s' % q.get('question'), 'Исследователь %s' % q.get('question'), r)
-                        for q in res for r in roles(q)], None))
+                        for q in res for r in roles(q)], None, not all(q.get('answered') for q in res)))
     for p in items('packages'):
         pid, seats = p.get('id'), [('%s/%s/%s' % (epic, p.get('id'), r['role']), ROLE_NAMES[r['role']], '%s %s' % (ROLE_NAMES[r['role']], p.get('id')), r) for r in roles(p)]
         # an open package keeps a desk for its QA, empty until the review starts: the floor shows who comes next
         if p.get('is_open') and not any(r['role'] == 'qa' for *_, r in seats):
             seats.append(('%s/%s/qa' % (epic, pid), ROLE_NAMES['qa'], '%s %s' % (ROLE_NAMES['qa'], pid), None))
         gates = [g if g in ('passed', 'next', 'rejected') else 'ahead' for g in p.get('gates') or []]
-        floors.append((str(pid), str(p.get('text') or ''), seats, [list(x) for x in zip(STAGES, gates)]))
+        floors.append((str(pid), str(p.get('text') or ''), seats, [list(x) for x in zip(STAGES, gates)], bool(p.get('is_open'))))
     return floors
 
 
@@ -1943,9 +1944,11 @@ def role_agent(kind, name, role, f):
 
 
 def epic_room(t, agents, busy, view, files):
-    """Офис эпика: наверху оркестратор, ниже этажи из view.json. Этаж, где никто не работает, свёрнут в полоску."""
+    """Офис эпика: наверху оркестратор, ниже этаж на каждую работу в ходу. Сданное и очередь — на доске в кабинете."""
     zones, seated = [], []
-    for i, (name, note, seats, track) in enumerate(epic_floors(view)):
+    for i, (name, note, seats, track, at_work) in enumerate(epic_floors(view)):
+        if not at_work:
+            continue
         desks, here = [], []
         for kind, desk, who, role in seats:
             # the journal names the task (Писатель P2), the desk keeps the short title
@@ -1956,15 +1959,20 @@ def epic_room(t, agents, busy, view, files):
             if f:
                 desks.append(dress({'type': kind, 'name': who, 'short': desk, 'prop': ROLE_PROPS[role['role']]}))
                 here.append((role_agent(kind, desk, role, f), who))
-        zones.append({'id': 'epic-%d' % i, 'name': name, 'note': note, 'strip': not any(a['isWorking'] for a, _ in here), 'desks': desks, 'track': track})
+        zones.append({'id': 'epic-%d' % i, 'name': name, 'note': note, 'desks': desks, 'track': track})
         seated += here
-    if zones:
-        zones[0]['desks'].insert(0, dress({'type': 'main', 'name': 'Оркестратор', 'prop': 'crown', 'shirt': '#3b3f8f'}))
+    # the orchestrator's desk needs a zone even when no work is in progress
+    if not zones:
+        zones.append({'id': 'epic-cabinet', 'name': 'ЭПИК', 'note': 'нет работы в ходу', 'desks': [], 'track': None})
+    zones[0]['desks'].insert(0, dress({'type': 'main', 'name': 'Оркестратор', 'prop': 'crown', 'shirt': '#3b3f8f'}))
+    packages = [p for p in view.get('packages') or [] if isinstance(p, dict)]
+    landed = lambda p: (p.get('gates') or [None] * 3)[2:3] == ['passed']
     coord = view.get('coordinator') if isinstance(view.get('coordinator'), dict) else {}
     progress = view.get('progress') if isinstance(view.get('progress'), dict) else {}
     title = 'EPIC %s · SPEC R%s · %s/%s' % (str(view.get('epic', '?')).upper(), view.get('revision', '?'), progress.get('landed', '?'), progress.get('total', '?'))
     office = {'v': OFFICE_V, 'lang': LANG, 'folder': t.home or '?', 'title': title, 'zones': zones, 'guests': {}, 'saved': True,
-              'job': None, 'generating': False, 'epic': {'context': coord.get('context_tokens'), 'limit': coord.get('context_limit')}}
+              'job': None, 'generating': False, 'epic': {'context': coord.get('context_tokens'), 'limit': coord.get('context_limit'),
+                       'done': [str(p.get('id')) for p in packages if landed(p)], 'queue': [str(p.get('id')) for p in packages if not p.get('attempt')]}}
     st = room(t, agents + [a for a, _ in seated], busy, office)
     st['producer']['waitingFor'] = ', '.join(who for a, who in seated if a['job'] == 'working')
     st['producer']['owner'] = bool(coord.get('owner_needed'))
