@@ -326,6 +326,7 @@ class Tail:
         self.prompt = ''
         self.cwd = ''
         self.home = ''         # папка, где сессию открыли
+        self.launched = ''     # фоновая сессия (claude --bg): папка, где её запустили; у чата пусто
         self.roster = {}       # агенты, доступные сессии: тип → описание
         self.events = []       # [(at, text)]
         self.cost = 0.0
@@ -383,7 +384,9 @@ class Tail:
             self.first = self.first or at
             self.last = max(self.last, at)
         self.cwd = d.get('cwd') or self.cwd
-        self.home = self.home or home_of(self.cwd)
+        if not self.home:  # первая запись с папкой: где сессию открыли
+            self.home = home_of(self.cwd)
+            self.launched = self.cwd if d.get('sessionKind') == 'bg' else ''
         msg = d.get('message') or {}
         content = msg.get('content') if isinstance(msg, dict) else None
         if kind == 'user':
@@ -1715,8 +1718,8 @@ def sessions():
         # an epic's role session hangs under its orchestrator in the list, named by its task
         if sid in views:
             out[-1]['epic'] = str(views[sid][0].get('epic', '?'))
-        elif child_of(sid, t.cwd, children):
-            out[-1]['parent'], out[-1]['role'] = child_of(sid, t.cwd, children)
+        elif child_of(sid, t.launched, children):
+            out[-1]['parent'], out[-1]['role'] = child_of(sid, t.launched, children)
     out += codex_sessions(now)
     out.sort(key=lambda s: s['at'], reverse=True)
     return out
@@ -1870,14 +1873,25 @@ def epic_views():
         if time.time() - mtime >= RECENT_S:
             continue
         if VIEW_CACHE.get(path, (None,))[0] != mtime:
-            view = read_json(path)
-            VIEW_CACHE[path] = (mtime, view if isinstance(view, dict) and view.get('schema') == 1 else None)
+            VIEW_CACHE[path] = (mtime, drawable(path))
         view = VIEW_CACHE[path][1]
         coord = view.get('coordinator') if view else None
         session = coord.get('session') if isinstance(coord, dict) else None
         if isinstance(session, str) and session:
             out[session] = (view, mtime)
     return out
+
+
+def drawable(path):
+    """view.json, который офис может нарисовать, иначе None: один кривой файл не должен стоить всего списка сессий."""
+    try:
+        view = read_json(path)
+        if isinstance(view, dict) and view.get('schema') == 1:
+            epic_children({'?': (view, 0)})  # every field the list and the floors read, read once here
+            return view
+    except Exception:  # wrong types, or JSON nested past the recursion limit
+        pass
+    return None
 
 
 def journal_of(session, files):
@@ -1903,9 +1917,12 @@ def epic_children(views):
     return out, paths
 
 
-def child_of(sid, cwd, children):
+def child_of(sid, launched, children):
+    """Оркестратор и роль сессии: по её id, а фоновой сессии — по worktree роли, где её запустили.
+    Чат, открытый в worktree, или сессия, зашедшая туда через cd, — не роль."""
+    # ponytail: a claude --bg launched by hand in a role worktree still counts as that role; the job file's intent would tell
     by_id, by_path = children
-    return by_id.get(sid) or by_id.get(sid[:8]) or (by_path.get(cwd.rstrip('/')) if cwd else None)
+    return by_id.get(sid) or by_id.get(sid[:8]) or (by_path.get(launched.rstrip('/')) if launched else None)
 
 
 def epic_floors(view):

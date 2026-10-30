@@ -1295,7 +1295,7 @@ class EpicTest(unittest.TestCase):
         self.journal('-work-app--wt-p1-qa', 'q1', assistant('q1', stop='end_turn'))
         self.journal('-work-app--wt-p2', 'w2', assistant('w2', [('Bash', {'command': 'npm test'})]))
         self.journal('-work-app--wt-p2', 'w2-old', assistant('w2o', stop='end_turn'))
-        self.journal('-wt-p1-qa', 'q1-again', assistant('q1a', stop='end_turn').replace('/work/app', '/wt/p1-qa'))
+        self.journal('-wt-p1-qa', 'q1-again', self.bg('q1a', '/wt/p1-qa'))
         self.journal('-work-app', 'c1', assistant('c1x', stop='end_turn'))
         self.journal('-work-app', 'abcdef12-3456-7890-abcd-ef1234567890', assistant('r1', [('Read', {'file_path': '/work/app/a.py'})]))
         self.view()
@@ -1313,6 +1313,10 @@ class EpicTest(unittest.TestCase):
             f.write(text)
         at = time.time() - age
         os.utime(path, (at, at))
+
+    def bg(self, mid, cwd):
+        """A record of a background session (claude --bg), as an epic role is launched, in the folder cwd."""
+        return line(**dict(json.loads(assistant(mid, stop='end_turn')), cwd=cwd, sessionKind='bg'))
 
     def view(self, raw=None, age=0, owner=False, name='e1', verdict='ACCEPT'):
         """view.json, как его пишет мод: пакеты в порядке манифеста, роли с сессиями и job-состоянием."""
@@ -1415,6 +1419,23 @@ class EpicTest(unittest.TestCase):
             'q1-again': ('coord', 'Контролёр P1'), 'w2-old': ('coord', 'Писатель P2'), 'w1': ('coord', 'Писатель P1'), 'q1': ('coord', 'Контролёр P1'), 'w2': ('coord', 'Писатель P2'),
             'c1': ('coord', 'Критик r1'), 'abcdef12-3456-7890-abcd-ef1234567890': ('coord', 'Исследователь Q1'),
         })
+
+    def test_only_a_background_session_launched_in_a_role_worktree_is_that_role(self):
+        # a chat opened in the worktree, or a session that went there with cd, is someone looking, not the role
+        self.journal('-wt-p1-qa', 'chat-there', assistant('ch', stop='end_turn').replace('/work/app', '/wt/p1-qa'))
+        self.journal('-work-app', 'bg-cd', self.bg('b1', '/work/app') + self.bg('b2', '/wt/p1-qa'))
+        rows = {s['id']: s for s in server.sessions()}
+        self.assertEqual([rows[s].get('parent') for s in ('q1-again', 'chat-there', 'bg-cd')], ['coord', None, None])
+
+    def test_a_view_the_office_cannot_draw_costs_only_its_own_epic(self):
+        for raw in ('{"schema": 1, "coordinator": {"session": "w1"}, "packages": 5}',
+                    '{"schema": 1, "coordinator": {"session": "w1"}, "release": {"state": ["x"]}}',
+                    '{"schema": 1, "x": %s}' % ('[' * 100000 + ']' * 100000)):
+            self.view(raw=raw, name='bad')
+            rows = {s['id']: s for s in server.sessions()}
+            self.assertEqual((rows['coord'].get('epic'), rows['w1'].get('epic'), rows['w1'].get('parent')), ('e1', None, 'coord'))
+            self.assertFalse(server.state('w1')['office'].get('epic'))
+            self.assertTrue(server.state('coord')['office'].get('epic'))
 
     def test_journal_names_the_task_of_each_role_step(self):
         st = server.state('coord')
