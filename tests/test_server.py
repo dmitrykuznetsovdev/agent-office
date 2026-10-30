@@ -135,10 +135,12 @@ class SessionsTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
         self.projects, server.PROJECTS = server.PROJECTS, self.dir.name
+        self.codex, server.CODEX_SESSIONS = server.CODEX_SESSIONS, os.path.join(self.dir.name, 'нет-codex')
         server.TAILS.clear()
 
     def tearDown(self):
         server.PROJECTS = self.projects
+        server.CODEX_SESSIONS = self.codex
         server.TAILS.clear()
         self.dir.cleanup()
 
@@ -313,6 +315,366 @@ class LedgerTest(unittest.TestCase):
         [[day, hour, usd]] = ledger.report()['hours']
         self.assertEqual((day, hour), (self.day(0), 14))
         self.assertAlmostEqual(usd, self.usd)
+
+
+THREAD = '01a18b44-21b2-7481-961a-0f2ee2ca8ea2'
+
+
+def rec(kind, payload, ts='2026-01-01T10:00:00.000Z'):
+    return line(type=kind, timestamp=ts, payload=payload)
+
+
+def meta(thread=THREAD, cwd='/work/app', source='vscode', **more):
+    return rec('session_meta', dict(id=thread, session_id=thread, cwd=cwd, source=source, originator='Codex Desktop', **more))
+
+
+def context(model='gpt-5.6-sol', cwd='/work/app', ts='2026-01-01T10:00:00.000Z'):
+    return rec('turn_context', {'model': model, 'cwd': cwd}, ts)
+
+
+def event(kind, ts='2026-01-01T10:00:00.000Z', **more):
+    return rec('event_msg', dict(type=kind, **more), ts)
+
+
+def usage_record(total_in=1000, cached=800, out=100, ts='2026-01-01T10:00:01.000Z'):
+    return rec('token_usage_record', {'response_id': 'r', 'usage': {
+        'input_tokens': total_in, 'cached_input_tokens': cached, 'cache_write_input_tokens': 0,
+        'output_tokens': out, 'reasoning_output_tokens': 0, 'total_tokens': total_in + out}}, ts)
+
+
+def token_count(total_in, cached, out, ts='2026-01-01T10:00:02.000Z', limits=None):
+    return event('token_count', ts, rate_limits=limits, info={'total_token_usage': {
+        'input_tokens': total_in, 'cached_input_tokens': cached, 'output_tokens': out, 'total_tokens': total_in + out}})
+
+
+def item(kind, ts='2026-01-01T10:00:03.000Z', **more):
+    return event('item_completed', ts, item=dict(type=kind, **more))
+
+
+USAGE = {'input_tokens': 200, 'output_tokens': 100, 'cache_read_input_tokens': 800, 'cache_creation_input_tokens': 0}
+
+
+class CodexUsageTest(unittest.TestCase):
+    def fold(self, text):
+        meter, out = {}, []
+        for raw in text.splitlines():
+            u = server.codex_usage(meter, json.loads(raw))
+            if u:
+                out.append(u)
+        return out
+
+    def test_cached_tokens_leave_the_input(self):
+        self.assertEqual(self.fold(context() + usage_record()), [USAGE])
+
+    def test_price_is_per_million_of_uncached_input(self):
+        usd = server.message_cost('gpt-5.6-sol', {'input_tokens': 1_000_000, 'output_tokens': 1_000_000, 'cache_read_input_tokens': 1_000_000})
+        self.assertAlmostEqual(usd, 4.0 + 20.0 + 0.4)
+
+    def test_old_logs_count_by_growth_of_the_running_total(self):
+        got = self.fold(context() + token_count(1000, 800, 100) + token_count(1000, 800, 100) + token_count(1500, 1000, 150))
+        self.assertEqual(got, [USAGE, {'input_tokens': 300, 'output_tokens': 50, 'cache_read_input_tokens': 200, 'cache_creation_input_tokens': 0}])
+
+    def test_records_win_over_the_running_total(self):
+        got = self.fold(context() + usage_record() + token_count(1000, 800, 100) + usage_record() + token_count(2000, 1600, 200))
+        self.assertEqual(got, [USAGE, USAGE])
+
+    def test_total_going_back_after_a_rollback_is_not_new_spending(self):
+        got = self.fold(context() + token_count(5000, 0, 500) + token_count(3000, 0, 300) + token_count(3100, 0, 310))
+        self.assertEqual([u['input_tokens'] for u in got], [5000, 100])
+
+    def test_fast_tier_is_kept(self):
+        got = self.fold(context() + event('thread_settings_applied', thread_settings={'service_tier': 'fast'}) + usage_record())
+        self.assertEqual(got[0]['speed'], 'fast')
+
+    def test_model_known_before_the_first_turn(self):
+        meter = {}
+        settings = event('thread_settings_applied', thread_settings={'model': 'gpt-5.5'})
+        for raw in (settings + token_count(10, 0, 1)).splitlines():
+            server.codex_usage(meter, json.loads(raw))
+        self.assertEqual(server.codex_model(meter), 'gpt-5.5')
+
+    def test_review_thread_after_compaction_is_still_the_review_model(self):
+        meter = {}
+        text = meta(thread='child', source={'subagent': {'other': 'guardian'}}) + token_count(10, 0, 1)
+        for raw in text.splitlines():
+            server.codex_usage(meter, json.loads(raw))
+        self.assertEqual(server.codex_model(meter), 'codex-auto-review')
+
+    def test_provider_by_model(self):
+        self.assertEqual([server.provider_of(m) for m in ('claude-opus-5-5', 'gpt-6-astra', 'codex-auto-review', 'gpt-?')],
+                         ['claude', 'codex', 'codex', 'codex'])
+
+
+class CodexTailTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.dir.name, 'rollout-2026-01-01T10-00-00-%s.jsonl' % THREAD)
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def tail(self, text):
+        with open(self.path, 'w') as f:
+            f.write(text)
+        return server.CodexTail(self.path).feed()
+
+    def test_thread_folder_prompt_and_cost(self):
+        t = self.tail(meta(cwd='/work/app') + context() + item('UserMessage', content=[{'type': 'text', 'text': 'почини сборку'}]) + usage_record())
+        self.assertEqual((t.thread, t.home, t.prompt, t.model), (THREAD, '/work/app', 'почини сборку', 'gpt-5.6-sol'))
+        self.assertAlmostEqual(t.cost, server.message_cost('gpt-5.6-sol', USAGE))
+
+    def test_turn_marks_busy_until_it_ends(self):
+        self.assertTrue(self.tail(meta() + event('task_started')).busy)
+        self.assertFalse(self.tail(meta() + event('task_started') + event('task_complete')).busy)
+        self.assertFalse(self.tail(meta() + event('task_started') + event('turn_aborted')).busy)
+
+    def test_finished_items_read_as_actions(self):
+        t = self.tail(meta()
+                      + item('CommandExecution', command=['/bin/zsh', '-lc', 'npm test'], parsed_cmd=[{'type': 'unknown', 'cmd': 'npm test'}])
+                      + item('CommandExecution', command=['/bin/zsh', '-lc', 'cat a/b.py'], parsed_cmd=[{'type': 'read', 'cmd': 'cat a/b.py', 'name': 'b.py', 'path': 'a/b.py'}])
+                      + item('CommandExecution', command=['/bin/zsh', '-lc', 'rg foo'], parsed_cmd=[{'type': 'search', 'cmd': 'rg foo', 'query': 'foo'}])
+                      + item('FileChange', changes={'/work/app/x.ts': {'type': 'update'}}, status='completed')
+                      + item('FileChange', changes={'/work/app/new.ts': {'type': 'add'}}, status='completed')
+                      + item('WebSearch', query='что-то')
+                      + item('McpToolCall', server='notion', tool='search', status='completed')
+                      + item('ImageView', path='/tmp/shot.png'))
+        self.assertEqual([what for _, what in t.events],
+                         ['$ npm test', 'читает b.py', 'ищет foo', 'правит x.ts', 'пишет new.ts', 'гуглит', 'листает Notion', 'читает shot.png'])
+        self.assertEqual(t.calls, 8)
+        self.assertEqual(t.tool, 'read')
+
+    def test_call_in_progress_is_seen_before_it_finishes(self):
+        call = rec('response_item', {'type': 'custom_tool_call', 'name': 'exec',
+                                     'input': 'const r = await tools.exec_command({cmd:"npm run build",yield_time_ms:1000});'})
+        t = self.tail(meta() + call)
+        self.assertEqual((t.activity, t.tool), ('$ npm run', 'bash'))
+        self.assertEqual(t.calls, 0)  # посчитается, когда вызов закончится
+
+    def test_review_thread_knows_its_parent(self):
+        t = self.tail(meta(thread='child', source={'subagent': {'other': 'guardian'}}, parent_thread_id=THREAD))
+        self.assertEqual((t.parent, t.role), (THREAD, 'guardian'))
+
+    def test_spawned_thread_knows_its_parent(self):
+        t = self.tail(meta(thread='child', source={'subagent': {'thread_spawn': {'parent_thread_id': THREAD}}}, agent_nickname='Maxwell'))
+        self.assertEqual((t.parent, t.role, t.nickname), (THREAD, 'general-purpose', 'Maxwell'))
+
+
+class CodexSessionsTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.saved = server.PROJECTS, server.CODEX_SESSIONS, server.CODEX_INDEX, server.DATA
+        server.PROJECTS = os.path.join(self.dir.name, 'claude')
+        server.CODEX_SESSIONS = os.path.join(self.dir.name, 'sessions')
+        server.CODEX_INDEX = os.path.join(self.dir.name, 'session_index.jsonl')
+        server.DATA = self.dir.name
+        os.makedirs(server.PROJECTS)
+        os.makedirs(server.CODEX_SESSIONS)
+        server.TAILS.clear()
+
+    def tearDown(self):
+        server.PROJECTS, server.CODEX_SESSIONS, server.CODEX_INDEX, server.DATA = self.saved
+        server.TAILS.clear()
+        self.dir.cleanup()
+
+    def write(self, thread, text):
+        day = os.path.join(server.CODEX_SESSIONS, '2026', '01', '01')
+        os.makedirs(day, exist_ok=True)
+        with open(os.path.join(day, 'rollout-2026-01-01T10-00-00-%s.jsonl' % thread), 'w') as f:
+            f.write(text)
+
+    def now(self, offset=0):
+        return iso(time.time() + offset)
+
+    def test_session_is_listed_with_its_provider_and_title(self):
+        self.write(THREAD, meta() + context(ts=self.now()) + event('task_started', self.now()) + usage_record(ts=self.now()))
+        with open(server.CODEX_INDEX, 'w') as f:
+            f.write(json.dumps({'id': THREAD, 'thread_name': 'Разобрать события'}) + '\n')
+        [s] = server.sessions()
+        self.assertEqual((s['provider'], s['title'], s['project'], s['id']), ('codex', 'Разобрать события', 'app', THREAD))
+        self.assertEqual(s['working'], 1)
+        self.assertTrue(s['isLive'])
+        self.assertAlmostEqual(s['today'], round(server.message_cost('gpt-5.6-sol', USAGE), 2))
+
+    def test_prompt_is_the_title_until_codex_names_the_thread(self):
+        self.write(THREAD, meta() + item('UserMessage', self.now(), content=[{'type': 'text', 'text': 'почини сборку'}]))
+        self.assertEqual(server.sessions()[0]['title'], 'почини сборку')
+
+    def test_touched_file_without_new_records_is_not_a_recent_session(self):
+        self.write(THREAD, meta() + context(ts=iso(time.time() - 3 * 86400)))
+        self.assertEqual(server.sessions(), [])
+
+    def test_review_thread_works_at_its_parents_desk(self):
+        self.write(THREAD, meta() + context(ts=self.now()) + usage_record(ts=self.now()))
+        self.write('child', meta(thread='child', source={'subagent': {'other': 'guardian'}}, parent_thread_id=THREAD)
+                   + context('codex-auto-review', ts=self.now()) + event('task_started', self.now()) + usage_record(ts=self.now()))
+        [s] = server.sessions()
+        self.assertEqual((s['id'], s['agents'], s['working']), (THREAD, 1, 1))
+        st = server.state(THREAD)
+        [a] = st['agents']
+        self.assertEqual((a['type'], a['model'], a['isWorking']), ('guardian', 'codex-auto-review', True))
+        self.assertEqual([d['name'] for z in st['office']['zones'] for d in z['desks']], ['Главный', 'Контролёр'])
+
+    def test_codex_office_has_its_own_sign_and_no_generation(self):
+        self.write(THREAD, meta() + context(ts=self.now()) + event('task_started', self.now()))
+        st = server.state(THREAD)
+        self.assertEqual(st['office']['provider'], 'codex')
+        self.assertEqual(st['office']['accent'], server.CODEX_ACCENT)
+        self.assertEqual(st['office']['title'], 'ОФИС · APP')
+        self.assertTrue(st['producer']['isBusy'])
+        self.assertEqual(st['producer']['model'], 'gpt-5.6-sol')
+
+    def test_folder_with_a_claude_office_stays_codex_inside_codex_session(self):
+        os.makedirs(os.path.dirname(server.office_path('/work/app')), exist_ok=True)
+        with open(server.office_path('/work/app'), 'w') as f:
+            json.dump({'folder': '/work/app', 'title': 'СТУДИЯ', 'zones': [], 'guests': {}}, f)
+        self.write(THREAD, meta() + context(ts=self.now()))
+        self.assertEqual(server.state(THREAD)['office']['title'], 'ОФИС · APP')
+
+    def test_no_codex_folder_is_fine(self):
+        server.CODEX_SESSIONS = os.path.join(self.dir.name, 'нет')
+        self.assertEqual(server.sessions(), [])
+
+
+class LedgerCodexTest(unittest.TestCase):
+    usd = server.message_cost('gpt-5.6-sol', USAGE)
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.claude = os.path.join(self.dir.name, 'claude')
+        self.codex = os.path.join(self.dir.name, 'sessions')
+        os.makedirs(os.path.join(self.claude, '-work-app'))
+        self.day = os.path.join(self.codex, '2026', '01', '01')
+        os.makedirs(self.day)
+        self.path = os.path.join(self.day, 'rollout-2026-01-01T10-00-00-%s.jsonl' % THREAD)
+        self.cache = os.path.join(self.dir.name, 'stats.json')
+        self.at = iso(local_day(0) + 3600)
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def write(self, text, mode='w', path=None):
+        with open(path or self.path, mode) as f:
+            f.write(text)
+
+    def scan(self, ledger=None):
+        ledger = ledger or server.Ledger(self.cache)
+        ledger.scan(self.claude, self.codex)
+        return ledger
+
+    def zstd(self):
+        exe = server.find_zstd()
+        if not exe:
+            self.skipTest('нет zstd')
+        import subprocess
+        subprocess.run([exe, '-q', '--rm', '-f', self.path], check=True)
+
+    def session(self):
+        return meta() + context(ts=self.at) + usage_record(ts=self.at)
+
+    def test_codex_spending_lands_in_the_same_report(self):
+        self.write(self.session())
+        with open(os.path.join(self.claude, '-work-app', 'sid.jsonl'), 'w') as f:
+            f.write(assistant('m1', ts=self.at))
+        today = self.scan().report()['days'][-1]
+        self.assertEqual(set(today['models']), {'gpt-5.6-sol', 'claude-sonnet-5-5'})
+        self.assertAlmostEqual(today['projects']['app'], self.usd + server.message_cost('claude-sonnet-5-5', {'input_tokens': 1000, 'output_tokens': 100}), delta=1e-4)  # отчёт округляет до 4 знаков
+        self.assertEqual(today['tokParts'][:3], [1200, 200, 800])
+        self.assertEqual((today['sessions'], today['started']), (2, 2))
+
+    def test_report_for_one_provider(self):
+        self.write(self.session())
+        with open(os.path.join(self.claude, '-work-app', 'sid.jsonl'), 'w') as f:
+            f.write(assistant('m1', ts=iso(local_day(-2) + 3600)))
+        ledger = self.scan()
+        codex = ledger.report(provider='codex')
+        self.assertEqual(codex['since'], server.day_of(local_day(0) * 1000))
+        self.assertEqual(list(codex['days'][-1]['models']), ['gpt-5.6-sol'])
+        self.assertEqual((codex['days'][-1]['sessions'], codex['days'][-1]['started']), (1, 1))
+        self.assertAlmostEqual(codex['days'][-1]['usd'], self.usd, delta=1e-4)  # отчёт округляет до 4 знаков
+        self.assertEqual([h[2] for h in codex['hours']], [round(self.usd, 4)])
+        claude = ledger.report(provider='claude')
+        self.assertEqual(claude['since'], server.day_of(local_day(-2) * 1000))
+        self.assertEqual(claude['days'][-1]['usd'], 0)
+        self.assertEqual(set(ledger.report()['first']), {'claude', 'codex'})
+        self.assertEqual(ledger.report()['first']['codex'], server.day_of(local_day(0) * 1000))
+
+    def test_review_thread_pays_but_is_not_a_session(self):
+        self.write(meta(thread='child', source={'subagent': {'other': 'guardian'}}, parent_thread_id=THREAD)
+                   + context('codex-auto-review', ts=self.at) + usage_record(ts=self.at))
+        today = self.scan().report()['days'][-1]
+        self.assertEqual(today['tokModels'], {'codex-auto-review': 1100})
+        self.assertEqual((today['sessions'], today['started']), (0, 0))
+        self.assertEqual(today['usd'], 0)  # цены нет в прайсе
+
+    def test_chatgpt_project_folder_gets_a_readable_name(self):
+        self.write(meta(cwd='/u/.codex/.chatgpt-projects/g-p-6aa15ef21e70') + context(cwd='/u/.codex/.chatgpt-projects/g-p-6aa15ef21e70', ts=self.at) + usage_record(ts=self.at))
+        self.assertEqual(list(self.scan().report()['days'][-1]['projects']), ['ChatGPT-проект'])
+
+    def test_appended_lines_are_read_once(self):
+        self.write(self.session())
+        ledger = self.scan()
+        self.write(usage_record(ts=self.at), mode='a')
+        self.scan(ledger)
+        self.scan(ledger)
+        self.assertAlmostEqual(ledger.report()['days'][-1]['usd'], 2 * self.usd, delta=1e-4)  # отчёт округляет до 4 знаков
+
+    def test_compressed_journal_is_read(self):
+        self.write(self.session())
+        self.zstd()
+        self.assertAlmostEqual(self.scan().report()['days'][-1]['usd'], self.usd, delta=1e-4)  # отчёт округляет до 4 знаков
+
+    def test_compressing_a_journal_does_not_count_it_twice(self):
+        self.write(self.session())
+        ledger = self.scan()
+        ledger.save()
+        self.zstd()
+        again = server.Ledger(self.cache)
+        self.scan(again)
+        self.scan(again)
+        self.assertAlmostEqual(again.report()['days'][-1]['usd'], self.usd, delta=1e-4)  # отчёт округляет до 4 знаков
+
+    def test_journal_resumed_after_compression_adds_only_the_new_part(self):
+        self.write(self.session())
+        ledger = self.scan()
+        self.zstd()
+        self.scan(ledger)
+        import subprocess
+        subprocess.run([server.find_zstd(), '-q', '-d', '--rm', '-f', self.path + '.zst'], check=True)
+        self.write(usage_record(ts=self.at), mode='a')
+        self.scan(ledger)
+        self.assertAlmostEqual(ledger.report()['days'][-1]['usd'], 2 * self.usd, delta=1e-4)  # отчёт округляет до 4 знаков
+
+    def test_without_zstd_compressed_journals_wait(self):
+        self.write(self.session())
+        self.zstd()
+        find, server.find_zstd = server.find_zstd, lambda: None
+        try:
+            ledger = self.scan()
+            self.assertEqual(ledger.report()['days'], [])
+        finally:
+            server.find_zstd = find
+        self.assertAlmostEqual(self.scan(ledger).report()['days'][-1]['usd'], self.usd, delta=1e-4)  # отчёт округляет до 4 знаков
+
+    def test_old_stats_file_keeps_claude_and_gains_codex(self):
+        hour = time.strftime('%Y-%m-%dT%H', time.localtime(local_day(-1) + 3600))
+        cell = [1.0, 0.0, 0.0, 0.0, 1100, 1000, 100, 0, 0]
+        self.write(json.dumps({'v': server.Ledger.VERSION, 'files': {}, 'hours': {hour: {'app': {'claude-opus-5-5': cell}}}}), path=self.cache)
+        self.write(self.session())
+        days = {d['day']: d for d in self.scan().report()['days']}
+        self.assertEqual(days[hour[:10]]['usd'], 1.0)
+        self.assertAlmostEqual(days[server.day_of(local_day(0) * 1000)]['usd'], self.usd, delta=1e-4)  # отчёт округляет до 4 знаков
+
+    def test_latest_limits_survive_a_restart(self):
+        old = {'limit_id': 'codex', 'plan_type': 'plus', 'primary': {'used_percent': 90.0, 'window_minutes': 300, 'resets_at': 100}}
+        new = {'limit_id': 'codex', 'plan_type': 'plus', 'primary': {'used_percent': 24.0, 'window_minutes': 300, 'resets_at': 200},
+               'secondary': {'used_percent': 8.0, 'window_minutes': 10080, 'resets_at': 300}}
+        self.write(meta() + context(ts=self.at) + token_count(10, 0, 1, ts='2026-01-02T10:00:00.000Z', limits=new)
+                   + token_count(11, 0, 1, ts='2026-01-01T10:00:00.000Z', limits=old))
+        ledger = self.scan()
+        ledger.save()
+        limits = server.Ledger(self.cache).report()['limits']
+        self.assertEqual(limits['plan'], 'plus')
+        self.assertEqual([(w['minutes'], w['used'], w['resets']) for w in limits['windows']], [(300, 24.0, 200), (10080, 8.0, 300)])
 
 
 FAKE_OK = '''#!/usr/bin/env python3

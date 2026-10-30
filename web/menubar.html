@@ -10,6 +10,8 @@
     --bg: #14151f; --panel: #1c1d2b; --line: #2a2c40; --text: #e8e6f0; --muted: #8a8fb0; --gold: #f0c040; --ok: #4ade80; --off: #e05a5a;
     --floor: #2e3150; --wall: #191a29; --plate: #f4f1e8; --ink: #1d1f2e;
     --m-fable: #b8801c; --m-opus: #d0566e; --m-sonnet: #3a95cf; --m-haiku: #4a9e5c; --m-other: #8c6fd0;
+    --m-astra: #4fb3c8; --m-sol: #2f7f97; --m-terra: #8fd6e4; --m-luna: #c3ecf3; --m-gpt: #5f8fa6;
+    --claude: #e08a5b; --codex: #4fb3c8;
     --t-in: #3a95cf; --t-out: #f0c040; --t-read: #5d628f; --t-write: #c27ba0;
     --px: 2px;
   }
@@ -59,6 +61,17 @@
 
   .row { display: flex; align-items: center; gap: 9px; width: 100%; text-align: left; padding: 7px 9px; margin-bottom: 4px; background: var(--panel); border: 0; color: var(--text); font: inherit; cursor: pointer; }
   .row:hover { background: var(--floor); }
+  /* чья сессия: полоса слева и подпись; цвета те же, что у списка в офисе */
+  .row { position: relative; padding-left: 12px; }
+  .row::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--pc); }
+  .p-claude { --pc: var(--claude); }
+  .p-codex { --pc: var(--codex); }
+  .row .p em { margin-right: 5px; color: var(--pc); font: 600 10px Menlo, ui-monospace, monospace; font-style: normal; }
+  .split { display: flex; height: 10px; margin-bottom: 5px; background: var(--line); }
+  .split i { display: block; height: 100%; }
+  .splits { display: flex; justify-content: space-between; margin-bottom: 14px; font-size: 11px; color: var(--muted); }
+  .splits b { color: var(--text); font: 600 12px Menlo, ui-monospace, monospace; }
+  .splits i { display: inline-block; width: 8px; height: 8px; margin-right: 5px; }
   .row .body { flex: 1; min-width: 0; }
   .row .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .row .p { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -73,10 +86,16 @@
   .note { font-size: 11px; color: var(--muted); margin: -4px 0 12px; }
   .note b { color: var(--text); font-weight: 600; }
 
-  .seg { display: flex; gap: 4px; margin-bottom: 12px; }
-  .seg button { background: var(--panel); color: var(--muted); border: 0; padding: 4px 10px; font: 12px -apple-system, Helvetica, sans-serif; cursor: pointer; }
-  .seg button.on { background: var(--plate); color: var(--ink); font-weight: 600; }
-  .seg .since { margin-left: auto; align-self: center; font-size: 11px; color: var(--muted); }
+  /* фильтры — не вкладки: период простым текстом, провайдеры как легенда графика */
+  .filters { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+  .filters button { background: none; border: 0; padding: 3px 0; color: var(--muted); font: 12px -apple-system, Helvetica, sans-serif; cursor: pointer; }
+  .filters button:hover { color: var(--text); }
+  .ranges, .who { display: flex; gap: 12px; }
+  .ranges button.on { color: var(--text); box-shadow: inset 0 calc(-1 * var(--px)) 0 var(--gold); }
+  .who button { display: flex; align-items: center; gap: 5px; color: var(--text); }
+  .who i { width: 8px; height: 8px; background: var(--pc); }
+  .who button.off { color: var(--muted); }
+  .who button.off i { background: transparent; box-shadow: inset 0 0 0 var(--px) var(--pc); opacity: .6; }
 
   .chart { background: var(--panel); padding: 8px 8px 4px; }
   .chart svg { display: block; width: 100%; height: auto; shape-rendering: crispEdges; }

@@ -10,6 +10,7 @@ let stats = null;
 let online = false;
 let tab = load('tab', 'sessions');
 let range = load('range', '30');
+let provider = load('provider', 'all'); // all, claude или codex: один фильтр на статистику и токены
 let autostart = false;
 let active = true;
 function load(key, fallback) {
@@ -57,13 +58,25 @@ function ago(t) {
     return m < 60 ? `${m} мин назад` : `${Math.round(m / 60)} ч назад`;
 }
 // ── Models: fixed order, fixed colors (validated against the dark panel) ──
-const MODELS = ['fable', 'opus', 'sonnet', 'haiku', 'other'];
+const MODELS = ['fable', 'opus', 'sonnet', 'haiku', 'astra', 'sol', 'terra', 'luna', 'gpt', 'other'];
 const family = (model) => MODELS.find(f => model.includes(f)) ?? 'other';
 const color = (f) => `var(--m-${f})`;
 function modelName(model) {
+    if (model === 'codex-auto-review')
+        return 'Авторевью';
+    if (model.startsWith('gpt-')) {
+        const [, version, ...rest] = model.split('-');
+        return ['GPT-' + version, ...rest.map(w => w[0]?.toUpperCase() + w.slice(1))].join(' ');
+    }
     const m = model.replace(/^claude-/, '').split('-');
     const name = m[0] ?? model;
     return name[0]?.toUpperCase() + name.slice(1) + (m.length > 1 ? ' ' + m.slice(1).join('.') : '');
+}
+// several models in one line don't fit the name column: the family's name, the list in the tooltip
+function familyRow(f, slot) {
+    const names = [...slot.names];
+    const name = names.length === 1 ? names[0] : f === 'gpt' ? 'GPT старые' : f[0].toUpperCase() + f.slice(1);
+    return { name, usd: slot.usd, fill: color(f), tip: `<b>${esc(name)}</b><br>${esc(names.join(', '))}` };
 }
 function byFamily(days, of = d => d.models) {
     const out = new Map();
@@ -139,8 +152,12 @@ async function refresh(withStats = false) {
     online = list !== null;
     if (list)
         sessions = list;
-    if (withStats || !stats || tab !== 'sessions')
-        stats = await get('api/stats') ?? stats;
+    if (withStats || !stats || tab !== 'sessions') {
+        const asked = provider;
+        const fresh = await get(asked === 'all' ? 'api/stats' : 'api/stats?p=' + asked);
+        if (asked === provider)
+            stats = fresh ?? stats;
+    }
     render();
 }
 // ── Header ──
@@ -154,17 +171,26 @@ function renderState() {
 }
 // ── Sessions tab ──
 function sessionRow(s, lamp) {
-    const state = s.working > 0 ? `в работе: ${s.working}` : s.isLive ? 'затихла' : ago(s.at);
+    const state = s.working > 0 ? `в работе: ${s.working}` : s.isLive ? `ждёт · ${ago(s.at)}` : ago(s.at);
     // главное — сегодняшнее; полная цена сессии, если она шла и раньше
     const money2 = !s.today
         ? `<div class="a">${money(s.cost)}</div><div class="b">до сегодня</div>`
         : money(s.today) === money(s.cost)
             ? `<div class="a">${money(s.today)}</div><div class="b">сегодня</div>`
             : `<div class="a">${money(s.today)}</div><div class="b">сегодня · всего ${money(s.cost)}</div>`;
-    return `<button class="row" data-open="/#${esc(s.id)}" title="Открыть офис сессии">
+    return `<button class="row p-${s.provider}" data-open="/#${esc(s.id)}" title="Открыть офис сессии">
     ${lamp ? `<span class="lamp${s.working > 0 ? '' : ' idle'}"></span>` : ''}
-    <span class="body"><div class="t">${esc(s.title)}</div><div class="p">${esc(s.project)} · ${state}</div></span>
+    <span class="body"><div class="t">${esc(s.title)}</div><div class="p"><em>${s.provider === 'codex' ? 'CODEX' : 'CLAUDE'}</em>${esc(s.project)} · ${state}</div></span>
     <span class="money">${money2}</span></button>`;
+}
+// who spent today: shown once there is something to compare
+function splitBar() {
+    const of = (p) => sessions.filter(s => s.provider === p).reduce((a, s) => a + (s.today ?? 0), 0);
+    const claude = of('claude'), codex = of('codex'), all = claude + codex;
+    if (!claude || !codex)
+        return '';
+    return `<div class="split"><i style="width:${(claude / all) * 100}%;background:var(--claude)"></i><i style="width:${(codex / all) * 100}%;background:var(--codex)"></i></div>
+    <div class="splits"><span><i style="background:var(--claude)"></i>Claude Code <b>${money(claude)}</b></span><span><i style="background:var(--codex)"></i>Codex <b>${money(codex)}</b></span></div>`;
 }
 function renderSessions() {
     const today = sessions.reduce((a, s) => a + (s.today ?? 0), 0);
@@ -176,19 +202,53 @@ function renderSessions() {
     <div class="tile pix"><div class="k">Сегодня</div><div class="v">${money(today)}</div><div class="s">с 00:00</div></div>
     <div class="tile pix"><div class="k">В работе</div><div class="v">${busy.length ? '<span class="lamp big"></span>' : ''}${busy.length}</div><div class="s">${busy.length ? `исполнителей: ${hands}` : 'сессий'}</div></div>
   </div>`;
+    html += splitBar();
     const live = sessions.filter(s => s.isLive).sort((a, b) => b.working - a.working || b.at - a.at);
     const rest = sessions.filter(s => !s.isLive && ((s.today ?? 0) > 0 || s.at >= midnight));
-    html += `<section><h3>ОТКРЫТЫЕ <span class="hint">${live.length || ''}</span></h3>`;
-    html += live.length ? live.map(s => sessionRow(s, true)).join('') : `<div class="empty">${online ? 'Открытых сессий нет' : 'Сервер не отвечает'}</div>`;
+    html += `<section><h3>АКТИВНЫЕ <span class="hint">${live.length || ''}</span></h3>`;
+    html += live.length ? live.map(s => sessionRow(s, true)).join('') : `<div class="empty">${online ? 'Активных сессий нет' : 'Сервер не отвечает'}</div>`;
     html += '</section>';
     if (rest.length) {
-        html += `<details${load('rest', '') ? ' open' : ''} id="rest"><summary><h3><span>ЗАТИХШИЕ СЕГОДНЯ</span> <span class="hint">${rest.length} · ${money(rest.reduce((a, s) => a + (s.today ?? 0), 0))}</span></h3></summary>`;
+        html += `<details${load('rest', '') ? ' open' : ''} id="rest"><summary><h3><span>РАНЬШЕ СЕГОДНЯ</span> <span class="hint">${rest.length} · ${money(rest.reduce((a, s) => a + (s.today ?? 0), 0))}</span></h3></summary>`;
         html += rest.map(s => sessionRow(s, false)).join('') + '</details>';
     }
     return html;
 }
 // ── Stats tab ──
 const W = 348;
+const PROVIDERS = [['claude', 'Claude'], ['codex', 'Codex']];
+// One quiet row under the tabs: the period on the left, who on the right.
+// Providers work like a chart legend: both lit is everything, a click leaves one, another click brings both back.
+function filters(all) {
+    const who = PROVIDERS.map(([k, name]) => `<button data-provider="${k}" class="p-${k}${provider !== 'all' && provider !== k ? ' off' : ''}"
+    title="${provider === k ? 'Показать всех' : 'Только ' + name}"><i></i>${name}</button>`).join('');
+    return `<div class="filters"><span class="ranges">${ranges(all)
+        .map(([k, t]) => `<button data-range="${k}" class="${range === k ? 'on' : ''}">${t}</button>`).join('')}</span><span class="who">${who}</span></div>`;
+}
+// the two histories start apart: an empty early stretch does not mean nobody worked
+function historyNote() {
+    const first = stats?.first ?? {};
+    const parts = [first.claude && `Claude Code с ${short(first.claude)}`, first.codex && `Codex с ${short(first.codex)}`].filter(Boolean);
+    return `<p class="note">История: ${parts.join(', ')}. Сервер копит её в своей папке, поэтому она переживает чистку журналов. Суммы посчитаны по ценам API, по подписке счёт другой. Обычные чаты claude.ai и ChatGPT сюда не входят.</p>`;
+}
+function until(seconds) {
+    const h = (seconds * 1000 - Date.now()) / 3600e3;
+    return h >= 24 ? `${Math.round(h / 24)} дн` : h >= 1 ? `${Math.round(h)} ч` : `${Math.max(1, Math.round(h * 60))} мин`;
+}
+// subscription limits come from Codex's own logs; a window past its reset has started over
+function renderLimits() {
+    const limits = stats?.limits;
+    if (provider === 'claude' || !limits?.windows?.length)
+        return '';
+    const rows = limits.windows.map(w => {
+        const over = w.resets * 1000 < Date.now();
+        const used = over ? 0 : w.used;
+        const name = w.minutes >= 10080 ? 'Неделя' : w.minutes >= 1440 ? `${Math.round(w.minutes / 1440)} дн` : `${Math.round(w.minutes / 60)} ч`;
+        return `<div class="line"><span class="name">${name}</span><span class="track"><span class="fill" style="display:block;width:${Math.min(used, 100)}%;background:var(--codex)"></span></span>
+      <span class="val">${Math.round(used)}% <small>${over ? 'сброшен' : until(w.resets)}</small></span></div>`;
+    }).join('');
+    return `<section><h3>ЛИМИТЫ CODEX <span class="hint">${limits.plan ? esc(limits.plan) + ' · ' : ''}занято и до сброса</span></h3><div class="bars">${rows}</div></section>`;
+}
 function rangeDays(all) {
     return range === 'all' ? all : all.slice(-Number(range));
 }
@@ -320,17 +380,13 @@ function barList(rows, total, fmt = money) {
     <span class="track"><span class="fill" style="display:block;width:${(r.usd / max) * 100}%;background:${r.fill}"></span></span>
     <span class="val">${fmt(r.usd)} <small>${pct(r.usd, total)}</small></span></div>`).join('') + '</div>';
 }
-function rangeBar(all, days) {
-    return `<div class="seg">${ranges(all)
-        .map(([k, t]) => `<button data-range="${k}" class="${range === k ? 'on' : ''}">${t}</button>`).join('')}
-    <span class="since">${short(days[0].day)} — ${short(days[days.length - 1].day)}</span></div>`;
-}
+const span = (days) => `${short(days[0].day)} — ${short(days[days.length - 1].day)}`;
 function renderStats() {
     if (!stats)
-        return `<div class="empty">${online ? 'Считаю траты по журналам…' : 'Сервер не отвечает'}</div>`;
+        return filters([]) + `<div class="empty">${online ? 'Считаю траты по журналам…' : 'Сервер не отвечает'}</div>`;
     const all = stats.days;
     if (!all.length)
-        return '<div class="empty">Журналов с тратами пока нет</div>';
+        return filters(all) + '<div class="empty">Журналов с тратами пока нет</div>';
     if (!ranges(all).some(([k]) => k === range))
         range = 'all';
     const days = rangeDays(all);
@@ -338,7 +394,7 @@ function renderStats() {
     const started = days.reduce((a, d) => a + d.started, 0);
     const active = days.filter(d => d.usd > 0).length;
     const tokensSum = days.reduce((a, d) => a + d.tokens, 0);
-    let html = rangeBar(all, days);
+    let html = filters(all);
     html += `<div class="tiles four">
     <div class="tile pix"><div class="k">Потрачено</div><div class="v">${money(total)}</div><div class="s">${tokens(tokensSum)} ток.</div></div>
     <div class="tile pix"><div class="k">В день</div><div class="v">${money(active ? total / active : 0)}</div><div class="s">${active} из ${days.length} дн.</div></div>
@@ -350,7 +406,7 @@ function renderStats() {
     const rows = byWeek ? weeks(days) : days;
     // week over week only makes sense over the whole history, not inside a 7- or 30-day window
     const wow = range === 'all' ? weekOverWeek(all) : '';
-    html += `<section><h3>${byWeek ? 'ПО НЕДЕЛЯМ' : 'ПО ДНЯМ'} <span class="hint">${byWeek && wow ? wow : 'наведите на столбик'}</span></h3><div class="chart pix">`;
+    html += `<section><h3>${byWeek ? 'ПО НЕДЕЛЯМ' : 'ПО ДНЯМ'} <span class="hint">${byWeek && wow ? wow : span(days)}</span></h3><div class="chart pix">`;
     html += barChart(rows, r => short(r.day), (r, i) => tipOf(byWeek ? 'неделя с ' + short(r.day) : `${WEEKDAYS[weekday(r.day)]}, ${short(r.day)}`, r, (byWeek ? vsPrev(rows, i) : '') + `<br>сессий: ${r.started}`));
     html += legend(fams) + '</div></section>';
     // the main chart is daily here, so the weeks get their own; by week it already shows them
@@ -361,7 +417,7 @@ function renderStats() {
         html += '</div></section>';
     }
     html += '<section><h3>МОДЕЛИ</h3>';
-    html += barList(MODELS.filter(f => fams.has(f)).map(f => ({ name: [...fams.get(f).names].join(', '), usd: fams.get(f).usd, fill: color(f) })), total);
+    html += barList(MODELS.filter(f => fams.has(f)).map(f => familyRow(f, fams.get(f))), total);
     html += '</section>';
     const parts = [0, 1, 2, 3].map(i => days.reduce((a, d) => a + (d.parts[i] ?? 0), 0));
     const partNames = ['Вход', 'Ответы модели', 'Чтение кэша', 'Запись в кэш'];
@@ -370,6 +426,7 @@ function renderStats() {
     html += barList(partNames.map((name, i) => ({ name, usd: parts[i] ?? 0, fill: '#7a80a8', tip: `<b>${name}</b><br>${partTips[i]}` })), total);
     html += '</section>';
     html += `<section><h3>ТРАТЫ ПО ЧАСАМ <span class="hint">дни недели × часы, за ${range === '7' ? 7 : 28} дн.</span></h3><div class="chart pix">${heatmap(all)}</div></section>`;
+    html += renderLimits();
     const projects = new Map();
     for (const d of days)
         for (const [p, usd] of Object.entries(d.projects))
@@ -379,8 +436,8 @@ function renderStats() {
     const other = top.slice(6).reduce((a, [, usd]) => a + usd, 0);
     if (other > 0)
         shown.push({ name: `прочие (${top.length - 6})`, usd: other, fill: 'var(--muted)' });
-    html += '<section><h3>ПРОЕКТЫ <span class="hint">по папке, где запущен Claude Code</span></h3>' + barList(shown, total) + '</section>';
-    html += `<p class="note">История с ${short(stats.since)}. Сервер копит её в своей папке, поэтому она переживает чистку журналов Claude Code.</p>`;
+    html += '<section><h3>ПРОЕКТЫ <span class="hint">по папке, где запущена сессия</span></h3>' + barList(shown, total) + '</section>';
+    html += historyNote();
     return html;
 }
 // ── Tokens tab: the same history counted in tokens, no dollars ──
@@ -407,10 +464,10 @@ function big(n) {
 }
 function renderTokens() {
     if (!stats)
-        return `<div class="empty">${online ? 'Считаю токены по журналам…' : 'Сервер не отвечает'}</div>`;
+        return filters([]) + `<div class="empty">${online ? 'Считаю токены по журналам…' : 'Сервер не отвечает'}</div>`;
     const all = stats.days;
     if (!all.length)
-        return '<div class="empty">Журналов с токенами пока нет</div>';
+        return filters(all) + '<div class="empty">Журналов с токенами пока нет</div>';
     if (!ranges(all).some(([k]) => k === range))
         range = 'all';
     const days = rangeDays(all);
@@ -419,7 +476,7 @@ function renderTokens() {
     const active = days.filter(d => d.tokens > 0).length;
     const started = days.reduce((a, d) => a + d.started, 0);
     const out = days.reduce((a, d) => a + (d.tokParts[1] ?? 0), 0);
-    let html = rangeBar(all, days);
+    let html = filters(all);
     html += `<div class="tiles">
     <div class="tile pix"><div class="k">Всего</div><div class="v">${big(total)}</div><div class="s">за ${days.length} дн.</div></div>
     <div class="tile pix"><div class="k">В день</div><div class="v">${big(active ? total / active : 0)}</div><div class="s">${active} из ${days.length} дн.</div></div>
@@ -427,7 +484,7 @@ function renderTokens() {
   </div>`;
     const byWeek = days.length > 45;
     const rows = byWeek ? weeks(days) : days;
-    html += `<section><h3>${byWeek ? 'ПО НЕДЕЛЯМ' : 'ПО ДНЯМ'} <span class="hint">наведите на столбик</span></h3><div class="chart pix">`;
+    html += `<section><h3>${byWeek ? 'ПО НЕДЕЛЯМ' : 'ПО ДНЯМ'} <span class="hint">${span(days)}</span></h3><div class="chart pix">`;
     html += barChart(rows, r => short(r.day), r => tokenTip(byWeek ? 'неделя с ' + short(r.day) : `${WEEKDAYS[weekday(r.day)]}, ${short(r.day)}`, r), 104, tokByKind, tokens);
     html += '<div class="legend">' + KINDS.map(k => `<span><i style="background:${k.fill}"></i>${k.name}</span>`).join('') + '</div></div></section>';
     const parts = KINDS.map((k, i) => ({ name: k.name, usd: days.reduce((a, d) => a + (d.tokParts[i] ?? 0), 0), fill: k.fill, tip: `<b>${k.name}</b><br>${k.tip}` }));
@@ -439,7 +496,7 @@ function renderTokens() {
     html += `<p class="note">Модель написала <b>${tokens(out)}</b> — ${pct(out, total)} от всех токенов периода. Остальное — контекст, который она читает на каждом шаге.</p>`;
     const fams = byFamily(days, d => d.tokModels);
     html += '<section><h3>МОДЕЛИ</h3>';
-    html += barList(MODELS.filter(f => fams.has(f)).map(f => ({ name: [...fams.get(f).names].join(', '), usd: fams.get(f).usd, fill: color(f) })), total, tokens);
+    html += barList(MODELS.filter(f => fams.has(f)).map(f => familyRow(f, fams.get(f))), total, tokens);
     html += '</section>';
     const projects = new Map();
     for (const d of days)
@@ -450,7 +507,7 @@ function renderTokens() {
     const other = top.slice(6).reduce((a, [, n]) => a + n, 0);
     if (other > 0)
         shown.push({ name: `прочие (${top.length - 6})`, usd: other, fill: 'var(--muted)' });
-    html += '<section><h3>ПРОЕКТЫ <span class="hint">по папке, где запущен Claude Code</span></h3>' + barList(shown, total, tokens) + '</section>';
+    html += '<section><h3>ПРОЕКТЫ <span class="hint">по папке, где запущена сессия</span></h3>' + barList(shown, total, tokens) + '</section>';
     return html;
 }
 // ── Render ──
@@ -485,6 +542,12 @@ document.addEventListener('click', e => {
         range = r.dataset.range;
         keep('range', range);
         return render();
+    }
+    const p = t.closest('[data-provider]');
+    if (p) {
+        provider = provider === p.dataset.provider ? 'all' : p.dataset.provider;
+        keep('provider', provider);
+        refresh(true);
     }
 });
 document.addEventListener('toggle', e => {

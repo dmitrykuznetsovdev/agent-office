@@ -10,6 +10,7 @@
   :root {
     --bg: #14151f; --panel: #1c1d2b; --line: #2a2c40; --text: #e8e6f0; --muted: #8a8fb0; --gold: #f0c040; --ok: #4ade80; --off: #e05a5a;
     --floor: #2e3150; --wall: #191a29; --plate: #f4f1e8; --ink: #1d1f2e; --rim: #44486a;
+    --claude: #e08a5b; --codex: #4fb3c8;
     --gap: 16px; --px: 2px;
   }
   * { box-sizing: border-box; }
@@ -25,6 +26,10 @@
   header { grid-column: 1 / -1; display: flex; align-items: center; gap: 12px; padding: 10px var(--gap); background: var(--wall); border-bottom: var(--px) solid var(--line); }
   header .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--off); flex: none; }
   header .dot.on { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  header .plate { flex: none; padding: 2px 7px; color: var(--ink); font: 700 11px Menlo, monospace; letter-spacing: .06em; background: var(--pc); }
+  header .plate:empty { display: none; }
+  .p-claude { --pc: var(--claude); }
+  .p-codex { --pc: var(--codex); }
   header .title { font-weight: 700; letter-spacing: .04em; color: var(--gold); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   header .status { color: var(--muted); font-size: 13px; white-space: nowrap; }
   header .spacer { flex: 1; }
@@ -77,7 +82,13 @@
   input[type=checkbox]:checked { background: var(--gold); box-shadow: inset 0 0 0 var(--px) #a07d1c; }
   input[type=checkbox]:checked::after { content: ''; width: 6px; height: 3px; border: solid var(--ink); border-width: 0 0 2px 2px; transform: translate(0, -1px) rotate(-45deg); }
 
-  .sess { --c: transparent; display: block; width: calc(100% - 2 * var(--px)); text-align: left; margin: var(--px) var(--px) 8px; padding: 8px 10px; background: var(--bg); font: inherit; letter-spacing: 0; }
+  .sess { --c: transparent; position: relative; display: block; width: calc(100% - 2 * var(--px)); text-align: left; margin: var(--px) var(--px) 8px; padding: 8px 10px 8px 14px; background: var(--bg); font: inherit; letter-spacing: 0; }
+  .sess::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 4px; background: var(--pc); }
+  .sess .tag { margin-right: 6px; color: var(--pc); font: 600 10px Menlo, monospace; font-style: normal; }
+  /* фильтр провайдера: сумма за сегодня под названием */
+  .seg.prov { display: flex; margin: 0 var(--px) 10px; }
+  .seg.prov button { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 1px; padding: 5px 4px; line-height: 1.2; }
+  .seg.prov small { font: 500 11px Menlo, monospace; opacity: .8; }
   .sess:hover { background: var(--floor); }
   .sess.sel { --c: var(--gold); background: var(--floor); }
   .sess .t { display: flex; gap: 8px; align-items: center; font-weight: 600; }
@@ -102,6 +113,7 @@
 <body>
 <header>
   <span class="dot" id="dot"></span>
+  <span class="plate" id="plate"></span>
   <span class="title" id="title">Agent Office</span>
   <span class="status" id="status">подключаюсь…</span>
   <span class="spacer"></span>
@@ -123,6 +135,7 @@
 <aside>
   <section class="sessions">
     <h2>СЕССИИ <label><input type="checkbox" id="follow"> следить за активной</label></h2>
+    <div class="seg prov" id="prov"></div>
     <div id="sessions"><div class="empty">Ищу сессии…</div></div>
   </section>
   <section class="log">
@@ -137,17 +150,22 @@ const { mountFloors, OFFICES, TIME_OPTIONS } = await import('./floors.js?' + Dat
 
 const $ = id => document.getElementById(id)
 const logBox = $('log'), dot = $('dot'), status = $('status')
-const titleEl = $('title'), list = $('sessions'), follow = $('follow'), total = $('total')
+const titleEl = $('title'), list = $('sessions'), follow = $('follow'), total = $('total'), plate = $('plate'), provBox = $('prov')
+const PROVIDERS = { all: 'Все', claude: 'Claude', codex: 'Codex' }
 
 let sessions = []
 let current = location.hash.slice(1)   // выбранная сессия живёт в адресе
 let live = null, lastText = '', lastDraw = 0
+let provider = 'all'
+try { provider = localStorage.getItem('office.provider') || 'all' } catch {}
+if (!(provider in PROVIDERS)) provider = 'all'
 
 follow.checked = !current
 function save(key, value) { try { localStorage.setItem(key, value) } catch {} }
 try { if (!current && localStorage.getItem('office.follow') === '0') follow.checked = false } catch {}
 
 const who = w => roleName(w, live?.office)
+const shown = () => sessions.filter(s => provider === 'all' || s.provider === provider)
 const bannerText = $('bannerText'), gen = $('gen')
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c])
 const hhmm = at => new Date(at).toTimeString().slice(0, 5)
@@ -202,19 +220,32 @@ function draw(st) {
     : lines.map(l => `<div class="line"><time>${new Date(l.at).toTimeString().slice(0, 8)}</time><b>${esc(who(l.who))}</b> · ${esc(l.text)}</div>`).join('')
 }
 
+function drawProviders() {
+  const today = k => sessions.filter(s => k === 'all' || s.provider === k).reduce((a, s) => a + (s.today ?? 0), 0)
+  const html = Object.entries(PROVIDERS).map(([k, name]) =>
+    `<button data-k="${k}" class="${k === provider ? 'on' : ''}" title="Потрачено сегодня">${name}<small>${money(today(k))}</small></button>`).join('')
+  if (html !== provBox.dataset.html) {
+    provBox.dataset.html = html
+    provBox.innerHTML = html
+  }
+}
+
 function drawList() {
-  if (sessions.length === 0) {
-    list.innerHTML = '<div class="empty">За сутки сессий не было.</div>'
+  drawProviders()
+  const rows = shown()
+  if (rows.length === 0) {
+    delete list.dataset.html
+    list.innerHTML = `<div class="empty">За сутки сессий${provider === 'all' ? '' : ' ' + PROVIDERS[provider]} не было.</div>`
     return
   }
-  const html = sessions.map(s => {
+  const html = rows.map(s => {
     const cls = s.working ? 'busy' : s.isLive ? 'live' : ''
     const work = s.working ? `в работе ${s.working}` : ago(s.at)
     const agents = s.agents ? ` · агентов ${s.agents}` : ''
     const usd = s.cost ? ` · <span class="usd">${money(s.cost)}</span>` : ''
-    return `<button class="sess${s.id === current ? ' sel' : ''}" data-id="${s.id}">
+    return `<button class="sess p-${s.provider}${s.id === current ? ' sel' : ''}" data-id="${s.id}">
       <div class="t"><span class="d ${cls}"></span><span>${esc(s.title)}</span></div>
-      <div class="m">${esc(s.project)} · ${work}${agents}${usd}</div></button>`
+      <div class="m"><i class="tag">${PROVIDERS[s.provider]}</i>${esc(s.project)} · ${work}${agents}${usd}</div></button>`
   }).join('')
   // не трогать список без перемен: иначе клик попадает в уже заменённую кнопку
   if (html !== list.dataset.html) {
@@ -229,6 +260,15 @@ list.addEventListener('click', e => {
   follow.checked = false
   save('office.follow', '0')
   pick(b.dataset.id)
+})
+
+provBox.addEventListener('click', e => {
+  const b = e.target.closest('button')
+  if (!b) return
+  provider = b.dataset.k
+  save('office.provider', provider)
+  drawList()
+  if (follow.checked) autoPick()
 })
 
 follow.addEventListener('change', () => {
@@ -247,7 +287,7 @@ function pick(id) {
 
 // самая активная: где больше всего работают, потом — где писали последней
 function autoPick() {
-  const best = [...sessions].sort((a, b) => (b.working - a.working) || (b.at - a.at))[0]
+  const best = shown().sort((a, b) => (b.working - a.working) || (b.at - a.at))[0]
   if (best) pick(best.id)
 }
 
@@ -276,7 +316,7 @@ function seen(o) { try { return Number(localStorage.getItem(seenKey(o)) || 0) } 
 
 function drawBanner(o) {
   const job = o.job
-  gen.hidden = !o.folder || o.folder === '?'
+  gen.hidden = !o.folder || o.folder === '?' || o.provider === 'codex'
   if (gen.hidden) { bannerText.textContent = ''; return }
   const place = o.folder.replace(/^\/Users\/[^/]+/, '~')
   const running = job?.status === 'running'
@@ -351,12 +391,14 @@ async function pollState() {
       draw(live)
     }
     const s = sessions.find(s => s.id === current)
+    plate.className = 'plate p-' + s?.provider
+    plate.textContent = s ? PROVIDERS[s.provider].toUpperCase() : ''
     titleEl.textContent = s ? s.title : 'Agent Office'
     document.title = s ? `Agent Office — ${s.title}` : 'Agent Office'
     const working = live.agents.filter(a => a.isWorking).length + (live.producer.isBusy ? 1 : 0)
     total.textContent = money(live.cost)
     total.title = `${roleName('main', live.office)} ${money(live.producer.cost)}, агенты ${money(live.cost - live.producer.cost)}`
-    status.textContent = !s ? '' : s.isLive ? `${s.project} · в работе ${working}` : `${s.project} · затихла ${ago(s.at)}`
+    status.textContent = !s ? '' : s.isLive ? `${s.project} · в работе ${working}` : `${s.project} · последняя активность ${ago(s.at)}`
   } catch {}
 }
 
