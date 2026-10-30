@@ -497,7 +497,7 @@ function layout(b: { floors: FloorDef[] }, room: Room, key: string): Layout {
 type Label = { x: number; y: number; text: string; px: number; color?: string; w?: number; align?: CanvasTextAlign; maxw?: number; stroke?: boolean; display?: boolean }
 type Flight = { key: string; t0: number; cost: number }
 
-export type FloorsView = { update(st: Studio): void; setStyle(office: string, time: string): void }
+export type FloorsView = { update(st: Studio): void; setStyle(office: string, time: string): void; picture(zoom?: number): HTMLCanvasElement }
 
 export function mountFloors(scene: HTMLCanvasElement, overlay: HTMLCanvasElement, onError: (e: unknown) => void): FloorsView {
   const ctx = scene.getContext('2d')!, octx = overlay.getContext('2d')!
@@ -775,19 +775,19 @@ export function mountFloors(scene: HTMLCanvasElement, overlay: HTMLCanvasElement
     return labels
   }
 
-  function drawLabels(labels: Label[]) {
-    octx.clearRect(0, 0, overlay.width, overlay.height)
-    const k = overlay.width / scene.width, dpr = window.devicePixelRatio || 1
-    octx.textBaseline = 'top'; octx.lineJoin = 'round'
+  function drawLabels(labels: Label[], g = octx, dpr = window.devicePixelRatio || 1) {
+    g.clearRect(0, 0, g.canvas.width, g.canvas.height)
+    const k = g.canvas.width / scene.width
+    g.textBaseline = 'top'; g.lineJoin = 'round'
     for (const l of labels) {
       const px = Math.max(9 * dpr, l.px * k)
-      octx.font = l.display ? `${Math.round(px * 0.8)}px "Press Start 2P", Menlo, monospace` : `${l.w ?? 400} ${Math.round(px)}px Menlo, "JetBrains Mono", monospace`
+      g.font = l.display ? `${Math.round(px * 0.8)}px "Press Start 2P", Menlo, monospace` : `${l.w ?? 400} ${Math.round(px)}px Menlo, "JetBrains Mono", monospace`
       let text = l.text
-      if (l.maxw) { const max = l.maxw * k; while (text.length > 1 && octx.measureText(text).width > max) text = text.slice(0, -2) + '…' }
+      if (l.maxw) { const max = l.maxw * k; while (text.length > 1 && g.measureText(text).width > max) text = text.slice(0, -2) + '…' }
       const x = l.x * k, y = l.y * k
-      octx.textAlign = l.align ?? 'center'
-      if (l.stroke !== false) { octx.lineWidth = Math.max(2, px / 3.5); octx.strokeStyle = 'rgba(8,8,16,0.8)'; octx.strokeText(text, x, y) }
-      octx.fillStyle = l.color ?? '#fff'; octx.fillText(text, x, y)
+      g.textAlign = l.align ?? 'center'
+      if (l.stroke !== false) { g.lineWidth = Math.max(2, px / 3.5); g.strokeStyle = 'rgba(8,8,16,0.8)'; g.strokeText(text, x, y) }
+      g.fillStyle = l.color ?? '#fff'; g.fillText(text, x, y)
     }
   }
 
@@ -805,5 +805,17 @@ export function mountFloors(scene: HTMLCanvasElement, overlay: HTMLCanvasElement
   return {
     update(next: Studio) { st = next; relayout(Date.now()) },
     setStyle(office: string, time: string) { style = { office, time }; L = null; relayout(Date.now()) },
+    // this very frame, enlarged: pixels stay square, labels are drawn anew at the bigger size
+    picture(zoom = 4) {
+      const out = document.createElement('canvas'), text = document.createElement('canvas')
+      out.width = text.width = scene.width * zoom; out.height = text.height = scene.height * zoom
+      const labels = render(Date.now())
+      drawLabels(labels, text.getContext('2d')!, zoom / 2)
+      const g = out.getContext('2d')!
+      g.imageSmoothingEnabled = false
+      g.drawImage(scene, 0, 0, out.width, out.height)
+      g.drawImage(text, 0, 0)
+      return out
+    },
   }
 }
