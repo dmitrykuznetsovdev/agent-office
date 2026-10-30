@@ -1836,7 +1836,10 @@ def sessions():
     tails = claude_tails()
     parent = task_tree(tails)
     views = epic_views()
-    children = epic_children(views)
+    by_id, by_path = epic_children(views)
+    # a worktree that is a coordinator's own folder would take every background session started in the repo
+    homes = {tails[c][0].home for c in views if c in tails}
+    children = by_id, {p: hit for p, hit in by_path.items() if p not in homes}
     roles = {sid: child_of(sid, t.launched, children) for sid, (t, _, _) in tails.items() if sid not in views}
     # an epic is a task of its own: its coordinator is the root, its role sessions hang under it named by their task
     parent.update({sid: hit[0] for sid, hit in roles.items() if hit})
@@ -2041,11 +2044,13 @@ def drawable(path):
     """view.json, который офис может нарисовать, иначе None: один кривой файл не должен стоить всего списка сессий."""
     try:
         view = read_json(path)
-        if isinstance(view, dict) and view.get('schema') == 1:
-            epic_children({'?': (view, 0)})  # every field the list and the floors read, read once here
-            return view
-    except Exception:  # wrong types, or JSON nested past the recursion limit
-        pass
+        if not (isinstance(view, dict) and view.get('schema') == 1):
+            raise ValueError('не JSON со schema 1')
+        epic_children({'?': (view, 0)})  # every field the list and the floors read, read once here
+        return view
+    except Exception as e:  # wrong types, or JSON nested past the recursion limit
+        # called once per mtime: one line per write of the file, not per poll
+        sys.stderr.write('вид эпика %s пропущен: %s\n' % (path, str(e)[:200]))
     return None
 
 
@@ -2086,7 +2091,11 @@ def epic_floors(view):
     идёт ли там работа: спека до ACCEPT, открытый вопрос, открытый пакет)."""
     epic, floors = str(view.get('epic', '?')), []
     items = lambda key: [x for x in view.get(key) or [] if isinstance(x, dict)]
-    roles = lambda x: [r for r in x.get('roles') or [] if isinstance(r, dict) and isinstance(r.get('session'), str) and r.get('role') in ROLE_NAMES]
+    # the coordinator listed as a role of its own (full id or the mod's 8 characters) heads the office, it is not its agent
+    coord = view.get('coordinator')
+    me = coord['session'] if isinstance(coord, dict) and isinstance(coord.get('session'), str) else ''
+    roles = lambda x: [r for r in x.get('roles') or [] if isinstance(r, dict) and isinstance(r.get('session'), str) and r.get('role') in ROLE_NAMES
+                       and r['session'] not in (me, me[:8])]
     seats = lambda p: [('%s/%s/%s' % (epic, p.get('id'), r['role']), ROLE_NAMES[r['role']], '%s %s' % (ROLE_NAMES[r['role']], p.get('id')), r) for r in roles(p)]
     crit = items('critiques')
     if crit:

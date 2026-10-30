@@ -1,5 +1,6 @@
 import datetime
 import http.client
+import io
 import json
 import os
 import re
@@ -1515,12 +1516,51 @@ class EpicTest(unittest.TestCase):
     def test_a_view_the_office_cannot_draw_costs_only_its_own_epic(self):
         for raw in ('{"schema": 1, "coordinator": {"session": "w1"}, "packages": 5}',
                     '{"schema": 1, "coordinator": {"session": "w1"}, "release": {"state": ["x"]}}',
+                    '{"schema": 1, "coordinator": {"session": "w1"}, "worktrees": [{"path": "/x", "role": ["qa"]}]}',
+                    '{"schema": 1, "coordinator": {"session": "w1"}, "packages": [{"id": "P1", "gates": {"a": 1}}]}',
                     '{"schema": 1, "x": %s}' % ('[' * 100000 + ']' * 100000)):
             self.view(raw=raw, name='bad')
             rows = {s['id']: s for s in server.sessions()}
             self.assertEqual((rows['coord'].get('epic'), rows['w1'].get('epic'), rows['w1'].get('parent')), ('e1', None, 'coord'))
             self.assertFalse(server.state('w1')['office'].get('epic'))
             self.assertTrue(server.state('coord')['office'].get('epic'))
+
+    def test_a_fixed_view_is_picked_up_without_a_restart(self):
+        self.view(raw='{"schema": 1, "coordinator": {"session": "coord"}, "packages": 5}', age=60)
+        self.assertFalse(server.state('coord')['office'].get('epic'))
+        self.view()
+        self.assertTrue(server.state('coord')['office'].get('epic'))
+
+    def test_a_skipped_view_is_told_once_per_write(self):
+        path = os.path.join(server.EPICS, 'bad', 'view.json')
+        with mock.patch('sys.stderr', io.StringIO()) as err:
+            self.view(raw='{"schema": 1, "coordinator": {"session": "w1"}, "packages": 5}', name='bad', age=60)
+            for _ in range(3):
+                server.sessions()
+                server.state('coord')
+            self.assertEqual([l for l in err.getvalue().splitlines() if path in l], [mock.ANY])
+            self.view(raw='{не json', name='bad')
+            server.sessions()
+            self.assertEqual(len([l for l in err.getvalue().splitlines() if path in l]), 2)
+            self.assertNotIn(os.path.join(server.EPICS, 'e1'), err.getvalue())
+
+    def test_a_coordinator_listed_as_its_own_role_is_counted_once(self):
+        cost = server.state('coord')['cost']
+        self.edit_view(lambda v: v['packages'][1]['roles'].append({'role': 'qa', 'session': 'coord', 'state': 'working', 'detail': ''}))
+        st = server.state('coord')
+        self.assertNotIn('coord', [a['id'] for a in st['agents']])
+        self.assertEqual((st['cost'], st['producer']['waitingFor']), (cost, 'Исследователь Q1, Писатель P2'))
+        # the mod may write a session as its first 8 characters
+        long = 'abcdef12-3456-7890-abcd-ef1234567890'
+        self.edit_view(lambda v: v['coordinator'].update(session=long))
+        self.assertNotIn(long, [a['id'] for a in server.state(long)['agents']])
+
+    def test_a_worktree_in_the_coordinators_own_folder_takes_no_sessions(self):
+        self.journal('-work-app', 'bg-root', self.bg('b1', '/work/app'))
+        self.edit_view(lambda v: v['worktrees'].append({'path': '/work/app/', 'role': 'writer', 'task': 'P9'}))
+        rows = {s['id']: s for s in server.sessions()}
+        self.assertEqual((rows['bg-root']['parent'], rows['bg-root'].get('role')), ('', None))
+        self.assertEqual(rows['q1-again']['parent'], 'coord')
 
     def test_journal_names_the_task_of_each_role_step(self):
         st = server.state('coord')
