@@ -12,7 +12,7 @@ type Look = { id: string; skin: string; hair: string; shirt: string; pants: stri
 // waiting: a desk whose agent this session has not called yet — its owner sits and waits
 type Person = { key: string; name: string; grade: Grade; model: string; look: Look; boss: boolean; agent?: Agent; desk?: boolean; waiting?: boolean }
 type Cell = { key: string; person?: Person; name: string }
-type FloorDef = { name: string; cells: Cell[]; free?: boolean; home: number; note?: string; track?: Array<[string, string]> | null }
+type FloorDef = { name: string; cells: Cell[]; free?: boolean; home: number; note?: string; strip?: boolean; track?: Array<[string, string]> | null }
 
 const SKIN = ['#f1c27d', '#e0ac69', '#c68642', '#ffdbac', '#8d5524']
 const HAIRS = ['#2b1d14', '#1a1a1a', '#6b4a2b', '#c9a227', '#9a9a9a', '#8a5a2b', '#3a2416', '#e05a8a']
@@ -62,7 +62,7 @@ function building(st: Studio, now: number): { boss: Person; floors: FloorDef[] }
   const [bg, bm] = gradeOf(st.producer.model)
   const boss: Person = { key: 'boss', name: deskName('main', office), grade: bg, model: bm, boss: true, look: lookOf('boss', mainDesk, '#3b3f8f', true) }
   const floors: FloorDef[] = office.zones
-    .map(z => ({ name: z.name, note: z.note, track: z.track, home: 0, cells: z.desks.filter(d => d.type !== 'main').map(d => ({ key: d.type, name: d.short ?? d.name } as Cell)) }))
+    .map(z => ({ name: z.name, note: z.note, strip: z.strip, track: z.track, home: 0, cells: z.strip ? [] : z.desks.filter(d => d.type !== 'main').map(d => ({ key: d.type, name: d.short ?? d.name } as Cell)) }))
   const free: FloorDef = { name: 'ФРИЛАНС', cells: [], free: true, home: 0 }
   const gone = (a: Agent) => !a.isWorking && now - a.endedAt >= AWAY
   // at work first, then home, newest first: a desk goes to whoever is here
@@ -79,6 +79,8 @@ function building(st: Studio, now: number): { boss: Person; floors: FloorDef[] }
     const floor = fi >= 0 ? floors[fi]! : free
     const seat = own ? floor.cells.find(c => c.key === own.type) : undefined
     if (seat && !seat.person) { seat.person = person; if (gone(a)) floor.home++; continue }
+    // a folded floor draws no desks: its people are only counted
+    if (floor.strip) { floor.home++; continue }
     if (gone(a)) {
       // a copy that went home: its desk is taken or it is a free-lancer
       if (!own && free.cells.filter(c => c.person && gone(c.person.agent!)).length < FREE_HOME) free.cells.push({ key: a.id, person, name })
@@ -98,7 +100,7 @@ function building(st: Studio, now: number): { boss: Person; floors: FloorDef[] }
     cell.person = { key: 'wait:' + cell.key, name: cell.name, grade: 'middle', model: '', boss: false, desk: true, waiting: true, look: lookOf(cell.key, desk, '#5a6a8a') }
   }
   if (free.cells.length || free.home) floors.push(free)
-  return { boss, floors: floors.filter(f => f.cells.length || f.home) }
+  return { boss, floors: floors.filter(f => f.cells.length || f.home || f.strip) }
 }
 
 // ── what a person is doing right now ───────────────────────────────────────
@@ -482,7 +484,7 @@ function sky(c: C2, w: number, h: number, tm: string, t: number) {
 // ── layout ─────────────────────────────────────────────────────────────────
 // a cell is 48×61: two info lines (what it does; model and money) · bubble · desk · name plate · slab.
 // A cell's `top` is where its scene starts, after the first 6 px of the info lines.
-const FL = { pad: 6, shaft: 19, plaque: 54, cw: 48, rowH: 61, info: 6, roof: 24, ground: 10, minCols: 8, maxCols: 12 }
+const FL = { pad: 6, shaft: 19, plaque: 54, cw: 48, rowH: 61, info: 6, roof: 24, ground: 10, minCols: 8, maxCols: 12, strip: 23 }
 type Geo = { x: number; top: number; sx: number; sy: number; wide?: boolean }
 type FloorGeo = { def: FloorDef; y: number; h: number; rows: number }
 type Layout = { key: string; f: Fig; cols: number; x0: number; width: number; height: number; floors: FloorGeo[]; cells: Map<string, Geo>; boss: Geo; lobby: number; couchX: number; couchW: number; seats: number }
@@ -497,9 +499,9 @@ function layout(b: { floors: FloorDef[] }, room: Room, key: string): Layout {
   y += FL.rowH
   const floors: FloorGeo[] = [], cells = new Map<string, Geo>()
   for (const def of b.floors) {
-    // a floor whose free-lancers all went home still keeps one row of empty desks
-    const rows = Math.max(1, Math.ceil(def.cells.length / cols))
-    const h = rows * FL.rowH
+    // a floor whose free-lancers all went home still keeps one row of empty desks; a folded one is a band
+    const rows = def.strip ? 0 : Math.max(1, Math.ceil(def.cells.length / cols))
+    const h = def.strip ? FL.strip : rows * FL.rowH
     floors.push({ def, y, h, rows })
     def.cells.forEach((cell, i) => {
       const top = y + Math.floor(i / cols) * FL.rowH + FL.info, x = x0 + (i % cols) * FL.cw
@@ -620,15 +622,6 @@ export function mountFloors(scene: HTMLCanvasElement, overlay: HTMLCanvasElement
     const kilo = (n: number) => Math.round(n / 1000) + 'k'
     labels.push({ x: xL + 4, y: P - FL.info + 8.6, text: tokens && limit ? `контекст ${kilo(tokens)}/${kilo(limit)}` : 'сдано работ: ' + arrived, px: 3.1, color: '#2a2a33', align: 'left', maxw: FL.plaque - 10, stroke: false })
     labels.push({ x: xL + 4, y: P - FL.info + 13.8, text: money(st.cost) + ' всего', px: 3.1, color: '#1f7a3a', w: 600, align: 'left', stroke: false })
-    // an epic's board on the cabinet wall: what landed and what waits; the floors below are only the work in progress
-    const epic = st.office.epic
-    if (epic?.done && epic.queue) {
-      const bw = Math.min(150, ww / 2 - 30)
-      whiteboard(c, wx + 6, P + 6, bw, 27)
-      labels.push({ x: wx + 9, y: P + 7.5, text: 'ДОСКА ЭПИКА', px: 3.4, color: '#2445a8', w: 600, align: 'left', stroke: false })
-      labels.push({ x: wx + 9, y: P + 14, text: epic.done.length ? `сдано ${epic.done.length}: ${epic.done.join(' ')}` : 'сдано: пока ничего', px: 3.3, color: '#1f7a3a', w: 600, align: 'left', maxw: bw - 6, stroke: false })
-      labels.push({ x: wx + 9, y: P + 20.5, text: epic.queue.length ? `очередь ${epic.queue.length}: ${epic.queue.join(' ')}` : 'очередь пуста', px: 3.3, color: '#2a2a33', align: 'left', maxw: bw - 6, stroke: false })
-    }
 
     // floors
     for (const fl of L.floors) {
@@ -646,9 +639,19 @@ export function mountFloors(scene: HTMLCanvasElement, overlay: HTMLCanvasElement
       }
       const busyHere = people.filter(p => now_.get(p.key)!.work).length
       const second = fl.def.note ?? `в деле ${busyHere}` + (fl.def.home ? ` · дома ${fl.def.home}` : '')
+      // a folded floor: a band with its stages and what the floor says, and no desks; a package not dispatched yet is dark
       const track = fl.def.track
+      if (fl.def.strip) {
+        const dark = !!track && track.every(([, s]) => s === 'ahead')
+        R(c, xL, fl.y, xR - xL, fl.h - 2, dark ? shade(room.wall2, 0.55) : room.wall2); R(c, xL, fl.y + fl.h - 2, xR - xL, 2, room.slab)
+      }
       whiteboard(c, xL + 2, fl.y + 2, FL.plaque - 6, 19)
       labels.push({ x: xL + 4, y: fl.y + 3.3, text: fl.def.name, px: 3.4, color: '#2445a8', w: 600, align: 'left', maxw: FL.plaque - 10, stroke: false })
+      if (fl.def.strip) {
+        const used = track ? stageTrack(c, labels, track, x0 + 4, fl.y + 6, t) : 0
+        labels.push({ x: x0 + 8 + used, y: fl.y + 8.2, text: second, px: 3.6, color: 'rgba(245,245,255,0.92)', w: 600, align: 'left', maxw: L.cols * FL.cw - used - 12, stroke: false })
+        continue
+      }
       // a floor at work keeps its track on the wall, right of the desks
       if (track) stageTrack(c, labels, track, xR - track.length * (SEG.w + SEG.gap) - 4, fl.y + 2, t)
       labels.push({ x: xL + 4, y: fl.y + 8.6, text: second, px: 3.1, color: '#2a2a33', align: 'left', maxw: FL.plaque - 10, stroke: false })

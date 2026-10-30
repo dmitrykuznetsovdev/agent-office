@@ -1342,27 +1342,45 @@ class EpicTest(unittest.TestCase):
     def floors(self, office):
         return [(z['name'], z.get('note'), [d.get('short') or d['name'] for d in z['desks'] if d['type'] != 'main']) for z in office['zones']]
 
-    def test_only_work_in_progress_gets_a_floor_the_rest_is_on_the_cabinet_board(self):
+    def strips(self, office):
+        return [z.get('strip') for z in office['zones']]
+
+    def test_every_floor_is_shown_landed_packages_share_one(self):
         office = server.state('coord')['office']
         self.assertEqual(office['title'], 'EPIC E1 · SPEC R2 · 1/3')
-        self.assertEqual(office['epic'], {'context': 147000, 'limit': 250000, 'done': ['P1'], 'queue': ['P3']})
-        # the accepted spec, the landed P1 and the undispatched P3 have nobody at work: no floor
+        self.assertEqual(office['epic'], {'context': 147000, 'limit': 250000})
         self.assertEqual(self.floors(office), [
+            ('СПЕКА', 'r1 ACCEPT', ['Критик r1']),
             ('ИССЛЕДОВАНИЯ', 'Q1', ['Исследователь Q1']),
+            ('СДАНО', 'сдано 1 из 3', ['Писатель', 'Контролёр']),
             ('P2', 'поп. 2 · active', ['Писатель', 'Контролёр']),
+            ('P3', 'не выдан', []),
         ])
+        # only the work in progress is a full floor: the accepted spec, the landed packages and the plan are bands
+        self.assertEqual(self.strips(office), [True, False, True, False, True])
+
+    def test_an_open_package_floor_stays_full_while_its_roles_rest(self):
+        path = os.path.join(server.EPICS, 'e1', 'view.json')
+        with open(path) as f:
+            view = json.load(f)
+        view['packages'][1]['roles'][0]['state'] = 'idle'
+        self.view(raw=json.dumps(view))
+        self.assertEqual(self.strips(server.state('coord')['office'])[3], False)
 
     def test_spec_floor_stays_until_the_critique_accepts(self):
         for verdict in ('REJECT', None):
             self.view(verdict=verdict)
-            self.assertEqual(self.floors(server.state('coord')['office'])[0], ('СПЕКА', 'r1 %s' % (verdict or '…'), ['Критик r1']))
+            office = server.state('coord')['office']
+            self.assertEqual((self.floors(office)[0], self.strips(office)[0]), (('СПЕКА', 'r1 %s' % (verdict or '…'), ['Критик r1']), False))
 
-    def test_a_package_floor_carries_its_track_of_stages(self):
+    def test_each_floor_carries_its_track(self):
         tracks = [z.get('track') for z in server.state('coord')['office']['zones']]
-        self.assertEqual(tracks, [None, [['патч', 'next'], ['QA', 'ahead'], ['влит', 'ahead'], ['выкачен', 'ahead']]])
+        self.assertEqual(tracks, [[['r1', 'passed']], None, [['P1', 'passed']],
+                                  [['патч', 'next'], ['QA', 'ahead'], ['влит', 'ahead'], ['выкачен', 'ahead']],
+                                  [['патч', 'ahead'], ['QA', 'ahead'], ['влит', 'ahead'], ['выкачен', 'ahead']]])
 
     def test_an_open_package_keeps_an_empty_desk_for_its_qa(self):
-        p2 = server.state('coord')['office']['zones'][1]
+        p2 = server.state('coord')['office']['zones'][3]
         qa = [d for d in p2['desks'] if d.get('short') == 'Контролёр']
         self.assertEqual([d['type'] for d in qa], ['e1/P2/qa'])
         self.assertNotIn('e1/P2/qa', [a['type'] for a in server.state('coord')['agents']])
@@ -1386,7 +1404,7 @@ class EpicTest(unittest.TestCase):
         w2, r1 = agents['w2'], agents['abcdef12-3456-7890-abcd-ef1234567890']
         self.assertEqual((w2['type'], w2['job'], w2['isWorking'], w2['activity']), ('e1/P2/writer', 'working', True, 'clippy+fmt clean'))
         self.assertEqual((r1['type'], r1['job'], r1['isWorking']), ('e1/research/Q1', 'working', True))
-        self.assertNotIn('w1', agents)   # the landed P1 has no floor: its roles went home
+        self.assertEqual(agents['w1']['type'], 'e1/P1/writer')   # the landed P1's roles sit on the floor of landed packages
 
     def test_idle_coordinator_waits_for_the_roles_at_work_and_calls_the_owner(self):
         producer = server.state('coord')['producer']

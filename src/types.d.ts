@@ -34,9 +34,9 @@ export type OfficeDesk = { type: string; name: string; short?: string; prop: str
 export type Office = {
   folder: string
   title: string
-  // note: the plaque's second line instead of the head count;
+  // note: the plaque's second line instead of the head count; strip: a floor folded to a band, nobody at work there;
   // track: an epic floor's stages left to right, each [label, passed | next | rejected | ahead]
-  zones: Array<{ id?: string; name: string; desks: OfficeDesk[]; note?: string; track?: Array<[string, string]> | null }>
+  zones: Array<{ id?: string; name: string; desks: OfficeDesk[]; note?: string; strip?: boolean; track?: Array<[string, string]> | null }>
   guests: Record<string, { name: string; prop: string }>
   saved?: boolean
   lang?: string
@@ -44,6 +44,6 @@ export type Office = {
   generating?: boolean
   provider?: string
   accent?: string
-  // an orchestrating-epics epic: the coordinator's context against its compaction line, packages landed and waiting
-  epic?: { context: number | null; limit: number | null; done?: string[]; queue?: string[] }
+  // an orchestrating-epics epic: the coordinator's context against its compaction line
+  epic?: { context: number | null; limit: number | null }
 }
