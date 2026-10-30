@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Agent Office</title>
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
 <style>
   /* палитра офиса: те же имена и в окошке строки меню (menubar.html) */
   :root {
@@ -351,6 +352,7 @@ async function pollState() {
     }
     const s = sessions.find(s => s.id === current)
     titleEl.textContent = s ? s.title : 'Agent Office'
+    document.title = s ? `Agent Office — ${s.title}` : 'Agent Office'
     const working = live.agents.filter(a => a.isWorking).length + (live.producer.isBusy ? 1 : 0)
     total.textContent = money(live.cost)
     total.title = `${roleName('main', live.office)} ${money(live.producer.cost)}, агенты ${money(live.cost - live.producer.cost)}`

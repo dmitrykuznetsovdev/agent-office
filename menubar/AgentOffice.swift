@@ -66,6 +66,8 @@ enum Pixel {
     static let colors: [Character: UInt32] = [
         "G": 0xf0c040, "R": 0x8a4a5a, "B": 0x4b5a8a, "C": 0x6ee7ff, "Y": 0xf0c040, "D": 0x1b1e2b, "O": 0xa0673d, "L": 0x3a3e63,
     ]
+    /// Без плашки офис стоит прямо на строке меню: пол светлее, чтобы не пропадал на тёмной.
+    static let menuColors = colors.merging(["L": 0x8a8fb0]) { $1 }
 
     static func color(_ hex: UInt32, _ alpha: CGFloat = 1) -> NSColor {
         NSColor(srgbRed: CGFloat(hex >> 16 & 0xff) / 255, green: CGFloat(hex >> 8 & 0xff) / 255, blue: CGFloat(hex & 0xff) / 255, alpha: alpha)
@@ -84,13 +86,13 @@ enum Pixel {
         }
     }
 
-    /// Значок строки меню: силуэт офиса, окна и дверь — прорези. Шаблон: цвет подставит система.
+    /// Значок строки меню: тот же офис в цвете, но без плашки иконки приложения.
     static func menuIcon() -> NSImage {
         let img = NSImage(size: NSSize(width: 16, height: 16), flipped: false) { r in
-            draw(in: r) { "GRBL".contains($0) ? .black : nil }
+            NSGraphicsContext.current?.shouldAntialias = false
+            draw(in: r) { ch in menuColors[ch].map { color($0) } }
             return true
         }
-        img.isTemplate = true
         img.accessibilityDescription = "Agent Office"
         return img
     }
