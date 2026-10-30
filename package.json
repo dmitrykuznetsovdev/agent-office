@@ -2,7 +2,7 @@
   "name": "agent-office",
   "version": "0.1.0",
   "private": true,
-  "description": "Pixel office for watching Claude Code agents at work",
+  "description": "Pixel office for watching Claude Code and Codex agents at work",
   "type": "module",
   "scripts": {
     "build": "tsc -p .",

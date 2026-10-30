@@ -7,12 +7,14 @@ const SKIN = ['#f1c27d', '#e0ac69', '#c68642', '#ffdbac', '#8d5524'];
 const HAIRS = ['#2b1d14', '#1a1a1a', '#6b4a2b', '#c9a227', '#9a9a9a', '#8a5a2b', '#3a2416', '#e05a8a'];
 const CAPS = ['#d06a2a', '#2f7a5a', '#c03040', '#3a6ab0'];
 const INK = '#1a1a22', GOLD = '#f0c040';
-// the model is the grade: Haiku in a cap, Sonnet in a hoodie, Opus in a suit, Fable in a dark suit with glasses
-const MODEL_GRADE = [['haiku', 'intern', 'Haiku'], ['sonnet', 'middle', 'Sonnet'], ['opus', 'senior', 'Opus'], ['fable', 'lead', 'Fable']];
+// the model is the grade: Haiku in a cap, Sonnet in a hoodie, Opus in a suit, Fable in a dark suit with glasses;
+// Codex models take the same grades by their tier
+const MODEL_GRADE = [['haiku', 'intern', 'Haiku'], ['sonnet', 'middle', 'Sonnet'], ['opus', 'senior', 'Opus'], ['fable', 'lead', 'Fable'],
+    ['luna', 'intern', 'Luna'], ['terra', 'middle', 'Terra'], ['sol', 'senior', 'Sol'], ['astra', 'lead', 'Astra'], ['auto-review', 'intern', 'Авторевью']];
 const MODEL_COLOR = { intern: '#8af0a0', middle: '#7fdcff', senior: '#ffb070', lead: '#f0c040' };
 function gradeOf(model) {
     const m = MODEL_GRADE.find(([k]) => model.includes(k));
-    return m ? [m[1], m[2]] : ['middle', model ? model.replace(/^claude-/, '') : '—'];
+    return m ? [m[1], m[2]] : ['middle', model ? model.replace(/^claude-/, '').replace(/^gpt-/, 'GPT-') : '—'];
 }
 function hash(s) {
     let n = 0;
@@ -840,7 +842,7 @@ export function mountFloors(scene, overlay, onError) {
         }
         // «в работе» как на сервере и в списке сессий: незавершённые агенты и занятый руководитель
         const working = st.agents.filter(a => a.isWorking).length + (st.producer.isBusy ? 1 : 0);
-        labels.push({ x: width / 2, y: 7.5, text: st.office.title || 'AGENT OFFICE', px: 5, color: GOLD, display: true, stroke: false });
+        labels.push({ x: width / 2, y: 7.5, text: st.office.title || 'AGENT OFFICE', px: 5, color: st.office.accent ?? GOLD, display: true, stroke: false });
         labels.push({ x: width / 2, y: 18, text: `в работе ${working} · агентов ${st.agents.length} · итого ${money(st.cost)}`, px: 4.2, color: '#ffffff', w: 600 });
         // the producer's office: panorama window, carpet, board
         const doorTops = [], P = L.boss.top;

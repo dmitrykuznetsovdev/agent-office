@@ -36,4 +36,6 @@ export type Office = {
   guests: Record<string, { name: string; prop: string }>
   saved?: boolean
   generating?: boolean
+  provider?: string
+  accent?: string
 }

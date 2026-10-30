@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Agent Office: пиксельный офис, где видно, как работают агенты Claude Code.
+"""Agent Office: пиксельный офис, где видно, как работают агенты Claude Code и Codex.
 
-Читает журналы всех сессий (~/.claude/projects) и отдаёт состояние офиса
-выбранной сессии. В журналы ничего не пишет, хуки не нужны.
+Читает журналы всех сессий (~/.claude/projects, ~/.codex/sessions) и отдаёт
+состояние офиса выбранной сессии. В журналы ничего не пишет, хуки не нужны.
 
   python3 server.py [--port 8767] [--data ~/.claude/agent-office] [--watch-parent]
 
   /                         страница офиса
   /api/sessions             сессии за последние сутки; today — потрачено сегодня
-  /api/stats                траты по дням, моделям и папкам за всё время, почасово — за 5 недель
+  /api/stats?p=codex        траты по дням, моделям и папкам за всё время, почасово — за 5 недель;
+                            p — один провайдер: claude или codex
   /api/state?s=<id>         офис одной сессии (руководитель, агенты, журнал)
   POST /api/office?s=<id>   сгенерировать офис для папки сессии
 """
@@ -29,6 +30,10 @@ WEB = os.path.join(HERE, 'web')
 CLAUDE_DIR = os.environ.get('CLAUDE_CONFIG_DIR') or os.path.expanduser('~/.claude')
 PROJECTS = os.path.join(CLAUDE_DIR, 'projects')
 DATA = os.path.join(CLAUDE_DIR, 'agent-office')  # офисы папок; меняется флагом --data
+CODEX_DIR = os.environ.get('CODEX_HOME') or os.path.expanduser('~/.codex')
+CODEX_SESSIONS = os.path.join(CODEX_DIR, 'sessions')
+CODEX_INDEX = os.path.join(CODEX_DIR, 'session_index.jsonl')  # названия тредов
+CODEX_ACCENT = '#4fb3c8'  # вывеска офиса Codex
 RECENT_S = 24 * 3600     # сессии в списке
 LIVE_S = 10 * 60         # тишина дольше — сессия считается остывшей
 AGENT_IDLE_S = 10 * 60   # агент без finished и без записей дольше — ушёл
@@ -39,6 +44,20 @@ PRICES = {
     'claude-opus-5-5': (4.0, 20.0, 0.20),
     'claude-sonnet-5-5': (2.0, 10.0, 0.20),
     'claude-haiku-5-5': (0.10, 0.50, 0.01),
+    'gpt-6-astra': (10.0, 50.0, 1.0),
+    'gpt-6.1-sol': (2.0, 10.0, 0.10),
+    'gpt-6.1-terra': (1.0, 5.0, 0.05),
+    'gpt-6-sol': (2.0, 10.0, 0.20),
+    'gpt-6-luna': (0.10, 0.50, 0.01),
+    'gpt-5.6-sol': (4.0, 20.0, 0.40),
+    'gpt-5.6-terra': (2.0, 12.0, 0.20),
+    'gpt-5.6-luna': (0.20, 1.20, 0.02),
+    'gpt-5.5': (5.0, 30.0, 0.50),
+    'gpt-5.4': (2.5, 15.0, 0.25),
+    'gpt-5.3-codex': (1.75, 14.0, 0.175),
+    'gpt-5.2': (1.75, 14.0, 0.175),
+    'gpt-5.1': (1.25, 10.0, 0.125),
+    'gpt-5': (1.25, 10.0, 0.125),
 }
 LOCK = threading.Lock()  # журналы дочитываются по одному
 
@@ -144,6 +163,11 @@ def cost_parts(model, usage):
             usage.get('cache_read_input_tokens', 0) * p_read * k, (w5m * 1.25 + w1h * 2) * p_in * k]
 
 
+def provider_of(model):
+    """Чей ответ: Claude Code или Codex — по имени модели."""
+    return 'codex' if str(model).startswith(('gpt-', 'codex-')) else 'claude'
+
+
 def message_cost(model, usage):
     """Стоимость одного ответа модели, формула reel.py cost."""
     return sum(cost_parts(model, usage))
@@ -164,6 +188,62 @@ def day_of(at_ms):
     return time.strftime('%Y-%m-%d', time.localtime(at_ms / 1000))
 
 
+def codex_usage(meter, d):
+    """Запись журнала Codex → токены ответа в виде Anthropic: вход без кэша, кэш отдельно.
+    С сентября 2026 ответы пишутся по одному (token_usage_record); в старых журналах есть
+    только нарастающий итог token_count. Состояние между записями лежит в meter."""
+    kind, p = d.get('type'), d.get('payload') or {}
+    if kind == 'session_meta':
+        if codex_origin(p)[1] == 'guardian':
+            meter.setdefault('model', 'codex-auto-review')  # после сжатия тред начинается без turn_context
+        return None
+    if kind == 'turn_context':
+        meter['model'] = p.get('model') or meter.get('model')
+        return None
+    if kind == 'event_msg' and p.get('type') == 'thread_settings_applied':
+        settings = p.get('thread_settings') or {}
+        meter['model'] = settings.get('model') or meter.get('model')
+        meter['tier'] = settings.get('service_tier') or meter.get('tier')
+        return None
+    if kind == 'token_usage_record':
+        meter['records'] = True
+        u = p.get('usage') or {}
+    elif kind == 'event_msg' and p.get('type') == 'token_count':
+        total = (p.get('info') or {}).get('total_token_usage')
+        if not total:
+            return None
+        prev, meter['prev'] = meter.get('prev') or {}, total
+        # итог падает после отката треда: это не новая трата
+        if meter.get('records') or total.get('total_tokens', 0) < prev.get('total_tokens', 0):
+            return None
+        u = {k: v - prev.get(k, 0) for k, v in total.items()}
+    else:
+        return None
+    cached, written = u.get('cached_input_tokens', 0), u.get('cache_write_input_tokens', 0)
+    usage = {'input_tokens': max(0, u.get('input_tokens', 0) - cached - written), 'output_tokens': u.get('output_tokens', 0),
+             'cache_read_input_tokens': cached, 'cache_creation_input_tokens': written}
+    if not any(usage.values()):
+        return None
+    if meter.get('tier') == 'fast':
+        usage['speed'] = 'fast'
+    return usage
+
+
+def codex_model(meter):
+    return meter.get('model') or 'gpt-?'
+
+
+def codex_origin(meta):
+    """Тред внутри другого: (id родителя, роль). Ревью действий — контролёр, остальные — фрилансеры."""
+    source = meta.get('source')
+    sub = source.get('subagent') if isinstance(source, dict) else None
+    if not sub:
+        return '', ''
+    spawn = sub.get('thread_spawn') if isinstance(sub, dict) else None
+    parent = meta.get('parent_thread_id') or (spawn or {}).get('parent_thread_id') or ''
+    return parent, 'general-purpose' if spawn else 'guardian'
+
+
 def today_cost(t):
     return t.daily.get(day_of(time.time() * 1000), 0.0)
 
@@ -182,6 +262,44 @@ def home_of(cwd):
     if not cwd:
         return ''
     return re.split(r'/\.claude/worktrees/', cwd)[0]
+
+
+def folder_name(path):
+    """Имя папки для людей: у ChatGPT-проектов вместо него идентификатор."""
+    name = os.path.basename(str(path or '').rstrip('/'))
+    return 'ChatGPT-проект' if re.match(r'g-p-[0-9a-f]+$', name) else name
+
+
+def codex_item(it):
+    """Законченный шаг Codex → инструмент Claude Code, чтобы описать его теми же словами."""
+    kind = it.get('type')
+    if kind == 'CommandExecution':
+        parsed = (it.get('parsed_cmd') or [{}])[0]
+        if parsed.get('type') == 'read':
+            return 'Read', {'file_path': parsed.get('path') or parsed.get('name')}
+        if parsed.get('type') == 'search':
+            return 'Grep', {'pattern': parsed.get('query') or parsed.get('cmd')}
+        if parsed.get('type') == 'list_files':
+            return 'Glob', {'pattern': parsed.get('path') or '.'}
+        command = it.get('command') or ['']
+        return 'Bash', {'command': command[-1] if isinstance(command, list) else command}
+    if kind == 'FileChange':
+        changes = it.get('changes') or {}
+        path = next(iter(changes), '')
+        added = (changes.get(path) or {}).get('type') == 'add'
+        return ('Write' if added else 'Edit'), {'file_path': path}
+    if kind == 'McpToolCall':
+        return 'mcp__%s__%s' % (it.get('server'), it.get('tool')), {}
+    if kind == 'WebSearch':
+        return 'WebSearch', {}
+    if kind == 'ImageView':
+        return 'Read', {'file_path': it.get('path')}
+    return None
+
+
+CODEX_CMD = re.compile(r'\b(?:cmd|command)"?\s*:\s*(["`\'])((?:\\.|(?!\1).)*)\1', re.S)
+CODEX_TOOL = re.compile(r'tools\.(\w+)\s*\(')
+CODEX_CALLS = {'apply_patch': ('Edit', {}), 'view_image': ('Read', {}), 'web__run': ('WebSearch', {})}
 
 
 class Tail:
@@ -276,12 +394,7 @@ class Tail:
         self.model = msg.get('model') or self.model
         if msg.get('usage') and mid not in self.paid:
             self.paid.add(mid)
-            usd = message_cost(msg.get('model'), msg['usage'])
-            self.cost += usd
-            day = day_of(at)
-            self.daily[day] = self.daily.get(day, 0.0) + usd
-            for old in sorted(self.daily)[:-2]:
-                del self.daily[old]
+            self.pay(msg.get('model'), msg['usage'], at)
         uses = [b for b in content or [] if isinstance(b, dict) and b.get('type') == 'tool_use']
         for b in uses:
             self.calls += 1
@@ -292,6 +405,88 @@ class Tail:
         if len(self.events) > LOG_MAX:
             self.events = self.events[-LOG_MAX:]
         self.busy = msg.get('stop_reason') != 'end_turn' or bool(uses)
+
+    def pay(self, model, usage, at):
+        usd = message_cost(model, usage)
+        self.cost += usd
+        day = day_of(at)
+        self.daily[day] = self.daily.get(day, 0.0) + usd
+        for old in sorted(self.daily)[:-2]:
+            del self.daily[old]
+
+
+class CodexTail(Tail):
+    """Журнал сессии Codex: поля те же, что у Tail, записи другие."""
+
+    def __init__(self, path):
+        super().__init__(path)
+        self.thread = ''
+        self.parent = ''       # тред, который запустил этот
+        self.role = ''         # guardian или general-purpose; у главной сессии пусто
+        self.nickname = ''
+        self.meter = {}
+
+    def take(self, d):
+        kind, p = d.get('type'), d.get('payload') or {}
+        at = ms(d.get('timestamp'))
+        if at:
+            self.first = self.first or at
+            self.last = max(self.last, at)
+        usage = codex_usage(self.meter, d)
+        if kind == 'session_meta':
+            if not self.thread:
+                self.thread = p.get('id') or ''
+                self.parent, self.role = codex_origin(p)
+                self.nickname = p.get('agent_nickname') or ''
+                self.cwd = p.get('cwd') or ''
+                self.home = home_of(self.cwd)
+            return
+        if usage and at:
+            self.pay(codex_model(self.meter), usage, at)
+        if kind == 'turn_context':
+            self.model = self.meter.get('model') or self.model
+            self.cwd = p.get('cwd') or self.cwd
+        elif kind == 'response_item' and p.get('type') in ('custom_tool_call', 'function_call'):
+            self.calling(p, at)
+        elif kind == 'event_msg':
+            event = p.get('type')
+            if event == 'task_started':
+                self.busy = True
+                self.activity, self.activity_at = 'думает', at
+            elif event in ('task_complete', 'turn_aborted'):
+                self.busy = False
+            elif event == 'item_completed':
+                self.finished(p.get('item') or {}, at)
+
+    def calling(self, p, at):
+        """Вызов только начался: в журнале он виден сразу, а итог появится, когда закончится."""
+        text = str(p.get('input') or p.get('arguments') or '')
+        name = p.get('name') or ''
+        inner = CODEX_TOOL.search(text)
+        name = inner.group(1) if inner else name
+        tool, inp = CODEX_CALLS.get(name, ('', {}))
+        cmd = CODEX_CMD.search(text)
+        if name.startswith('mcp__'):
+            tool = name
+        elif name in ('exec_command', 'shell', 'shell_command') and cmd:
+            tool, inp = 'Bash', {'command': cmd.group(2)}
+        if tool:
+            self.activity, self.activity_at, self.tool = describe(tool, inp), at, tool_kind(tool)
+
+    def finished(self, it, at):
+        if it.get('type') == 'UserMessage':
+            text = next((c.get('text') for c in it.get('content') or [] if isinstance(c, dict) and c.get('text')), '')
+            self.prompt = self.prompt or text
+            return
+        step = codex_item(it)
+        if not step:
+            return
+        self.calls += 1
+        what = describe(*step)
+        self.activity, self.activity_at, self.tool = what, at, tool_kind(step[0])
+        self.events.append((at, what))
+        del self.events[:-LOG_MAX]
+
 
 # ── Офисы: раскладка агентов папки по столам ───────────────────────────────
 # универсальные агенты сидят во фрилансе, своих столов у них нет
@@ -338,6 +533,7 @@ PHRASES = {
     'art-director': 'Арт-директор', 'motion-designer': 'Аниматор', 'sound-designer': 'Звукорежиссёр',
     'cover-maker': 'Обложечник', 'subs-editor': 'Субтитровщик', 'qa-inspector': 'Контролёр', 'qa': 'Контролёр',
     'style-critic': 'Стилист', 'selection-critic': 'Отборщик', 'code-reviewer': 'Ревьюер', 'statusline-setup': 'Наладчик',
+    'guardian': 'Контролёр',
 }
 WORDS = {
     'reviewer': 'Ревьюер', 'review': 'Ревьюер', 'builder': 'Сборщик', 'investigator': 'Сыщик', 'rescue': 'Спасатель',
@@ -357,7 +553,7 @@ KINDS = [
     ('ПЛАН', ['plan', 'architect', 'script', 'copywrit', 'writer', 'interview', 'strateg', 'product']),
     ('ПРОИЗВОДСТВО', ['build', 'editor', 'maker', 'design', 'director', 'camera', 'motion', 'sound', 'loader', 'packag',
                       'render', 'cover', 'subs', 'coder', 'develop', 'refactor', 'migrat', 'translat', 'document', 'operator']),
-    ('КАЧЕСТВО', ['review', 'critic', 'inspector', 'qa', 'test', 'audit', 'verif', 'lint', 'check']),
+    ('КАЧЕСТВО', ['review', 'critic', 'inspector', 'qa', 'test', 'audit', 'verif', 'lint', 'check', 'guardian']),
     ('ПОДДЕРЖКА', ['rescue', 'debug', 'fix', 'deploy', 'setup', 'support', 'ops', 'help', 'guide']),
 ]
 LATIN = re.compile('[A-Za-z]')
@@ -380,7 +576,7 @@ def kind_of(t, desc=''):
     return 'ПРОЧИЕ'
 
 
-def auto_office(folder, roster):
+def auto_office(folder, roster, shirt='#3b3f8f'):
     """Офис без модели: отделы по ходу работы, должности по-русски из названий агентов."""
     order = [k for k, _ in KINDS] + ['ПРОЧИЕ']
     zones = {}
@@ -388,7 +584,7 @@ def auto_office(folder, roster):
         if t in BUILTIN:
             continue
         zones.setdefault(kind_of(t, desc or ''), []).append(dress({'type': t, 'name': ru_name(t)}))
-    boss = dress({'type': 'main', 'name': 'Главный', 'prop': 'crown', 'shirt': '#3b3f8f'})
+    boss = dress({'type': 'main', 'name': 'Главный', 'prop': 'crown', 'shirt': shirt})
     rows = [{'name': 'ГЛАВНЫЙ', 'desks': [boss]}] if not zones else []
     for i, name in enumerate(n for n in order if n in zones):
         rows.append({'name': name, 'desks': ([boss] if i == 0 else []) + zones[name]})
@@ -601,6 +797,37 @@ def tidy(folder, roster, raw):
 
 # ── Статистика: траты по часам из всех журналов ─────────────────────────────
 HEAT_DAYS = 35  # сколько дней отдавать почасово, для карты «когда тратим»
+ROLLOUT = re.compile(r'rollout-\d{4}-\d\d-\d\dT\d\d-\d\d-\d\d-(.+)\.jsonl(\.zst)?$')
+# дешёвый отсев: json разбираем только у строк, важных для подсчёта
+CODEX_WORDS = (b'"token_usage_record"', b'"token_count"', b'"turn_context"', b'"session_meta"', b'"thread_settings_applied"')
+
+
+def find_zstd():
+    for p in [shutil.which('zstd'), '/opt/homebrew/bin/zstd', '/usr/local/bin/zstd']:
+        if p and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def journal_lines(path, offset):
+    """Целые строки журнала после байта offset: (строка, байт за ней). Сжатый читает zstd."""
+    proc = None
+    if path.endswith('.zst'):
+        proc = subprocess.Popen([find_zstd(), '-dc', path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        f, pos = proc.stdout, 0
+    else:
+        f, pos = open(path, 'rb'), offset
+        f.seek(offset)
+    with f:
+        for raw in f:
+            pos += len(raw)
+            if pos <= offset:
+                continue
+            if not raw.endswith(b'\n'):
+                break  # строка ещё дописывается
+            yield raw, pos
+    if proc:
+        proc.wait()
 
 
 def blank_day(day):
@@ -619,6 +846,7 @@ class Ledger:
         self.files = {}  # журнал → {offset, ids, days, main}
         # 'ГГГГ-ММ-ДДTЧЧ' → {папка: {модель: [$ вход, выход, чтение кэша, запись в кэш, токены, те же статьи в токенах]}}
         self.hours = {}
+        self.rate = {}  # последние лимиты подписки Codex: at, plan, windows
         self.dirty = False
         self.saved_at = 0
         try:
@@ -636,10 +864,13 @@ class Ledger:
             for models in projects.values():
                 for cell in models.values():
                     cell.extend([0] * (9 - len(cell)))
-        self.files, self.hours = files, hours
+        self.files, self.hours, self.rate = files, hours, data.get('limits') or {}
 
-    def scan(self, root=None):
-        root = root or PROJECTS
+    def scan(self, root=None, codex=None):
+        if root is None:
+            root, codex = PROJECTS, CODEX_SESSIONS
+        if codex:
+            self.scan_codex(codex)
         for proj in os.listdir(root):
             pdir = os.path.join(root, proj)
             if not os.path.isdir(pdir):
@@ -654,6 +885,61 @@ class Ledger:
                         if agent.endswith('.jsonl'):
                             self.feed(os.path.join(sub, agent), False)
         return self
+
+    def scan_codex(self, root):
+        """Журналы Codex остывают в .jsonl.zst и оживают обратно, поэтому ключ — имя без .zst."""
+        journals = {}
+        for folder, _, names in os.walk(root):
+            for name in names:
+                if ROLLOUT.match(name):
+                    key = os.path.join(folder, name[:-4] if name.endswith('.zst') else name)
+                    if key not in journals or not name.endswith('.zst'):
+                        journals[key] = os.path.join(folder, name)
+        for key, path in journals.items():
+            self.feed_codex(key, path)
+
+    def feed_codex(self, key, path):
+        rec = self.files.setdefault(key, {'offset': 0, 'ids': [], 'days': [], 'main': True, 'provider': 'codex', 'meter': {}, 'cwd': ''})
+        packed = path.endswith('.zst')
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return
+        if (rec.get('packed') if packed else rec['offset']) == size or (packed and not find_zstd()):
+            return
+        for raw, end in journal_lines(path, rec['offset']):
+            if any(word in raw for word in CODEX_WORDS):
+                self.take_codex(rec, raw)
+            rec['offset'] = end
+        if packed:
+            rec['packed'] = size
+        self.dirty = True
+
+    def take_codex(self, rec, raw):
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            return
+        kind, p, at = d.get('type'), d.get('payload') or {}, ms(d.get('timestamp'))
+        usage = codex_usage(rec['meter'], d)
+        if kind == 'session_meta':
+            if not rec['cwd']:
+                rec['cwd'] = p.get('cwd') or '?'
+                rec['main'] = not codex_origin(p)[1]
+            return
+        if kind == 'turn_context':
+            rec['cwd'] = p.get('cwd') or rec['cwd']
+        self.note_limits(p.get('rate_limits'), d.get('timestamp') or '')
+        if usage and at:
+            self.add(rec, at, rec['cwd'], codex_model(rec['meter']), usage)
+
+    def note_limits(self, limits, ts):
+        if not limits or limits.get('limit_id') not in (None, 'codex') or ts <= self.rate.get('at', ''):
+            return
+        windows = [{'minutes': w.get('window_minutes'), 'used': w.get('used_percent'), 'resets': w.get('resets_at')}
+                   for w in (limits.get('primary'), limits.get('secondary')) if w]
+        if windows:
+            self.rate = {'at': ts, 'plan': limits.get('plan_type'), 'windows': windows}
 
     def feed(self, path, main):
         rec = self.files.setdefault(path, {'offset': 0, 'ids': [], 'days': [], 'main': main})
@@ -693,13 +979,15 @@ class Ledger:
                 return
             rec['ids'].append(mid)
             del rec['ids'][:-self.IDS]
-        model = msg.get('model') or '?'
+        self.add(rec, at, d.get('cwd'), msg.get('model') or '?', usage)
+
+    def add(self, rec, at, cwd, model, usage):
         parts, toks = cost_parts(model, usage), token_parts(usage)
         tokens = sum(toks)
         if not tokens:
             return
         hour = time.strftime('%Y-%m-%dT%H', time.localtime(at / 1000))
-        project = os.path.basename(home_of(d.get('cwd'))) or '?'
+        project = folder_name(home_of(cwd)) or '?'
         cell = self.hours.setdefault(hour, {}).setdefault(project, {}).setdefault(model, [0.0, 0.0, 0.0, 0.0, 0, 0, 0, 0, 0])
         for i, n in enumerate(parts + [tokens] + toks):
             cell[i] += n
@@ -712,22 +1000,27 @@ class Ledger:
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         tmp = self.path + '.tmp'
         with open(tmp, 'w') as f:
-            json.dump({'v': self.VERSION, 'files': self.files, 'hours': self.hours}, f, separators=(',', ':'))
+            json.dump({'v': self.VERSION, 'files': self.files, 'hours': self.hours, 'limits': self.rate}, f, separators=(',', ':'))
         os.replace(tmp, self.path)
         self.dirty, self.saved_at = False, time.time()
 
-    def report(self, now=None):
-        """Дни подряд от первой записи до сегодня; почасово — последние HEAT_DAYS дней."""
+    def report(self, now=None, provider=None):
+        """Дни подряд от первой записи до сегодня; почасово — последние HEAT_DAYS дней.
+        provider — только Claude Code или только Codex."""
         from datetime import date, timedelta
         now = now or time.time()
         since_24 = time.strftime('%Y-%m-%dT%H', time.localtime(now - 23 * 3600))
         heat_from = day_of((now - HEAT_DAYS * 86400) * 1000)
-        days, hours, last24 = {}, [], 0.0
+        days, hours, last24, first = {}, [], 0.0, {}
         for hour, projects in sorted(self.hours.items()):
-            row = days.setdefault(hour[:10], blank_day(hour[:10]))
             spent = 0.0
             for project, models in projects.items():
                 for model, cell in models.items():
+                    who = provider_of(model)
+                    first.setdefault(who, hour[:10])
+                    if provider and who != provider:
+                        continue
+                    row = days.setdefault(hour[:10], blank_day(hour[:10]))
                     usd = sum(cell[:4])
                     spent += usd
                     row['models'][model] = row['models'].get(model, 0.0) + usd
@@ -737,12 +1030,15 @@ class Ledger:
                     row['tokParts'] = [a + b for a, b in zip(row['tokParts'], cell[5:9])]
                     row['tokModels'][model] = row['tokModels'].get(model, 0) + cell[4]
                     row['tokProjects'][project] = row['tokProjects'].get(project, 0) + cell[4]
-            row['usd'] += spent
+            if hour[:10] in days:
+                days[hour[:10]]['usd'] += spent
             if hour >= since_24:
                 last24 += spent
             if hour[:10] >= heat_from and spent:
                 hours.append([hour[:10], int(hour[11:]), round(spent, 4)])
         for rec in self.files.values():
+            if provider and rec.get('provider', 'claude') != provider:
+                continue
             for day in rec['days'] if rec['main'] else []:
                 days.setdefault(day, blank_day(day))['sessions'] += 1
             if rec['main'] and rec['days']:
@@ -758,30 +1054,31 @@ class Ledger:
             row['parts'] = [round(x, 4) for x in row['parts']]
             for k in ('models', 'projects'):
                 row[k] = {name: round(usd, 4) for name, usd in row[k].items()}
-        return {'since': out[0]['day'] if out else '', 'last24': round(last24, 4), 'days': out, 'hours': hours}
+        return {'since': out[0]['day'] if out else '', 'last24': round(last24, 4), 'days': out, 'hours': hours,
+                'first': first, 'limits': self.rate}
 
 
 LEDGER = None
 STATS_LOCK = threading.Lock()  # статистика копится отдельно от офиса: первый проход долгий
 
 
-def stats():
+def stats(provider=None):
     global LEDGER
     with STATS_LOCK:
         if LEDGER is None:
             LEDGER = Ledger(os.path.join(DATA, 'stats.json'))
         LEDGER.scan()
         LEDGER.save(every=60)
-        return LEDGER.report()
+        return LEDGER.report(provider=provider)
 
 
 TAILS = {}
 
 
-def tail(path):
+def tail(path, kind=Tail):
     t = TAILS.get(path)
     if t is None:
-        t = TAILS[path] = Tail(path)
+        t = TAILS[path] = kind(path)
     return t.feed()
 
 
@@ -808,7 +1105,7 @@ def session_files():
 
 def project_name(pdir, cwd):
     if cwd:
-        return os.path.basename(cwd.rstrip('/')) or cwd
+        return folder_name(cwd) or cwd
     return os.path.basename(pdir).split('-')[-1]
 
 
@@ -861,6 +1158,7 @@ def sessions():
         working = sum(a['isWorking'] for a in agents) + (1 if live and t.busy else 0)
         out.append({
             'id': sid,
+            'provider': 'claude',
             'title': t.title or clip(t.prompt, 50) or sid[:8],
             'project': project_name(pdir, t.cwd),
             'at': int(mtime * 1000),
@@ -872,7 +1170,99 @@ def sessions():
             'folder': t.home,
             'hasOffice': bool(t.home) and os.path.exists(office_path(t.home)),
         })
+    out += codex_sessions(now)
+    out.sort(key=lambda s: s['at'], reverse=True)
     return out
+
+
+CODEX_TITLES = {'mtime': 0, 'names': {}}
+
+
+def codex_titles():
+    """Названия тредов: Codex дописывает их в session_index.jsonl."""
+    try:
+        mtime = os.path.getmtime(CODEX_INDEX)
+        if mtime != CODEX_TITLES['mtime']:
+            with open(CODEX_INDEX) as f:
+                rows = [json.loads(raw) for raw in f if raw.strip()]
+            CODEX_TITLES.update(mtime=mtime, names={r.get('id'): r.get('thread_name') for r in rows})
+    except (OSError, ValueError):
+        return {}
+    return CODEX_TITLES['names']
+
+
+def codex_threads(now):
+    """Журналы Codex с записями за сутки: {файл: хвост} главных сессий и дети по id родителя."""
+    mains, kids = {}, {}
+    for folder, _, names in os.walk(CODEX_SESSIONS):
+        for name in names:
+            m = ROLLOUT.match(name)
+            path = os.path.join(folder, name)
+            if not m or m.group(2) or now - os.path.getmtime(path) >= RECENT_S:
+                continue  # сжатые журналы давно остыли
+            t = tail(path, CodexTail)
+            if (now * 1000 - t.last) >= RECENT_S * 1000:
+                continue  # файл тронут, а записей нет
+            if t.parent:
+                kids.setdefault(t.parent, []).append(t)
+            elif not t.role:
+                mains[m.group(1)] = t
+    return mains, kids
+
+
+def codex_agents(kids, now_ms):
+    """Дети сессии — её агенты. Контролёр один, сколько бы ревью он ни провёл."""
+    agents = {}
+    for t in sorted(kids, key=lambda t: t.first):
+        working = t.busy and now_ms - t.last < AGENT_IDLE_S * 1000
+        a = agents.get(t.role if t.role == 'guardian' else t.thread)
+        if a is None:
+            a = agents[t.role if t.role == 'guardian' else t.thread] = {
+                'id': t.thread, 'type': t.role, 'desc': clip(t.nickname or t.prompt or 'проверяет действия', 40), 'isWorking': False,
+                'activity': '', 'startedAt': t.first, 'endedAt': 0, 'calls': 0, 'cost': 0.0, 'today': 0.0, 'model': '', 'tool': '',
+                'at': 0, 'finished': False, 'events': []}
+        a['isWorking'] = a['isWorking'] or working
+        a['activity'] = t.activity or a['activity'] or a['desc']
+        a['calls'] += t.calls
+        a['cost'] = round(a['cost'] + t.cost, 4)
+        a['today'] = round(a['today'] + today_cost(t), 4)
+        a['model'], a['tool'] = t.model or a['model'], t.tool or a['tool']
+        a['at'] = max(a['at'], t.activity_at or t.last)
+        a['endedAt'] = 0 if a['isWorking'] else max(a['endedAt'], t.last)
+        a['finished'] = not a['isWorking']
+        a['events'] = (a['events'] + t.events)[-LOG_MAX:]
+    return list(agents.values())
+
+
+def codex_sessions(now):
+    titles = codex_titles()
+    mains, kids = codex_threads(now)
+    out = []
+    for sid, t in mains.items():
+        agents = codex_agents(kids.get(t.thread, []), now * 1000)
+        live = now * 1000 - t.last < LIVE_S * 1000
+        out.append({
+            'id': sid,
+            'provider': 'codex',
+            'title': titles.get(t.thread) or clip(t.prompt, 50) or sid[:8],
+            'project': project_name('', t.cwd),
+            'at': t.last,
+            'isLive': live,
+            'working': sum(a['isWorking'] for a in agents) + (1 if live and t.busy else 0),
+            'agents': len(agents),
+            'cost': round(t.cost + sum(a['cost'] for a in agents), 2),
+            'today': round(today_cost(t) + sum(a['today'] for a in agents), 2),
+            'folder': t.home,
+            'hasOffice': False,
+        })
+    return out
+
+
+def codex_office(t, agents):
+    """Столы Codex — по тому, кто работал в сессии: генерировать тут нечего, ролей он не объявляет."""
+    office = auto_office(t.home or '?', {a['type']: '' for a in agents}, '#1f6f8f')
+    office.update(saved=True, job=None, generating=False, provider='codex', accent=CODEX_ACCENT)
+    return office
 
 
 def office_for(t):
@@ -891,32 +1281,39 @@ def find_tail(sid):
     return None
 
 
+def room(t, agents, busy, office):
+    """Состояние офиса сессии: руководитель, агенты, общий журнал."""
+    log = [(at, 'producer', text) for at, text in t.events]
+    for a in agents:
+        log.append((a['startedAt'], a['type'], 'взял задачу: ' + a['desc']))
+        log += [(at, a['type'], text) for at, text in a['events']]
+        if not a['isWorking']:
+            log.append((a['endedAt'], a['type'], 'сдал работу'))
+    log.sort(key=lambda x: x[0])
+    for a in agents:
+        del a['events']
+    return {
+        'agents': agents,
+        'producer': {'isBusy': busy, 'activity': t.activity if busy else '', 'at': t.activity_at, 'calls': t.calls, 'cost': round(t.cost, 4), 'model': t.model, 'tool': t.tool},
+        'cost': round(t.cost + sum(a['cost'] for a in agents), 4),
+        'office': office,
+        'log': [{'at': at, 'who': who, 'text': clip(text)} for at, who, text in log[-LOG_MAX:]],
+        'since': t.first,
+    }
+
+
 def state(sid):
     now = time.time()
     for mtime, s, pdir, path in session_files():
-        if s != sid:
-            continue
-        t = tail(path)
-        busy = t.busy and now - mtime < LIVE_S
-        agents = agents_of(pdir, sid, now * 1000)
-        log = [(at, 'producer', text) for at, text in t.events]
-        for a in agents:
-            log.append((a['startedAt'], a['type'], 'взял задачу: ' + a['desc']))
-            log += [(at, a['type'], text) for at, text in a['events']]
-            if not a['isWorking']:
-                log.append((a['endedAt'], a['type'], 'сдал работу'))
-        log.sort(key=lambda x: x[0])
-        for a in agents:
-            del a['events']
-        return {
-            'agents': agents,
-            'producer': {'isBusy': busy, 'activity': t.activity if busy else '', 'at': t.activity_at, 'calls': t.calls, 'cost': round(t.cost, 4), 'model': t.model, 'tool': t.tool},
-            'cost': round(t.cost + sum(a['cost'] for a in agents), 4),
-            'office': office_for(t),
-            'log': [{'at': at, 'who': who, 'text': clip(text)} for at, who, text in log[-LOG_MAX:]],
-            'since': t.first,
-        }
-    return None
+        if s == sid:
+            t = tail(path)
+            return room(t, agents_of(pdir, sid, now * 1000), t.busy and now - mtime < LIVE_S, office_for(t))
+    mains, kids = codex_threads(now)
+    t = mains.get(sid)
+    if t is None:
+        return None
+    agents = codex_agents(kids.get(t.thread, []), now * 1000)
+    return room(t, agents, t.busy and now * 1000 - t.last < LIVE_S * 1000, codex_office(t, agents))
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -969,7 +1366,8 @@ class Handler(SimpleHTTPRequestHandler):
                     body = sessions()
                 return self.send_json(body)
             if url.path == '/api/stats':
-                return self.send_json(stats())
+                p = parse_qs(url.query).get('p', [''])[0]
+                return self.send_json(stats(p if p in ('claude', 'codex') else None))
             if url.path == '/api/state':
                 with LOCK:
                     st = state(parse_qs(url.query).get('s', [''])[0])
@@ -982,7 +1380,7 @@ class Handler(SimpleHTTPRequestHandler):
 def main():
     global DATA
     import argparse
-    ap = argparse.ArgumentParser(description='Agent Office: пиксельный офис агентов Claude Code')
+    ap = argparse.ArgumentParser(description='Agent Office: пиксельный офис агентов Claude Code и Codex')
     ap.add_argument('--port', type=int, default=8767)
     ap.add_argument('--host', default='127.0.0.1')
     ap.add_argument('--data', default=DATA, help='где хранить офисы папок')
