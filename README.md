@@ -360,6 +360,7 @@ flowchart LR
 
 ```
 server.py           сервер: разбор журналов, стоимость, офисы, API
+server/             новый сервер на Rust, пишется по эпику #2 и пока не заменяет server.py
 web/index.html      страница
 web/floors.js       отрисовка офиса (собирается из src/, лежит в репозитории)
 web/menubar.html    окошко строки меню
@@ -368,12 +369,12 @@ src/office.ts       имена ролей и деньги
 src/shot.ts         названия скриншотов и PNG
 src/menubar.ts      исходник окошка, графики на SVG
 menubar/            приложение для строки меню (Swift, один файл)
-scripts/            сборка приложения, автозапуск
+scripts/            сборка приложения, автозапуск, проверка лимита строк и слоёв
 scripts/demo/       вымышленные журналы и съёмка картинок для README
 tests/              тесты сервера (unittest)
 examples/           пример файла офиса
 docs/screenshots/   картинки для README, сняты на вымышленных данных
-.github/workflows/  релиз по тегу
+.github/workflows/  CI на каждый PR и релиз по тегу
 VERSION             текущая версия
 CHANGELOG.md        что менялось от версии к версии
 ```

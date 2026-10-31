@@ -1,0 +1,6 @@
+menubar/AgentOffice.swift 652
+server.py 2575
+src/floors.ts 1015
+src/menubar.ts 637
+tests/test_server.py 2714
+web/index.html 557

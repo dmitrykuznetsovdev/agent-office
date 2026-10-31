@@ -7,7 +7,7 @@
   "scripts": {
     "build": "tsc -p .",
     "check": "tsc -p . --noEmit",
-    "test": "python3 -m unittest discover -s tests"
+    "test": "python3 -m unittest discover -s tests && sh scripts/check-structure.sh && sh scripts/check-structure.test.sh"
   },
   "devDependencies": {
     "typescript": "5.6.3"
