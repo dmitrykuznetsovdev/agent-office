@@ -32,6 +32,10 @@ setup_allowlisted_gone() { printf 'old.py 600\n' > scripts/lines-allowlist.txt; 
 setup_domain_pure() { mkdir -p server/src/domain; echo 'pub fn f(now: i64) -> i64 { now }' > server/src/domain/a.rs; }
 setup_domain_fs() { mkdir -p server/src/domain; echo 'use std::fs;' > server/src/domain/a.rs; }
 setup_domain_clock() { mkdir -p server/src/domain; echo 'let t = SystemTime::now();' > server/src/domain/a.rs; }
+setup_cyrillic_name() { lines 501 > пример.rs; }
+setup_no_final_newline() { lines 500 > a.ts; printf y >> a.ts; }
+setup_domain_grouped() { mkdir -p server/src/domain; echo 'use std::{fs, io};' > server/src/domain/a.rs; }
+setup_domain_comment() { mkdir -p server/src/domain; echo '// tokio здесь нельзя' > server/src/domain/a.rs; }
 setup_app_axum() { mkdir -p server/src/app; echo 'use axum::Router;' > server/src/app/a.rs; }
 
 case_ at_limit ok
@@ -46,3 +50,7 @@ case_ domain_pure ok
 case_ domain_fs fail
 case_ domain_clock fail
 case_ app_axum fail
+case_ cyrillic_name fail
+case_ no_final_newline fail
+case_ domain_grouped fail
+case_ domain_comment ok

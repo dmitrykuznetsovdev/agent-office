@@ -12,13 +12,15 @@ ALLOW=scripts/lines-allowlist.txt
 OUT="$(mktemp)"
 trap 'rm -f "$OUT"' EXIT
 
+# строки как у редактора: последняя без перевода строки тоже считается
+count() { awk 'END { print NR }' "$1"; }
 allowed() { [ -f "$ALLOW" ] && awk -v f="$1" '$1 == f { print $2 }' "$ALLOW"; }
 
-git ls-files -- '*.rs' '*.ts' '*.tsx' '*.css' '*.swift' '*.sh' '*.mjs' '*.py' '*.html' |
+git -c core.quotePath=false ls-files -- '*.rs' '*.ts' '*.tsx' '*.css' '*.swift' '*.sh' '*.mjs' '*.py' '*.html' |
   grep -vE '(^|/)(fixtures|golden)/' |
   while IFS= read -r f; do
     [ -f "$f" ] || continue
-    n=$(wc -l < "$f" | tr -d ' ')
+    n=$(count "$f")
     max=$(allowed "$f")
     if [ -n "$max" ]; then
       [ "$n" -le "$max" ] || echo "$f: $n строк, в $ALLOW записано $max — старому файлу расти нельзя"
@@ -32,7 +34,7 @@ if [ -f "$ALLOW" ]; then
     [ -n "$f" ] || continue
     if [ ! -f "$f" ]; then
       echo "$ALLOW: $f удалён — убери запись"
-    elif [ "$(wc -l < "$f" | tr -d ' ')" -le "$LIMIT" ]; then
+    elif [ "$(count "$f")" -le "$LIMIT" ]; then
       echo "$ALLOW: $f ушёл под лимит — убери запись"
     fi
   done < "$ALLOW" >> "$OUT"
@@ -41,10 +43,11 @@ fi
 # слои сервера: domain без IO, процессов, рантайма и часов; app без HTTP и файлов
 forbid() {
   [ -d "$1" ] || return 0
-  grep -rnE "$2" "$1" | sed "s|\$| — $3|" >> "$OUT" || true
+  # комментарии не в счёт; std::{fs, io} ловится так же, как std::fs
+  grep -rnE "$2" "$1" | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' | sed "s|\$| — $3|" >> "$OUT" || true
 }
-forbid server/src/domain 'std::fs|std::process|std::net|tokio|axum|SystemTime::now|Instant::now|Local::now|Utc::now' 'domain без IO и часов'
-forbid server/src/app 'axum|std::fs|std::process' 'app работает через порты'
+forbid server/src/domain 'std::(fs|process|net)\b|std::\{[^}]*\b(fs|process|net)\b|tokio|axum|SystemTime::now|Instant::now|Local::now|Utc::now' 'domain без IO и часов'
+forbid server/src/app 'axum|std::(fs|process)\b|std::\{[^}]*\b(fs|process)\b' 'app работает через порты'
 
 if [ -s "$OUT" ]; then
   cat "$OUT" >&2

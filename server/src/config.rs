@@ -48,7 +48,8 @@ impl Config {
         };
         let claude_dir = dir("CLAUDE_CONFIG_DIR", ".claude");
         let codex_dir = dir("CODEX_HOME", ".codex");
-        let data = cli.data.map_or_else(|| claude_dir.join("agent-office"), |p| expand(&p, &home));
+        // как в server.py: значение по умолчанию тоже проходит expanduser
+        let data = expand(&cli.data.unwrap_or_else(|| claude_dir.join("agent-office").display().to_string()), &home);
         let shots = cli.shots.map_or_else(|| home.join("Pictures/Agent Office"), |p| expand(&p, &home));
         Ok(Config {
             port: cli.port,
@@ -116,6 +117,12 @@ mod tests {
         assert_eq!(c.shots, PathBuf::from("/h"));
         assert!(c.watch_parent);
         assert_eq!(parse(&["--data", "/abs/~x"], &[("HOME", "/h")]).data, PathBuf::from("/abs/~x"));
+    }
+
+    #[test]
+    fn tilde_in_config_dir_expands_for_data_only() {
+        let c = parse(&[], &[("HOME", "/h"), ("CLAUDE_CONFIG_DIR", "~/x")]);
+        assert_eq!(c.data, PathBuf::from("/h/x/agent-office"));
     }
 
     #[test]

@@ -13,7 +13,10 @@ jobs:
     # старый сервер живёт до удаления Python (эпик #2, пакет X1)
     # setup-python больше не даёт 3.9 на свежих Ubuntu: берём официальный образ
     runs-on: ubuntu-latest
-    container: python:3.9-slim
+    container:
+      image: python:3.9-slim
+      # init в контейнере подбирает осиротевших детей claude: иначе тесты генерации видят зомби живыми
+      options: --init
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: python -m unittest discover -s tests
