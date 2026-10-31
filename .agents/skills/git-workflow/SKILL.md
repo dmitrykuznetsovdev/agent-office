@@ -58,12 +58,12 @@ docs: describe office manifest fields
 
 ## PR и мерж
 
-Заголовок PR тоже в формате Conventional Commits: он станет текстом коммита в `main`. В описании указать ветку. Мерж только через squash:
+Заголовок PR тоже в формате Conventional Commits. В описании указать ветку:
 
 ```bash
 git push -u origin <ветка>
 gh pr create --repo dmitrykuznetsovdev/agent-office --base main --head <ветка>
-gh pr merge <номер> --repo dmitrykuznetsovdev/agent-office --squash --delete-branch
+gh pr merge <номер> --repo dmitrykuznetsovdev/agent-office --merge --delete-branch
 ```
 
 ## Релиз
@@ -72,7 +72,7 @@ gh pr merge <номер> --repo dmitrykuznetsovdev/agent-office --squash --delet
 
 1. В `CHANGELOG.md` заголовок `## [Unreleased]` стал `## [x.y.z] – ГГГГ-ММ-ДД`, выше новый пустой `## [Unreleased]`, внизу ссылка `[x.y.z]: .../releases/tag/vx.y.z`.
 2. Новая версия в `VERSION`, `package.json`, `package-lock.json` (`npm version x.y.z --no-git-tag-version`) и бейдже README.
-3. `npm test`, PR `chore: release x.y.z`, squash.
+3. `npm test`, PR `chore: release x.y.z`.
 4. После мержа тег на коммит в `main`. Релиз GitHub соберёт `.github/workflows/release.yml` из раздела чейнджлога.
 
 ```bash
