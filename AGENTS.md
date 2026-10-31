@@ -21,7 +21,7 @@ scripts/demo/shoot.sh   # картинки README на вымышленных д
 ## Обязательные правила
 
 1. **Сначала тест.** Для фичи или багфикса сначала падающий тест, потом код. Тесты не подгонять под сломанный код. Скил `tdd`.
-2. **В `main` не коммитить.** Ветка `<type>/<kebab-case-description>`, Conventional Commits, PR в наш репозиторий (см. «Репозиторий»), squash. Каждый `feat` и `fix` дописывает строку в `[Unreleased]` файла `CHANGELOG.md`. Скил `git-workflow`.
+2. **В `main` не коммитить.** Ветка `<type>/<kebab-case-description>`, Conventional Commits, PR в наш репозиторий (см. «Репозиторий»). Каждый `feat` и `fix` дописывает строку в `[Unreleased]` файла `CHANGELOG.md`. Скил `git-workflow`.
 3. **Репозиторий публичный.** Никаких настоящих доменов, путей, токенов и реальных сессий на скриншотах. Скил `public-repo-hygiene`.
 4. **README совпадает с кодом.** Скил `readme-sync`.
 5. **«Готово» только после проверки.** Скил `verify-done`.

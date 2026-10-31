@@ -402,7 +402,7 @@ git tag vX.Y.Z && git push origin vX.Y.Z
 |---|---|---|
 | [`karpathy-guidelines`](.claude/skills/karpathy-guidelines/SKILL.md) | Код и ревью | Думать до кода, простота, точечные правки, проверяемая цель |
 | [`tdd`](.claude/skills/tdd/SKILL.md) | Фича или багфикс | Сначала падающий тест, тесты не подгоняются под код |
-| [`git-workflow`](.claude/skills/git-workflow/SKILL.md) | Ветка, коммит, PR, релиз | Имена веток, Conventional Commits, squash, версии и чейнджлог |
+| [`git-workflow`](.claude/skills/git-workflow/SKILL.md) | Ветка, коммит, PR, релиз | Имена веток, Conventional Commits, версии и чейнджлог |
 | [`readme-sync`](.claude/skills/readme-sync/SKILL.md) | Перед пушем | Какой раздел README проверить при какой правке |
 | [`verify-done`](.claude/skills/verify-done/SKILL.md) | Перед словом «готово» | Проверять результат, а не намерение |
 | [`public-repo-hygiene`](.claude/skills/public-repo-hygiene/SKILL.md) | Документы, примеры, скриншоты | Плейсхолдеры вместо личных данных |
