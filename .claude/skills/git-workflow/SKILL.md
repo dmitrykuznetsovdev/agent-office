@@ -8,6 +8,8 @@ license: MIT
 
 В `main` напрямую не коммитим. Любое изменение идёт через ветку и PR.
 
+Наш репозиторий `dmitrykuznetsovdev/agent-office` (`origin`). Это форк `miulyano/agent-office` (`upstream`), и `gh` без `--repo` открывает PR туда. Поэтому каждая команда `gh pr` идёт с `--repo dmitrykuznetsovdev/agent-office`. В `upstream` PR не открываем и не пушим; изменения из него забираем только по явной просьбе, своей веткой и PR.
+
 ## Старт
 
 ```bash
@@ -59,7 +61,9 @@ docs: describe office manifest fields
 Заголовок PR тоже в формате Conventional Commits: он станет текстом коммита в `main`. В описании указать ветку. Мерж только через squash:
 
 ```bash
-gh pr merge --squash --delete-branch
+git push -u origin <ветка>
+gh pr create --repo dmitrykuznetsovdev/agent-office --base main --head <ветка>
+gh pr merge <номер> --repo dmitrykuznetsovdev/agent-office --squash --delete-branch
 ```
 
 ## Релиз
